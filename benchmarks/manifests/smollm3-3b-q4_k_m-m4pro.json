@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "name": "smollm3-3b-q4_k_m-m4pro",
+  "host": {
+    "machine_model": "Mac16,7",
+    "chip": "Apple M4 Pro",
+    "memory_bytes": 51539607552,
+    "architecture": "aarch64"
+  },
+  "model": {
+    "path": "../../models/smollm3-3b-q4_k_m",
+    "repository": "ggml-org/SmolLM3-3B-GGUF",
+    "revision": "4965cb60b150737b68a0408c36aeefb65078f894",
+    "filename": "SmolLM3-Q4_K_M.gguf",
+    "size_bytes": 1915305312,
+    "sha256": "8334b850b7bd46238c16b0c550df2138f0889bf433809008cc17a8b05761863e",
+    "architecture": "smollm3",
+    "quantization": "Q4_K_M"
+  },
+  "llama_cpp": {
+    "binary_directory": "/opt/homebrew/bin",
+    "build": 10050,
+    "commit": "b15ca938ad00aa6b3ee6c2edda7363fd02826b18",
+    "gpu_layers": 99,
+    "flash_attention": "auto",
+    "cache_type_k": "f16",
+    "cache_type_v": "f16",
+    "mmap": true
+  },
+  "workload": {
+    "prompt": {
+      "path": "../prompts/smollm3-raw-2-plus-2.txt",
+      "sha256": "88b6df86c6f204f660caccd9fcbb25a7b95cdc2a4920a0533381f47f3bd434c9",
+      "token_count": 5,
+      "token_ids_sha256": "42cbf65d37eb436b75b0f4399abd23d9abafdf5aaa81afbb6617972694ab1d2b",
+      "add_special_tokens": false,
+      "strip_final_newline": true
+    },
+    "decode_steps": 7,
+    "sampling": {
+      "temperature": 0.0,
+      "top_k": 0,
+      "top_p": 1.0,
+      "repetition_penalty": 1.0,
+      "seed": 42,
+      "ignore_stop_tokens": true
+    },
+    "concurrency": [1, 4, 8],
+    "warmup_waves": 1,
+    "samples_per_concurrency": 40,
+    "prefix_cache": "disabled"
+  },
+  "runtime": {
+    "device": "metal",
+    "dtype": "f32",
+    "prefill_token_quantum": 128,
+    "kv_cache_block_tokens": 16,
+    "kv_cache_slab_blocks": 8,
+    "kv_cache_capacity_tokens": 65536
+  }
+}

@@ -1,0 +1,72 @@
+[package]
+name = "macllm-infer"
+version = "0.1.0"
+edition = "2024"
+description = "An Apple Silicon-first Rust LLM inference runtime"
+license = "MIT"
+repository = "https://github.com/lhwzds/macllm-infer"
+
+[[bin]]
+name = "macllm"
+path = "src/main.rs"
+
+[features]
+default = ["metal", "accelerate"]
+metal = [
+    "dep:block2",
+    "candle-core/metal",
+    "candle-nn/metal",
+    "dep:candle-metal-kernels",
+    "dep:objc2-metal",
+]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.8.9", features = ["http1", "json", "tokio"] }
+block2 = { version = "0.6", optional = true }
+bytemuck = "1.24"
+candle-core = { version = "0.11.0", default-features = false }
+candle-metal-kernels = { version = "0.11.0", optional = true }
+candle-nn = { version = "0.11.0", default-features = false }
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3.32"
+hf-hub = { version = "1.0.0", features = ["blocking", "rustls-tls"] }
+libc = "0.2"
+memmap2 = "0.9"
+objc2-metal = { version = "0.3.2", optional = true }
+rand = "0.9"
+rand_chacha = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10.9"
+tempfile = "3.20"
+tokenizers = "0.23.1"
+tokio = { version = "1.53", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+
+[dev-dependencies]
+candle-transformers = { version = "0.11.0", default-features = false, features = ["metal", "accelerate"] }
+http-body-util = "0.1.4"
+tower = { version = "0.5.3", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -2 }
+pedantic = { level = "warn", priority = -1 }
+# Model dimensions are validated and far below integer conversion limits.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+# Public fallible APIs return contextual anyhow/Candle errors; duplicating an
+# Errors section on each small adapter method obscures the instructional docs.
+missing_errors_doc = "allow"
+# VarBuilder is an Arc-backed path cursor. Passing it by value makes weight
+# ownership and prefix derivation explicit at model construction boundaries.
+needless_pass_by_value = "allow"
+# Projection bias is checkpoint metadata, not independent application state.
+struct_excessive_bools = "allow"
