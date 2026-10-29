@@ -317,6 +317,9 @@ struct NativeFunction<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<&'a str>,
     parameters: &'a serde_json::Value,
+    // The official template renders the client's declaration verbatim, and
+    // clients normally omit `strict` unless they enable it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     strict: bool,
 }
 
@@ -443,6 +446,9 @@ pub(crate) fn format_qwen3_agent_prompt(
             }
         }
     }
+    // Text-only and automatic turns both end at an open assistant turn; for
+    // `Auto` the serving layer constrains a call lazily once the model opens
+    // one with the envelope rendered in the system block above.
     rendered.push_str("<|im_start|>assistant\n");
     if let AgentDirective::ForcedSingle { name } = &prompt.directive {
         rendered.push_str("<tool_call>\n{\"name\":\"");
@@ -665,6 +671,127 @@ mod tests {
         assert_eq!(
             rendered,
             format_qwen3_agent_prompt(AgentTemplateProfile::Qwen3Gguf, &prompt)?
+        );
+        Ok(())
+    }
+
+    fn shell_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "shell".to_owned(),
+            description: Some("Run a shell command.".to_owned()),
+            parameters: json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }),
+            strict: false,
+        }
+    }
+
+    fn shell_call(id: &str, command: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_owned(),
+            name: "shell".to_owned(),
+            arguments: serde_json::to_string(&json!({"command": command})).unwrap(),
+        }
+    }
+
+    #[test]
+    fn renders_auto_turns_with_reasoning_text_and_call_history_byte_exact() -> Result<()> {
+        let prompt = AgentPrompt {
+            messages: vec![
+                AgentMessage::System {
+                    content: "You are a coding agent.".to_owned(),
+                },
+                AgentMessage::User {
+                    content: "List files.".to_owned(),
+                },
+                AgentMessage::Assistant {
+                    content: Some("<think>\nNeed ls.\n</think>\n\nListing.".to_owned()),
+                    tool_call: Some(shell_call("call_1", "ls")),
+                },
+                AgentMessage::Tool {
+                    content: "exit: 0\na.txt\n".to_owned(),
+                    tool_call_id: "call_1".to_owned(),
+                },
+                AgentMessage::Assistant {
+                    content: None,
+                    tool_call: Some(shell_call("call_2", "cat a.txt")),
+                },
+                AgentMessage::Tool {
+                    content: "exit: 0\nhi\n".to_owned(),
+                    tool_call_id: "call_2".to_owned(),
+                },
+            ],
+            tools: vec![shell_tool()],
+            directive: AgentDirective::Auto,
+        };
+        // Matches the official template: non-strict declarations are
+        // rendered without `strict`, reasoning after the last user query is
+        // kept, visible text is separated from its call by one newline, and
+        // the prompt ends at an open assistant turn.
+        let expected = concat!(
+            "<|im_start|>system\nYou are a coding agent.\n\n",
+            "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n",
+            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
+            "{\"type\":\"function\",\"function\":{\"name\":\"shell\",\"description\":\"Run a shell command.\",\"parameters\":{\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"],\"type\":\"object\"}}}",
+            "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n",
+            "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n",
+            "<|im_start|>user\nList files.<|im_end|>\n",
+            "<|im_start|>assistant\n<think>\nNeed ls.\n</think>\n\nListing.\n",
+            "<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\":\"ls\"}}\n</tool_call><|im_end|>\n",
+            "<|im_start|>user\n<tool_response>\nexit: 0\na.txt\n\n</tool_response><|im_end|>\n",
+            "<|im_start|>assistant\n",
+            "<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\":\"cat a.txt\"}}\n</tool_call><|im_end|>\n",
+            "<|im_start|>user\n<tool_response>\nexit: 0\nhi\n\n</tool_response><|im_end|>\n",
+            "<|im_start|>assistant\n"
+        );
+        for profile in [
+            AgentTemplateProfile::Qwen3Current,
+            AgentTemplateProfile::Qwen3Gguf,
+        ] {
+            assert_eq!(format_qwen3_agent_prompt(profile, &prompt)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_call_history_uses_the_constrained_envelope_spelling() -> Result<()> {
+        use crate::tool_call::{TOOL_CALL_OPEN, TOOL_CALL_TAIL, tool_call_head};
+
+        let call = shell_call("call_1", "ls");
+        let prompt = AgentPrompt {
+            messages: vec![
+                AgentMessage::User {
+                    content: "List files.".to_owned(),
+                },
+                AgentMessage::Assistant {
+                    content: None,
+                    tool_call: Some(call.clone()),
+                },
+                AgentMessage::Tool {
+                    content: "ok".to_owned(),
+                    tool_call_id: "call_1".to_owned(),
+                },
+            ],
+            tools: vec![shell_tool()],
+            directive: AgentDirective::Auto,
+        };
+        let envelope = format!(
+            "{TOOL_CALL_OPEN}{}{}{TOOL_CALL_TAIL}",
+            tool_call_head(&serde_json::to_string(&call.name)?),
+            call.arguments
+        );
+        let rendered = format_qwen3_agent_prompt(AgentTemplateProfile::Qwen3Current, &prompt)?;
+        assert!(rendered.contains(&format!("<|im_start|>assistant\n{envelope}<|im_end|>\n")));
+
+        let mut no_tools = prompt;
+        no_tools.tools.clear();
+        assert!(
+            format_qwen3_agent_prompt(AgentTemplateProfile::Qwen3Current, &no_tools)
+                .unwrap_err()
+                .to_string()
+                .contains("requires at least one declared tool")
         );
         Ok(())
     }

@@ -1,4 +1,5 @@
-//! Fail-closed constrained decoding for strict JSON response formats.
+//! Fail-closed constrained decoding for strict JSON response formats and
+//! native tool calls.
 //!
 //! The grammar checks a candidate token's complete decoded byte fragment
 //! before the sampler may select it. It deliberately does not accept token
@@ -13,6 +14,10 @@
 //! `additionalProperties: false`. `enum` and `const` values are emitted using
 //! their canonical `serde_json` spelling, which is a valid (and deterministic)
 //! subset of the representations accepted by JSON Schema.
+//!
+//! Native tool calls wrap the same argument grammar in the Qwen3 call
+//! envelope. [`LazyToolCallConstraint`] leaves ordinary text unconstrained
+//! and applies that envelope only after the model opens a call.
 
 use std::{
     collections::{BTreeSet, HashSet, VecDeque},
@@ -23,7 +28,10 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value};
 use tokenizers::{Tokenizer, tokenizer::step_decode_stream};
 
-use crate::sampling::LogitsConstraint;
+use crate::{
+    sampling::LogitsConstraint,
+    tool_call::{TOOL_CALL_OPEN, TOOL_CALL_TAIL, ToolCallScan, scan_tool_call, tool_call_head},
+};
 
 /// Default hard limit for one constrained response.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -57,9 +65,36 @@ impl CompiledJsonSchema {
     /// not conform to their own `type` plus `enum`/`const` constraints.
     pub fn compile(schema: &Value) -> Result<Self> {
         Ok(Self {
-            root: compile_schema_node(schema, "$", 0)?,
+            root: compile_schema_node(schema, "$", 0, SchemaMode::Strict)?,
         })
     }
+
+    /// Compile a non-strict function schema by closing every object to its
+    /// declared properties. `additionalProperties` may be absent or boolean
+    /// and `required` may name a subset of the properties; every other rule of
+    /// the strict subset still applies. Closing only narrows the accepted
+    /// values, so any value the result accepts is valid under the original
+    /// schema.
+    pub fn compile_closed(schema: &Value) -> Result<Self> {
+        Ok(Self {
+            root: compile_schema_node(schema, "$", 0, SchemaMode::Closed)?,
+        })
+    }
+
+    /// Whether a complete JSON value conforms to the compiled schema.
+    #[must_use]
+    pub fn accepts(&self, value: &Value) -> bool {
+        node_conforms(&self.root, value)
+    }
+}
+
+/// How object schemas are admitted into the compiled subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaMode {
+    /// OpenAI strict mode: closed objects whose properties are all required.
+    Strict,
+    /// A non-strict schema narrowed to its declared properties.
+    Closed,
 }
 
 /// Result of applying a grammar mask to one logit row.
@@ -142,24 +177,7 @@ impl JsonSchemaTokenConstraint {
         eos_token_ids: Vec<u32>,
         grammar: JsonSchemaGrammar,
     ) -> Result<Self> {
-        ensure!(
-            !eos_token_ids.is_empty(),
-            "at least one EOS token ID is required"
-        );
-        let vocabulary_size = tokenizer.get_vocab_size(true);
-        let eos_count = eos_token_ids.len();
-        let eos = eos_token_ids.into_iter().collect::<BTreeSet<_>>();
-        ensure!(
-            eos.len() == eos_count,
-            "EOS token ID list contains duplicates"
-        );
-        for token_id in &eos {
-            let token_index = usize::try_from(*token_id).context("EOS token ID exceeds usize")?;
-            ensure!(
-                token_index < vocabulary_size,
-                "EOS token ID {token_id} is outside tokenizer vocabulary size {vocabulary_size}"
-            );
-        }
+        let eos = validate_eos_token_ids(&tokenizer, eos_token_ids)?;
         Ok(Self {
             tokenizer,
             eos_token_ids: eos,
@@ -186,19 +204,7 @@ impl JsonSchemaTokenConstraint {
     }
 
     fn candidate_step(&self, token_id: u32) -> Result<(DecoderState, Option<String>)> {
-        let mut next = self.decoder.clone();
-        let fragment = step_decode_stream(
-            self.tokenizer.as_ref(),
-            vec![token_id],
-            true,
-            &mut next.ids,
-            &mut next.prefix,
-            &mut next.prefix_index,
-        )
-        .map_err(|error| {
-            anyhow::anyhow!("tokenizer rejected candidate token {token_id}: {error}")
-        })?;
-        Ok((next, fragment))
+        decode_candidate(&self.tokenizer, &self.decoder, token_id)
     }
 
     fn candidate_is_allowed(&self, token_id: u32) -> bool {
@@ -214,6 +220,48 @@ impl JsonSchemaTokenConstraint {
             .filter(|fragment| !fragment.is_empty())
             .is_some_and(|fragment| self.grammar.allows_token_text(&fragment))
     }
+}
+
+fn validate_eos_token_ids(tokenizer: &Tokenizer, eos_token_ids: Vec<u32>) -> Result<BTreeSet<u32>> {
+    ensure!(
+        !eos_token_ids.is_empty(),
+        "at least one EOS token ID is required"
+    );
+    let vocabulary_size = tokenizer.get_vocab_size(true);
+    let eos_count = eos_token_ids.len();
+    let eos = eos_token_ids.into_iter().collect::<BTreeSet<_>>();
+    ensure!(
+        eos.len() == eos_count,
+        "EOS token ID list contains duplicates"
+    );
+    for token_id in &eos {
+        let token_index = usize::try_from(*token_id).context("EOS token ID exceeds usize")?;
+        ensure!(
+            token_index < vocabulary_size,
+            "EOS token ID {token_id} is outside tokenizer vocabulary size {vocabulary_size}"
+        );
+    }
+    Ok(eos)
+}
+
+/// Decode one candidate against a cloned decoder state, returning the state
+/// selecting it would produce and its exact context-sensitive text delta.
+fn decode_candidate(
+    tokenizer: &Tokenizer,
+    decoder: &DecoderState,
+    token_id: u32,
+) -> Result<(DecoderState, Option<String>)> {
+    let mut next = decoder.clone();
+    let fragment = step_decode_stream(
+        tokenizer,
+        vec![token_id],
+        true,
+        &mut next.ids,
+        &mut next.prefix,
+        &mut next.prefix_index,
+    )
+    .map_err(|error| anyhow::anyhow!("tokenizer rejected candidate token {token_id}: {error}"))?;
+    Ok((next, fragment))
 }
 
 impl LogitsConstraint for JsonSchemaTokenConstraint {
@@ -428,6 +476,331 @@ impl JsonSchemaGrammar {
     }
 }
 
+/// One declared function a model-chosen native call may name.
+#[derive(Debug, Clone)]
+struct ToolCallSchema {
+    name: String,
+    /// Canonical envelope bytes from after `<tool_call>` up to the arguments.
+    head: Vec<u8>,
+    arguments: CompiledJsonSchema,
+}
+
+/// The calls a lazily constrained native tool turn may produce: one declared
+/// name followed by arguments valid under that function's compiled schema.
+#[derive(Debug, Clone)]
+pub struct CompiledToolCalls {
+    tools: Vec<ToolCallSchema>,
+}
+
+impl CompiledToolCalls {
+    /// Pair each declared function name with its compiled arguments schema.
+    pub fn new(tools: impl IntoIterator<Item = (String, CompiledJsonSchema)>) -> Result<Self> {
+        let mut names = HashSet::new();
+        let mut compiled = Vec::new();
+        for (name, arguments) in tools {
+            ensure!(!name.is_empty(), "tool names must not be empty");
+            ensure!(names.insert(name.clone()), "duplicate tool name {name:?}");
+            let encoded = serde_json::to_string(&name).context("serializing tool name")?;
+            compiled.push(ToolCallSchema {
+                head: tool_call_head(&encoded).into_bytes(),
+                name,
+                arguments,
+            });
+        }
+        ensure!(
+            !compiled.is_empty(),
+            "a native tool call grammar requires at least one declared tool"
+        );
+        Ok(Self { tools: compiled })
+    }
+
+    /// Check a parsed call against the declared names and their schemas.
+    /// The serving layer re-validates constrained output with this before
+    /// exposing it, so a grammar defect cannot leak an invalid call.
+    pub fn validate_call(&self, name: &str, arguments: &Value) -> Result<()> {
+        let tool = self
+            .tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .with_context(|| format!("tool `{name}` is not declared"))?;
+        ensure!(
+            arguments.is_object(),
+            "tool `{name}` arguments are not a JSON object"
+        );
+        ensure!(
+            tool.arguments.accepts(arguments),
+            "tool `{name}` arguments do not satisfy its schema"
+        );
+        Ok(())
+    }
+}
+
+/// Request-local grammar for the bytes after a native call's opening tag:
+/// `\n{"name": "<declared>", "arguments": <schema-valid object>}\n</tool_call>`.
+///
+/// The envelope is the canonical spelling Qwen3 is prompted with. Only the
+/// arguments object admits JSON whitespace; once the closing tag completes,
+/// no further byte is viable.
+#[derive(Debug, Clone)]
+pub struct ToolCallGrammar {
+    calls: CompiledToolCalls,
+    output: Vec<u8>,
+    max_output_bytes: usize,
+}
+
+impl ToolCallGrammar {
+    #[must_use]
+    pub fn new(calls: CompiledToolCalls) -> Self {
+        Self {
+            calls,
+            output: Vec::new(),
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+        }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> GrammarStatus {
+        analyze_tool_call(&self.calls.tools, &self.output, self.max_output_bytes)
+    }
+
+    #[must_use]
+    pub fn can_end(&self) -> bool {
+        self.status() == GrammarStatus::Complete
+    }
+
+    /// Return the already-validated UTF-8 call text after the opening tag.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the UTF-8 invariant kept by [`Self::commit_token_text`]
+    /// is violated.
+    #[must_use]
+    pub fn output_text(&self) -> &str {
+        std::str::from_utf8(&self.output).expect("grammar output is valid UTF-8")
+    }
+
+    /// Check a candidate's exact decoded text without mutating state.
+    #[must_use]
+    pub fn allows_token_text(&self, token_text: &str) -> bool {
+        if token_text.is_empty()
+            || self.output.len().saturating_add(token_text.len()) > self.max_output_bytes
+        {
+            return false;
+        }
+        let mut candidate = self.output.clone();
+        candidate.extend_from_slice(token_text.as_bytes());
+        analyze_tool_call(&self.calls.tools, &candidate, self.max_output_bytes)
+            != GrammarStatus::Dead
+    }
+
+    pub fn commit_token_text(&mut self, token_text: &str) -> Result<GrammarStatus> {
+        ensure!(!token_text.is_empty(), "grammar tokens must make progress");
+        ensure!(
+            self.allows_token_text(token_text),
+            "token text makes the native tool call impossible"
+        );
+        self.output.extend_from_slice(token_text.as_bytes());
+        Ok(self.status())
+    }
+
+    /// Ensure generation ended at a complete, closed native call.
+    pub fn finish(&self) -> Result<()> {
+        ensure!(
+            self.can_end(),
+            "generation ended before the native tool call was complete"
+        );
+        Ok(())
+    }
+}
+
+fn analyze_tool_call(
+    tools: &[ToolCallSchema],
+    bytes: &[u8],
+    max_output_bytes: usize,
+) -> GrammarStatus {
+    if bytes.len() > max_output_bytes || std::str::from_utf8(bytes).is_err() {
+        return GrammarStatus::Dead;
+    }
+    let mut viable = false;
+    let mut complete = false;
+    for tool in tools {
+        let head = match_terminal(bytes, 0, &tool.head);
+        viable |= head.incomplete;
+        for after_head in head.complete {
+            let arguments = parse_node(&tool.arguments.root, bytes, after_head, 0);
+            viable |= arguments.incomplete;
+            for arguments_end in arguments.complete {
+                let tail = match_terminal(bytes, arguments_end, TOOL_CALL_TAIL.as_bytes());
+                viable |= tail.incomplete;
+                complete |= tail.complete.contains(&bytes.len());
+            }
+        }
+    }
+    if complete {
+        GrammarStatus::Complete
+    } else if viable {
+        GrammarStatus::Viable
+    } else {
+        GrammarStatus::Dead
+    }
+}
+
+/// Tool-choice `auto` sampling constraint for the native Qwen3 call syntax.
+///
+/// Like llama.cpp's lazy grammars, sampling is unconstrained while the
+/// decoded output is ordinary text or reasoning. Once [`scan_tool_call`]
+/// sees the opening tag, every candidate is checked against
+/// [`ToolCallGrammar`], and after `</tool_call>` completes only EOS remains
+/// selectable, so a turn carries at most one call. Text answers are never
+/// masked and pay only one incremental decode per sampled token.
+///
+/// The opening tag itself is sampled without a mask. If the token completing
+/// it also carries bytes the envelope rejects, the commit fails and the
+/// request errors instead of exposing an unconstrained call. Qwen3 emits the
+/// tag as one atomic added token, so this is a defensive boundary.
+#[derive(Clone)]
+pub struct LazyToolCallConstraint {
+    tokenizer: Arc<Tokenizer>,
+    eos_token_ids: BTreeSet<u32>,
+    decoder: DecoderState,
+    /// Decoded output before the call opened, rescanned for the opening tag.
+    text: String,
+    grammar: ToolCallGrammar,
+    call_opened: bool,
+    finished: bool,
+}
+
+impl LazyToolCallConstraint {
+    pub fn new(
+        tokenizer: Arc<Tokenizer>,
+        eos_token_ids: Vec<u32>,
+        calls: CompiledToolCalls,
+    ) -> Result<Self> {
+        let eos = validate_eos_token_ids(&tokenizer, eos_token_ids)?;
+        Ok(Self {
+            tokenizer,
+            eos_token_ids: eos,
+            decoder: DecoderState::default(),
+            text: String::new(),
+            grammar: ToolCallGrammar::new(calls),
+            call_opened: false,
+            finished: false,
+        })
+    }
+
+    #[must_use]
+    pub fn grammar(&self) -> &ToolCallGrammar {
+        &self.grammar
+    }
+
+    /// Whether the decoded output has opened a native call.
+    #[must_use]
+    pub const fn call_opened(&self) -> bool {
+        self.call_opened
+    }
+
+    #[must_use]
+    pub const fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    fn call_candidate_is_allowed(&self, token_id: u32) -> bool {
+        if self.eos_token_ids.contains(&token_id) {
+            return self.grammar.can_end();
+        }
+        if self.grammar.can_end() {
+            return false;
+        }
+        decode_candidate(&self.tokenizer, &self.decoder, token_id)
+            .ok()
+            .and_then(|(_, fragment)| fragment)
+            .filter(|fragment| !fragment.is_empty())
+            .is_some_and(|fragment| self.grammar.allows_token_text(&fragment))
+    }
+}
+
+impl LogitsConstraint for LazyToolCallConstraint {
+    fn mask_logits(&mut self, logits: &mut [f32]) -> Result<()> {
+        ensure!(
+            !self.finished,
+            "cannot sample after the tool-call constraint selected EOS"
+        );
+        if !self.call_opened {
+            return Ok(());
+        }
+        for (index, logit) in logits.iter_mut().enumerate() {
+            if !logit.is_finite() {
+                continue;
+            }
+            let token_id = u32::try_from(index).context("vocabulary exceeds u32 token IDs")?;
+            if !self.call_candidate_is_allowed(token_id) {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
+        ensure!(
+            logits.iter().any(|logit| logit.is_finite()),
+            "native tool call grammar rejected every finite token candidate"
+        );
+        Ok(())
+    }
+
+    fn commit_token(&mut self, token_id: u32) -> Result<()> {
+        ensure!(
+            !self.finished,
+            "cannot commit a token after the tool-call constraint selected EOS"
+        );
+        if self.eos_token_ids.contains(&token_id) {
+            ensure!(
+                !self.call_opened || self.grammar.can_end(),
+                "cannot commit EOS inside an incomplete native tool call"
+            );
+            self.finished = true;
+            return Ok(());
+        }
+
+        let (next_decoder, fragment) = decode_candidate(&self.tokenizer, &self.decoder, token_id)?;
+        if self.call_opened {
+            ensure!(
+                !self.grammar.can_end(),
+                "only EOS may follow a complete native tool call"
+            );
+            let fragment = fragment
+                .filter(|fragment| !fragment.is_empty())
+                .with_context(|| {
+                    format!(
+                        "token {token_id} produced no text inside a native tool call; pending byte-fallback and skipped special tokens are conservatively rejected"
+                    )
+                })?;
+            self.grammar.commit_token_text(&fragment)?;
+            self.decoder = next_decoder;
+            return Ok(());
+        }
+
+        self.decoder = next_decoder;
+        if let Some(fragment) = fragment {
+            self.text.push_str(&fragment);
+        }
+        if let ToolCallScan::Call { open, .. } = scan_tool_call(&self.text) {
+            self.call_opened = true;
+            let after_open = &self.text[open + TOOL_CALL_OPEN.len()..];
+            if !after_open.is_empty() {
+                self.grammar.commit_token_text(after_open).context(
+                    "text sampled with the tool-call opening tag does not fit the call envelope",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<()> {
+        if self.call_opened {
+            self.grammar.finish()
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SchemaNode {
     kind: Option<SchemaKind>,
@@ -464,7 +837,12 @@ struct PropertySchema {
     required: bool,
 }
 
-fn compile_schema_node(schema: &Value, path: &str, depth: usize) -> Result<SchemaNode> {
+fn compile_schema_node(
+    schema: &Value,
+    path: &str,
+    depth: usize,
+    mode: SchemaMode,
+) -> Result<SchemaNode> {
     ensure!(
         depth <= MAX_SCHEMA_DEPTH,
         "schema nesting exceeds {MAX_SCHEMA_DEPTH} at {path}"
@@ -488,8 +866,8 @@ fn compile_schema_node(schema: &Value, path: &str, depth: usize) -> Result<Schem
         .transpose()?;
 
     let kind = match type_name {
-        Some("object") => Some(compile_object_schema(object, path, depth)?),
-        Some("array") => Some(compile_array_schema(object, path, depth)?),
+        Some("object") => Some(compile_object_schema(object, path, depth, mode)?),
+        Some("array") => Some(compile_array_schema(object, path, depth, mode)?),
         Some("string") => {
             reject_unknown_keywords(object, path, &["type", "enum", "const"])?;
             Some(SchemaKind::String)
@@ -544,6 +922,7 @@ fn compile_object_schema(
     object: &Map<String, Value>,
     path: &str,
     depth: usize,
+    mode: SchemaMode,
 ) -> Result<SchemaKind> {
     reject_unknown_keywords(
         object,
@@ -557,10 +936,18 @@ fn compile_object_schema(
             "const",
         ],
     )?;
-    ensure!(
-        object.get("additionalProperties") == Some(&Value::Bool(false)),
-        "{path}.additionalProperties must be explicitly false"
-    );
+    match mode {
+        SchemaMode::Strict => ensure!(
+            object.get("additionalProperties") == Some(&Value::Bool(false)),
+            "{path}.additionalProperties must be explicitly false"
+        ),
+        SchemaMode::Closed => ensure!(
+            object
+                .get("additionalProperties")
+                .is_none_or(Value::is_boolean),
+            "{path}.additionalProperties must be absent or a boolean"
+        ),
+    }
     let properties = object
         .get("properties")
         .and_then(Value::as_object)
@@ -570,10 +957,13 @@ fn compile_object_schema(
         "{path}.properties exceeds the limit of {MAX_SCHEMA_PROPERTIES}"
     );
 
-    let required_array = object
-        .get("required")
-        .and_then(Value::as_array)
-        .with_context(|| format!("{path}.required must list every property"))?;
+    let no_required = Vec::new();
+    let required_array = match (object.get("required"), mode) {
+        (None, SchemaMode::Closed) => &no_required,
+        (required, _) => required
+            .and_then(Value::as_array)
+            .with_context(|| format!("{path}.required must list every property"))?,
+    };
     let mut required = HashSet::new();
     for (index, value) in required_array.iter().enumerate() {
         let name = value
@@ -591,7 +981,7 @@ fn compile_object_schema(
         );
     }
     ensure!(
-        required.len() == properties.len(),
+        mode == SchemaMode::Closed || required.len() == properties.len(),
         "{path}.required must contain every property in strict mode"
     );
 
@@ -601,7 +991,7 @@ fn compile_object_schema(
         compiled.push(PropertySchema {
             name: name.clone(),
             encoded_name: serde_json::to_vec(name).context("serializing JSON property name")?,
-            schema: compile_schema_node(property_schema, &property_path, depth + 1)?,
+            schema: compile_schema_node(property_schema, &property_path, depth + 1, mode)?,
             required: required.contains(name),
         });
     }
@@ -614,6 +1004,7 @@ fn compile_array_schema(
     object: &Map<String, Value>,
     path: &str,
     depth: usize,
+    mode: SchemaMode,
 ) -> Result<SchemaKind> {
     reject_unknown_keywords(object, path, &["type", "items", "enum", "const"])?;
     let items = object
@@ -623,6 +1014,7 @@ fn compile_array_schema(
         items,
         &format!("{path}.items"),
         depth + 1,
+        mode,
     )?)))
 }
 
@@ -1317,6 +1709,137 @@ mod tests {
                 "schema should fail closed: {schema}"
             );
         }
+    }
+
+    fn shell_schema() -> Value {
+        // RestLoop's declaration: non-strict, open, every property required.
+        json!({
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"]
+        })
+    }
+
+    #[test]
+    fn closed_compilation_narrows_non_strict_objects_to_declared_properties() -> Result<()> {
+        assert!(CompiledJsonSchema::compile(&shell_schema()).is_err());
+        let shell = CompiledJsonSchema::compile_closed(&shell_schema())?;
+        assert!(shell.accepts(&json!({"command": "ls"})));
+        assert!(!shell.accepts(&json!({"command": "ls", "cwd": "/"})));
+        assert!(!shell.accepts(&json!({})));
+        assert!(!shell.accepts(&json!({"command": 1})));
+
+        let optional = CompiledJsonSchema::compile_closed(&json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "lines": {"type": "integer"}},
+            "required": ["path"],
+            "additionalProperties": true
+        }))?;
+        assert!(optional.accepts(&json!({"path": "a"})));
+        assert!(optional.accepts(&json!({"lines": 3, "path": "a"})));
+        assert!(!optional.accepts(&json!({"lines": 3})));
+        let mut grammar = JsonSchemaGrammar::new(optional);
+        grammar.commit_token_text("{\"path\": \"a\"")?;
+        assert!(grammar.allows_token_text("}"));
+        assert!(grammar.allows_token_text(", \"lines\": 2}"));
+        assert!(!grammar.allows_token_text(", \"other\""));
+
+        for schema in [
+            json!({"type": "object"}),
+            json!({"type": "object", "properties": {}, "additionalProperties": {"type": "string"}}),
+            json!({"type": "object", "properties": {"a": {"type": "string", "minLength": 1}}}),
+            json!({"type": "object", "properties": {}, "required": ["missing"]}),
+        ] {
+            assert!(
+                CompiledJsonSchema::compile_closed(&schema).is_err(),
+                "schema should fail closed: {schema}"
+            );
+        }
+        Ok(())
+    }
+
+    fn tool_calls() -> Result<CompiledToolCalls> {
+        CompiledToolCalls::new([
+            (
+                "shell".to_owned(),
+                CompiledJsonSchema::compile_closed(&shell_schema())?,
+            ),
+            (
+                "shelf".to_owned(),
+                CompiledJsonSchema::compile(&json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }))?,
+            ),
+        ])
+    }
+
+    #[test]
+    fn tool_call_grammar_accepts_one_canonical_envelope_for_a_declared_tool() -> Result<()> {
+        let mut grammar = ToolCallGrammar::new(tool_calls()?);
+        assert_eq!(grammar.status(), GrammarStatus::Viable);
+        for fragment in [
+            "\n{\"name\": \"",
+            "shel",
+            "l\", \"arguments\": ",
+            "{\"command\": ",
+            "\"ls -la\"}",
+            "}\n",
+            "</tool_call>",
+        ] {
+            assert_ne!(grammar.commit_token_text(fragment)?, GrammarStatus::Dead);
+        }
+        assert_eq!(grammar.status(), GrammarStatus::Complete);
+        grammar.finish()?;
+        assert!(!grammar.allows_token_text("\n"));
+        assert!(!grammar.allows_token_text("<tool_call>"));
+        assert_eq!(
+            grammar.output_text(),
+            "\n{\"name\": \"shell\", \"arguments\": {\"command\": \"ls -la\"}}\n</tool_call>"
+        );
+
+        let fresh = ToolCallGrammar::new(tool_calls()?);
+        assert!(fresh.finish().is_err());
+        for dead in [
+            "{",
+            "\n{\"name\":\"shell\"",
+            "\n{\"name\": \"rm\"",
+            "\n{\"name\": \"shell\", \"arguments\": {\"cmd\"",
+            "\n{\"name\": \"shell\", \"arguments\": {\"command\": 1",
+            "\n{\"name\": \"shell\", \"arguments\": {}}",
+            "\n{\"name\": \"shelf\", \"arguments\": {\"command\"",
+            "\n{\"name\": \"shelf\", \"arguments\": {}}\n</tool_call>\n",
+        ] {
+            assert!(!fresh.allows_token_text(dead), "{dead:?}");
+        }
+        assert!(fresh.allows_token_text("\n{\"name\": \"shelf\", \"arguments\": {}}\n</tool_"));
+        Ok(())
+    }
+
+    #[test]
+    fn tool_call_validation_rechecks_names_and_schemas() -> Result<()> {
+        let calls = tool_calls()?;
+        calls.validate_call("shell", &json!({"command": "ls"}))?;
+        calls.validate_call("shelf", &json!({}))?;
+        assert!(calls.validate_call("rm", &json!({})).is_err());
+        assert!(
+            calls
+                .validate_call("shell", &json!({"command": 1}))
+                .is_err()
+        );
+        assert!(calls.validate_call("shell", &json!(["ls"])).is_err());
+        assert!(CompiledToolCalls::new([]).is_err());
+        let schema = CompiledJsonSchema::compile_closed(&shell_schema())?;
+        assert!(
+            CompiledToolCalls::new([
+                ("shell".to_owned(), schema.clone()),
+                ("shell".to_owned(), schema)
+            ])
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]

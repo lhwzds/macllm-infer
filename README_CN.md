@@ -24,7 +24,8 @@ tokenization、批处理、缓存、采样和服务层由所有模型复用。�
   exact-token automatic prefix cache。
 - 通过共用同一 runtime 的 `run`、`embed` 和 `rerank` 命令完成生成、向量嵌入和重排序。
 - 纯文本 Chat Completions-compatible API 子集，支持受约束 JSON 生成、stop sequence、
-  已适配 Qwen3/Qwen3MoE profile 的 forced native tool call，以及 cached-token 统计。
+  已适配 Qwen3/Qwen3MoE profile 的 native tool call（forced，或 `tool_choice=auto`，
+  每轮最多一个受 grammar 约束的调用），以及 cached-token 统计。
 - 固定模型和 runtime provenance 的 MacLLM/llama.cpp 可重复 benchmark。
 
 当前已经完成真实验证的垂直切片包括 SmolLM3-3B Q4_K_M 生成，以及 Qwen3

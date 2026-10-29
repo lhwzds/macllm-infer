@@ -25,10 +25,12 @@ use crate::{
         GenerationPreparation, GenerationPreview, GenerationSequence, GenerationStep,
         PreparedGeneration, PreparedGenerationPhase, TokenControl,
     },
-    grammar::{CompiledJsonSchema, JsonSchemaTokenConstraint},
+    grammar::{
+        CompiledJsonSchema, CompiledToolCalls, JsonSchemaTokenConstraint, LazyToolCallConstraint,
+    },
     output::StopFilter,
     runtime::{LoadedRuntime, ModelLoadConfig},
-    sampling::{Sampler, SamplingConfig},
+    sampling::{LogitsConstraint, Sampler, SamplingConfig},
     token_stream::TokenStream,
 };
 
@@ -93,7 +95,8 @@ pub enum EngineInput {
         constraint: EngineConstraintSpec,
     },
     /// Render a protocol-independent prompt through a pinned native model
-    /// profile. Forced calls carry a tool-arguments constraint; completed
+    /// profile. Forced calls carry a tool-arguments constraint, automatic
+    /// tool choice carries a lazy native tool-call constraint, and completed
     /// tool history may also request an ordinary text turn without one.
     Agent {
         prompt: AgentPrompt,
@@ -119,13 +122,24 @@ impl EngineInput {
 pub enum EngineConstraintPurpose {
     ResponseFormat,
     ToolArguments,
+    /// Tool choice `auto`: text stays free until the model opens a call.
+    ToolCall,
+}
+
+/// The grammar a request-local constraint enforces.
+#[derive(Debug, Clone)]
+pub enum EngineConstraintGrammar {
+    /// The whole generated text is one schema-valid JSON value.
+    JsonSchema(CompiledJsonSchema),
+    /// At most one native call, constrained only after it opens.
+    LazyToolCall(CompiledToolCalls),
 }
 
 /// Cloneable, already-validated request-local sampling constraint.
 #[derive(Debug, Clone)]
 pub struct EngineConstraintSpec {
     pub purpose: EngineConstraintPurpose,
-    pub schema: CompiledJsonSchema,
+    pub grammar: EngineConstraintGrammar,
 }
 
 impl EngineConstraintSpec {
@@ -133,7 +147,7 @@ impl EngineConstraintSpec {
     pub const fn response_format(schema: CompiledJsonSchema) -> Self {
         Self {
             purpose: EngineConstraintPurpose::ResponseFormat,
-            schema,
+            grammar: EngineConstraintGrammar::JsonSchema(schema),
         }
     }
 
@@ -141,7 +155,15 @@ impl EngineConstraintSpec {
     pub const fn tool_arguments(schema: CompiledJsonSchema) -> Self {
         Self {
             purpose: EngineConstraintPurpose::ToolArguments,
-            schema,
+            grammar: EngineConstraintGrammar::JsonSchema(schema),
+        }
+    }
+
+    #[must_use]
+    pub const fn tool_call(calls: CompiledToolCalls) -> Self {
+        Self {
+            purpose: EngineConstraintPurpose::ToolCall,
+            grammar: EngineConstraintGrammar::LazyToolCall(calls),
         }
     }
 
@@ -149,6 +171,7 @@ impl EngineConstraintSpec {
         match self.purpose {
             EngineConstraintPurpose::ResponseFormat => "response_format.json_schema",
             EngineConstraintPurpose::ToolArguments => "tool arguments JSON schema",
+            EngineConstraintPurpose::ToolCall => "native tool call",
         }
     }
 }
@@ -1605,7 +1628,7 @@ impl<'a> ServingScheduler<'a> {
         )?;
         sequence.set_publish_prompt_prefix(job.request_policy.publish_prompt_prefix)?;
         if let Some(constraint) = logits_constraint
-            && let Err(error) = sequence.set_logits_constraint(Box::new(constraint))
+            && let Err(error) = sequence.set_logits_constraint(constraint)
         {
             let session = sequence.reclaim_session(self.runtime.model.as_ref())?;
             self.sessions.push(session);
@@ -2619,16 +2642,24 @@ impl<'a> ServingScheduler<'a> {
 fn initialize_logits_constraint(
     runtime: &LoadedRuntime,
     spec: Option<EngineConstraintSpec>,
-) -> Result<Option<JsonSchemaTokenConstraint>> {
-    match spec {
-        Some(EngineConstraintSpec { schema, .. }) => JsonSchemaTokenConstraint::new(
-            Arc::clone(&runtime.tokenizer),
-            runtime.model.runtime_spec().stop_token_ids.clone(),
+) -> Result<Option<Box<dyn LogitsConstraint>>> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let tokenizer = Arc::clone(&runtime.tokenizer);
+    let stop_token_ids = runtime.model.runtime_spec().stop_token_ids.clone();
+    Ok(Some(match spec.grammar {
+        EngineConstraintGrammar::JsonSchema(schema) => Box::new(JsonSchemaTokenConstraint::new(
+            tokenizer,
+            stop_token_ids,
             schema,
-        )
-        .map(Some),
-        None => Ok(None),
-    }
+        )?),
+        EngineConstraintGrammar::LazyToolCall(calls) => Box::new(LazyToolCallConstraint::new(
+            tokenizer,
+            stop_token_ids,
+            calls,
+        )?),
+    }))
 }
 
 fn kv_capacity_rejection(

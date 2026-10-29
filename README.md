@@ -26,8 +26,9 @@ compatibility, output correctness, memory use, and performance—not an ABI targ
 - Generation, embedding, and reranking through the `run`, `embed`, and `rerank`
   commands, backed by the same runtime.
 - A text-only Chat Completions-compatible API subset with constrained JSON
-  generation, stop sequences, forced native tool calls for supported
-  Qwen3/Qwen3MoE profiles, and cached-token accounting.
+  generation, stop sequences, native tool calls for supported Qwen3/Qwen3MoE
+  profiles (forced, or `tool_choice=auto` with at most one grammar-constrained
+  call per turn), and cached-token accounting.
 - Reproducible MacLLM/llama.cpp benchmarks with pinned model and runtime provenance.
 
 The current validated vertical slices include SmolLM3-3B Q4_K_M generation and

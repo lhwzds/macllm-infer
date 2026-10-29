@@ -36,4 +36,5 @@ pub mod runtime;
 pub mod sampling;
 pub mod server;
 pub mod token_stream;
+pub mod tool_call;
 pub mod weights;

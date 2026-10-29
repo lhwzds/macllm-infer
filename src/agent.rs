@@ -70,18 +70,24 @@ impl AgentPrompt {
                 "duplicate tool name `{}`",
                 tool.name
             );
-            ensure!(tool.strict, "native agent tools must use strict schemas");
             ensure!(
                 tool.parameters.is_object(),
                 "tool parameters must be a JSON object"
             );
         }
-        if let AgentDirective::ForcedSingle { name } = &self.directive {
-            reject_native_control("forced tool name", name)?;
-            ensure!(
-                self.tools.iter().any(|tool| tool.name == *name),
-                "forced tool `{name}` is not declared"
-            );
+        match &self.directive {
+            AgentDirective::TextOnly => {}
+            AgentDirective::ForcedSingle { name } => {
+                reject_native_control("forced tool name", name)?;
+                ensure!(
+                    self.tools.iter().any(|tool| tool.name == *name),
+                    "forced tool `{name}` is not declared"
+                );
+            }
+            AgentDirective::Auto => ensure!(
+                !self.tools.is_empty(),
+                "automatic tool choice requires at least one declared tool"
+            ),
         }
 
         let mut state = AgentHistoryState::NeedUser;
@@ -115,10 +121,6 @@ impl AgentPrompt {
                         "assistant message is out of order"
                     );
                     if let Some(call) = tool_call {
-                        ensure!(
-                            content.is_none(),
-                            "assistant tool-call history requires empty content"
-                        );
                         ensure!(!call.id.is_empty(), "tool call id must not be empty");
                         ensure!(!call.name.is_empty(), "tool call name must not be empty");
                         reject_native_control("tool call id", &call.id)?;
@@ -170,13 +172,20 @@ pub enum AgentTemplateProfile {
     Qwen3Gguf,
 }
 
-/// Whether the next assistant turn is ordinary text or exactly one named
-/// function call.  The forced form renders the function envelope into the
-/// prompt so the model generates only its JSON arguments.
+/// Whether the next assistant turn is ordinary text, exactly one named
+/// function call, or the model's choice between the two.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentDirective {
     TextOnly,
-    ForcedSingle { name: String },
+    /// The prompt ends inside the function envelope so the model generates
+    /// only its JSON arguments.
+    ForcedSingle {
+        name: String,
+    },
+    /// The prompt ends at an open assistant turn. The model may answer in
+    /// text, or emit text followed by at most one native call to a declared
+    /// tool; a lazy grammar constrains the call once it opens.
+    Auto,
 }
 
 /// A protocol-neutral function declaration.
@@ -199,7 +208,8 @@ pub struct ToolCall {
 
 /// The deliberately small history subset supported by the first native tool
 /// runtime.  Validation permits at most one call and exactly one matching
-/// response per assistant tool turn.
+/// response per assistant tool turn.  A tool-call turn may also carry the
+/// visible text (including reasoning) the model produced before its call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentMessage {
     System {
