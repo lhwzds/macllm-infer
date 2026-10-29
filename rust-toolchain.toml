@@ -1,0 +1,6 @@
+# Pinned so every machine builds with the toolchain that passes the README
+# checks: older releases cannot build candle 0.11, and newer clippy releases
+# add lints the tree does not yet satisfy.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
