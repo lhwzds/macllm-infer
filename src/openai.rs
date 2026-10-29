@@ -140,15 +140,15 @@ impl ChatCompletionRequest {
             ));
         }
 
-        let temperature = self.temperature.unwrap_or(DEFAULT_TEMPERATURE);
-        if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+        let temperature = self.temperature;
+        if temperature.is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)) {
             return Err(invalid_value(
                 "temperature",
                 "temperature must be finite and in [0, 2]",
             ));
         }
-        let top_p = self.top_p.unwrap_or(DEFAULT_TOP_P);
-        if !(top_p.is_finite() && 0.0 < top_p && top_p <= 1.0) {
+        let top_p = self.top_p;
+        if top_p.is_some_and(|value| !(value.is_finite() && 0.0 < value && value <= 1.0)) {
             return Err(invalid_value("top_p", "top_p must be finite and in (0, 1]"));
         }
         let seed = self
@@ -472,8 +472,11 @@ pub struct ValidatedChatCompletionRequest {
     pub stream: bool,
     pub include_usage: bool,
     pub max_completion_tokens: usize,
-    pub temperature: f64,
-    pub top_p: f64,
+    /// `None` when the request omitted it; the server's sampling profile
+    /// supplies the value.
+    pub temperature: Option<f64>,
+    /// `None` when the request omitted it; see `temperature`.
+    pub top_p: Option<f64>,
     pub seed: Option<u64>,
     pub stop: Vec<String>,
     pub response_format: Option<ResponseFormat>,
@@ -1740,8 +1743,8 @@ mod tests {
         assert!(!request.stream);
         assert!(!request.include_usage);
         assert_eq!(request.max_completion_tokens, 128);
-        assert!((request.temperature - 1.0).abs() < f64::EPSILON);
-        assert!((request.top_p - 1.0).abs() < f64::EPSILON);
+        assert_eq!(request.temperature, None);
+        assert_eq!(request.top_p, None);
         assert_eq!(request.seed, None);
     }
 
@@ -1768,8 +1771,8 @@ mod tests {
         assert!(request.stream);
         assert!(request.include_usage);
         assert_eq!(request.max_completion_tokens, 17);
-        assert!(request.temperature.abs() < f64::EPSILON);
-        assert!((request.top_p - 0.75).abs() < f64::EPSILON);
+        assert_eq!(request.temperature, Some(0.0));
+        assert_eq!(request.top_p, Some(0.75));
         assert_eq!(request.seed, Some(7));
     }
 
