@@ -89,6 +89,8 @@ pub struct ServerOptions {
     /// `max_completion_tokens` nor `max_tokens`. It must be positive and fit
     /// the model context; the server checks this at startup.
     pub default_max_completion_tokens: usize,
+    /// Sampling values for fields a request omits.
+    pub sampling_profile: SamplingProfile,
 }
 
 impl ServerOptions {
@@ -99,6 +101,56 @@ impl Default for ServerOptions {
     fn default() -> Self {
         Self {
             default_max_completion_tokens: Self::DEFAULT_MAX_COMPLETION_TOKENS,
+            sampling_profile: SamplingProfile::default(),
+        }
+    }
+}
+
+/// Sampling values used for fields a request omits. Request values always
+/// win. `top_k` is not a Chat Completions field, so it always comes from
+/// here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplingDefaults {
+    pub temperature: f64,
+    pub top_p: f64,
+    pub top_k: usize,
+}
+
+/// Named server sampling defaults.
+///
+/// A profile rather than per-field flags: the Qwen3 recommendation depends
+/// on each request's effective thinking mode (its `chat_template_kwargs`, or
+/// the server's `--disable-thinking`), which one fixed value per field
+/// cannot express.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SamplingProfile {
+    /// The `OpenAI` defaults: temperature 1, top_p 1, no top-k.
+    #[default]
+    OpenAi,
+    /// The Qwen3 model card's recommendation: temperature 0.6, top_p 0.95,
+    /// top_k 20 when thinking; 0.7, 0.8, 20 when not.
+    Qwen3,
+}
+
+impl SamplingProfile {
+    #[must_use]
+    pub const fn defaults(self, thinking: bool) -> SamplingDefaults {
+        match (self, thinking) {
+            (Self::OpenAi, _) => SamplingDefaults {
+                temperature: crate::openai::DEFAULT_TEMPERATURE,
+                top_p: crate::openai::DEFAULT_TOP_P,
+                top_k: 0,
+            },
+            (Self::Qwen3, true) => SamplingDefaults {
+                temperature: 0.6,
+                top_p: 0.95,
+                top_k: 20,
+            },
+            (Self::Qwen3, false) => SamplingDefaults {
+                temperature: 0.7,
+                top_p: 0.8,
+                top_k: 20,
+            },
         }
     }
 }
@@ -801,7 +853,15 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
     let stream_response = request.stream;
     let include_usage = request.include_usage;
     let identity = RequestIdentity::new(request.model.clone());
-    let (engine_request, output) = match to_engine_request(request, identity.default_seed) {
+    // Templates think unless a request or the server disables it.
+    let thinking = request
+        .chat_template
+        .or(metadata.chat_template_defaults)
+        .enable_thinking
+        != Some(false);
+    let sampling = state.options.sampling_profile.defaults(thinking);
+    let (engine_request, output) = match to_engine_request(request, identity.default_seed, sampling)
+    {
         Ok(lowered) => lowered,
         Err(error) => return api_error(status_for_api_error(&error), error),
     };
@@ -852,11 +912,12 @@ enum AssistantOutput {
 fn to_engine_request(
     request: ValidatedChatCompletionRequest,
     request_default_seed: u64,
+    defaults: SamplingDefaults,
 ) -> std::result::Result<(EngineRequest, AssistantOutput), ApiError> {
     let sampling = SamplingConfig {
-        temperature: request.temperature,
-        top_k: 0,
-        top_p: request.top_p,
+        temperature: request.temperature.unwrap_or(defaults.temperature),
+        top_k: defaults.top_k,
+        top_p: request.top_p.unwrap_or(defaults.top_p),
         repetition_penalty: 1.0,
         seed: request.seed.unwrap_or(request_default_seed),
     };
@@ -1526,6 +1587,7 @@ mod tests {
                     max_context: 128,
                     device: "cpu".to_owned(),
                     dtype: "f32".to_owned(),
+                    chat_template_defaults: crate::chat::ChatTemplateOptions::default(),
                 },
                 status: EngineStatus::Ready,
                 events: Mutex::new(events),
@@ -1624,16 +1686,21 @@ mod tests {
                 .unwrap()
         };
 
-        let (implicit, _) = to_engine_request(validated(None), 91).unwrap();
+        let (implicit, _) =
+            to_engine_request(validated(None), 91, SamplingProfile::OpenAi.defaults(true)).unwrap();
         assert_eq!(implicit.sampling.seed, 91);
         assert!(matches!(implicit.input, EngineInput::Chat(_)));
         assert!(!implicit.ignore_stop_tokens);
         assert_eq!(
-            to_engine_request(validated(Some(7)), 91)
-                .unwrap()
-                .0
-                .sampling
-                .seed,
+            to_engine_request(
+                validated(Some(7)),
+                91,
+                SamplingProfile::OpenAi.defaults(true)
+            )
+            .unwrap()
+            .0
+            .sampling
+            .seed,
             7
         );
 
@@ -1660,7 +1727,8 @@ mod tests {
         .unwrap()
         .validate("test-model", 16)
         .unwrap();
-        let (structured, _) = to_engine_request(structured, 91).unwrap();
+        let (structured, _) =
+            to_engine_request(structured, 91, SamplingProfile::OpenAi.defaults(true)).unwrap();
         assert!(matches!(
             structured.input,
             EngineInput::ConstrainedChat {
@@ -2257,7 +2325,8 @@ mod tests {
         .unwrap()
         .validate("test-model", 16)
         .unwrap();
-        let (request, _) = to_engine_request(request, 7).unwrap();
+        let (request, _) =
+            to_engine_request(request, 7, SamplingProfile::OpenAi.defaults(true)).unwrap();
         let EngineInput::Agent {
             prompt,
             constraint: Some(constraint),
@@ -2319,7 +2388,8 @@ mod tests {
             .unwrap()
             .validate("test-model", 16)
             .unwrap();
-        let (request, _) = to_engine_request(request, 7).unwrap();
+        let (request, _) =
+            to_engine_request(request, 7, SamplingProfile::OpenAi.defaults(true)).unwrap();
         let EngineInput::Agent { prompt, .. } = request.input else {
             panic!("expected native agent history");
         };
@@ -2548,7 +2618,8 @@ mod tests {
         .unwrap()
         .validate("test-model", 16)
         .unwrap();
-        let (request, output) = to_engine_request(request, 7).unwrap();
+        let (request, output) =
+            to_engine_request(request, 7, SamplingProfile::OpenAi.defaults(true)).unwrap();
         let EngineInput::Agent {
             prompt,
             constraint: Some(constraint),
@@ -2585,6 +2656,7 @@ mod tests {
         ))]));
         let options = ServerOptions {
             default_max_completion_tokens: 64,
+            sampling_profile: SamplingProfile::OpenAi,
         };
         let response = router_with_options(engine.clone(), options)
             .oneshot(chat_request(&json!({
@@ -2620,6 +2692,65 @@ mod tests {
         assert_eq!(request.chat_template.enable_thinking, Some(true));
         assert!(matches!(request.input, EngineInput::Agent { .. }));
         assert_eq!(ServerOptions::default().default_max_completion_tokens, 128);
+    }
+
+    #[tokio::test]
+    async fn sampling_profile_fills_only_omitted_fields_by_thinking_mode() {
+        let sampled = |body: Value, server_disables_thinking: bool, profile| async move {
+            let mut fake =
+                FakeEngine::healthy(vec![EngineEvent::Finished(metrics(FinishReason::Stop))]);
+            if server_disables_thinking {
+                fake.metadata.chat_template_defaults.enable_thinking = Some(false);
+            }
+            let engine = Arc::new(fake);
+            let options = ServerOptions {
+                sampling_profile: profile,
+                ..ServerOptions::default()
+            };
+            let response = router_with_options(engine.clone(), options)
+                .oneshot(chat_request(&body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let sampling = engine.last_request.lock().unwrap().take().unwrap().sampling;
+            (sampling.temperature, sampling.top_p, sampling.top_k)
+        };
+        let base = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "list files"}],
+            "tools": [shell_tool()]
+        });
+        let with = |patch: Value| {
+            let mut body = base.clone();
+            body.as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            body
+        };
+
+        // The OpenAI profile keeps today's behavior.
+        assert_eq!(
+            sampled(base.clone(), false, SamplingProfile::OpenAi).await,
+            (1.0, 1.0, 0)
+        );
+        // Qwen3: thinking by default, non-thinking when the server or the
+        // request disables it; a request can also re-enable it.
+        let qwen3 = SamplingProfile::Qwen3;
+        assert_eq!(sampled(base.clone(), false, qwen3).await, (0.6, 0.95, 20));
+        assert_eq!(sampled(base.clone(), true, qwen3).await, (0.7, 0.8, 20));
+        let kwargs =
+            |enabled: bool| with(json!({"chat_template_kwargs": {"enable_thinking": enabled}}));
+        assert_eq!(sampled(kwargs(false), false, qwen3).await, (0.7, 0.8, 20));
+        assert_eq!(sampled(kwargs(true), true, qwen3).await, (0.6, 0.95, 20));
+        // Request values always win, field by field.
+        assert_eq!(
+            sampled(with(json!({"temperature": 0.0})), true, qwen3).await,
+            (0.0, 0.8, 20)
+        );
+        assert_eq!(
+            sampled(with(json!({"temperature": 1.2, "top_p": 0.5})), true, qwen3).await,
+            (1.2, 0.5, 20)
+        );
     }
 
     #[tokio::test]

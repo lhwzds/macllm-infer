@@ -42,6 +42,9 @@ pub struct EngineMetadata {
     pub max_context: usize,
     pub device: String,
     pub dtype: String,
+    /// Template options the worker applies to requests that leave them
+    /// unset, so protocol defaults can follow the effective template mode.
+    pub chat_template_defaults: ChatTemplateOptions,
 }
 
 /// Worker-owned automatic-prefix-cache diagnostics mirrored for read-only callers.
@@ -1212,6 +1215,7 @@ fn worker_main(
         }
         .to_owned(),
         dtype: format!("{:?}", runtime.dtype).to_ascii_lowercase(),
+        chat_template_defaults: scheduler_config.chat_template_defaults,
     };
     let rendered = match runtime.adapter.format_serving_chat_probe() {
         Ok(rendered) => rendered,
@@ -4047,6 +4051,7 @@ mod tests {
                 max_context: 8,
                 device: "cpu".to_owned(),
                 dtype: "f32".to_owned(),
+                chat_template_defaults: ChatTemplateOptions::default(),
             },
             prefix_cache_snapshot: Arc::new(Mutex::new(EnginePrefixCacheSnapshot::default())),
             event_capacity: 1,
@@ -4087,6 +4092,7 @@ mod tests {
                 max_context: 8,
                 device: "cpu".to_owned(),
                 dtype: "f32".to_owned(),
+                chat_template_defaults: ChatTemplateOptions::default(),
             },
             prefix_cache_snapshot: Arc::new(Mutex::new(EnginePrefixCacheSnapshot::default())),
             event_capacity: 8,
@@ -4171,6 +4177,7 @@ mod tests {
                 max_context: 8,
                 device: "cpu".to_owned(),
                 dtype: "f32".to_owned(),
+                chat_template_defaults: ChatTemplateOptions::default(),
             },
             prefix_cache_snapshot: Arc::new(Mutex::new(EnginePrefixCacheSnapshot::default())),
             event_capacity: 8,
@@ -4247,6 +4254,7 @@ mod tests {
                 max_context: 8,
                 device: "cpu".to_owned(),
                 dtype: "f32".to_owned(),
+                chat_template_defaults: ChatTemplateOptions::default(),
             },
             prefix_cache_snapshot: Arc::new(Mutex::new(EnginePrefixCacheSnapshot::default())),
             event_capacity: 1,

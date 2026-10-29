@@ -68,7 +68,9 @@ Jinja templates or silently guess a template.
 For agent clients, `serve --default-max-completion-tokens N` sets the budget of
 requests that omit one (default 128), and `--disable-thinking` renders Qwen3
 prompts with `enable_thinking=false`; a request may instead send
-`chat_template_kwargs: {"enable_thinking": false}`.
+`chat_template_kwargs: {"enable_thinking": false}`. `--sampling-profile qwen3`
+fills omitted `temperature`/`top_p` (and top-k) with Qwen3's recommended values for
+each request's thinking mode (0.6/0.95/20 thinking, 0.7/0.8/20 otherwise).
 
 ## Benchmarking
 

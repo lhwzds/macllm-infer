@@ -10,8 +10,14 @@
 //!
 //! The supported JSON Schema subset is intentionally small and closed. A
 //! schema that contains an unrecognized keyword is rejected at compile time;
-//! it never silently degrades to unconstrained JSON. Object schemas require
-//! `additionalProperties: false`. `enum` and `const` values are emitted using
+//! it never silently degrades to unconstrained JSON. Annotations (`title`,
+//! `description`, `default`, `examples`, `$comment`, `$schema`) are accepted
+//! and ignored. Object schemas require `additionalProperties: false`.
+//! Non-strict tool schemas are compiled closed: their validation keywords
+//! that the grammar cannot express (length, pattern, format, numeric bounds,
+//! item counts) are accepted but not enforced, while strict schemas reject
+//! them. Composition (`anyOf`, `oneOf`, `allOf`, `$ref`) and type arrays are
+//! rejected in every mode. `enum` and `const` values are emitted using
 //! their canonical `serde_json` spelling, which is a valid (and deterministic)
 //! subset of the representations accepted by JSON Schema.
 //!
@@ -71,10 +77,12 @@ impl CompiledJsonSchema {
 
     /// Compile a non-strict function schema by closing every object to its
     /// declared properties. `additionalProperties` may be absent or boolean
-    /// and `required` may name a subset of the properties; every other rule of
-    /// the strict subset still applies. Closing only narrows the accepted
-    /// values, so any value the result accepts is valid under the original
-    /// schema.
+    /// and `required` may name a subset of the properties. Closing only
+    /// narrows the accepted values. Validation keywords the grammar cannot
+    /// express (string length, `pattern`, `format`, numeric bounds,
+    /// `multipleOf`, item counts) are accepted but not enforced, so generated
+    /// arguments can violate them; every other rule of the strict subset
+    /// still applies.
     pub fn compile_closed(schema: &Value) -> Result<Self> {
         Ok(Self {
             root: compile_schema_node(schema, "$", 0, SchemaMode::Closed)?,
@@ -321,6 +329,18 @@ impl LogitsConstraint for JsonSchemaTokenConstraint {
 
     fn finish(&self) -> Result<()> {
         self.grammar.finish()
+    }
+
+    fn checks_tokens(&self) -> bool {
+        true
+    }
+
+    fn allows_token(&self, token: u32) -> Result<bool> {
+        ensure!(
+            !self.finished,
+            "cannot sample after the JSON grammar selected EOS"
+        );
+        Ok(self.candidate_is_allowed(token))
     }
 }
 
@@ -799,6 +819,18 @@ impl LogitsConstraint for LazyToolCallConstraint {
             Ok(())
         }
     }
+
+    fn checks_tokens(&self) -> bool {
+        true
+    }
+
+    fn allows_token(&self, token: u32) -> Result<bool> {
+        ensure!(
+            !self.finished,
+            "cannot sample after the tool-call constraint selected EOS"
+        );
+        Ok(!self.call_opened || self.call_candidate_is_allowed(token))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -869,28 +901,31 @@ fn compile_schema_node(
         Some("object") => Some(compile_object_schema(object, path, depth, mode)?),
         Some("array") => Some(compile_array_schema(object, path, depth, mode)?),
         Some("string") => {
-            reject_unknown_keywords(object, path, &["type", "enum", "const"])?;
+            let unenforced = UNENFORCED_STRING_KEYWORDS;
+            reject_unknown_keywords(object, path, &["type", "enum", "const"], unenforced, mode)?;
             Some(SchemaKind::String)
         }
         Some("number") => {
-            reject_unknown_keywords(object, path, &["type", "enum", "const"])?;
+            let unenforced = UNENFORCED_NUMBER_KEYWORDS;
+            reject_unknown_keywords(object, path, &["type", "enum", "const"], unenforced, mode)?;
             Some(SchemaKind::Number)
         }
         Some("integer") => {
-            reject_unknown_keywords(object, path, &["type", "enum", "const"])?;
+            let unenforced = UNENFORCED_NUMBER_KEYWORDS;
+            reject_unknown_keywords(object, path, &["type", "enum", "const"], unenforced, mode)?;
             Some(SchemaKind::Integer)
         }
         Some("boolean") => {
-            reject_unknown_keywords(object, path, &["type", "enum", "const"])?;
+            reject_unknown_keywords(object, path, &["type", "enum", "const"], &[], mode)?;
             Some(SchemaKind::Boolean)
         }
         Some("null") => {
-            reject_unknown_keywords(object, path, &["type", "enum", "const"])?;
+            reject_unknown_keywords(object, path, &["type", "enum", "const"], &[], mode)?;
             Some(SchemaKind::Null)
         }
         Some(other) => bail!("{path}.type {other:?} is unsupported"),
         None => {
-            reject_unknown_keywords(object, path, &["enum", "const"])?;
+            reject_unknown_keywords(object, path, &["enum", "const"], &[], mode)?;
             ensure!(
                 object.contains_key("enum") || object.contains_key("const"),
                 "{path} must declare one supported type, enum, or const"
@@ -935,6 +970,8 @@ fn compile_object_schema(
             "enum",
             "const",
         ],
+        &[],
+        mode,
     )?;
     match mode {
         SchemaMode::Strict => ensure!(
@@ -1006,7 +1043,13 @@ fn compile_array_schema(
     depth: usize,
     mode: SchemaMode,
 ) -> Result<SchemaKind> {
-    reject_unknown_keywords(object, path, &["type", "items", "enum", "const"])?;
+    reject_unknown_keywords(
+        object,
+        path,
+        &["type", "items", "enum", "const"],
+        UNENFORCED_ARRAY_KEYWORDS,
+        mode,
+    )?;
     let items = object
         .get("items")
         .with_context(|| format!("{path}.items is required for an array schema"))?;
@@ -1018,16 +1061,61 @@ fn compile_array_schema(
     )?)))
 }
 
+/// Keywords that only describe a value. Every mode accepts them; they stay
+/// in the rendered tool declaration and the grammar ignores them.
+const ANNOTATION_KEYWORDS: &[&str] = &[
+    "title",
+    "description",
+    "default",
+    "examples",
+    "$comment",
+    "$schema",
+];
+
+/// Validation keywords the grammar cannot enforce. Closed (non-strict)
+/// schemas accept them so the model still sees them in the declaration, but
+/// generated arguments are not checked against them; strict schemas reject
+/// them because strict mode promises conformance.
+const UNENFORCED_STRING_KEYWORDS: &[&str] = &["minLength", "maxLength", "pattern", "format"];
+const UNENFORCED_NUMBER_KEYWORDS: &[&str] = &[
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+];
+const UNENFORCED_ARRAY_KEYWORDS: &[&str] = &["minItems", "maxItems"];
+
 fn reject_unknown_keywords(
     object: &Map<String, Value>,
     path: &str,
     allowed: &[&str],
+    unenforced: &[&str],
+    mode: SchemaMode,
 ) -> Result<()> {
-    for keyword in object.keys() {
-        ensure!(
-            allowed.contains(&keyword.as_str()),
-            "unsupported JSON Schema keyword {path}.{keyword}"
-        );
+    for (keyword, value) in object {
+        let keyword = keyword.as_str();
+        if allowed.contains(&keyword) {
+            continue;
+        }
+        let well_formed = if ANNOTATION_KEYWORDS.contains(&keyword) {
+            match keyword {
+                "default" => true,
+                "examples" => value.is_array(),
+                _ => value.is_string(),
+            }
+        } else if mode == SchemaMode::Closed && unenforced.contains(&keyword) {
+            match keyword {
+                "minLength" | "maxLength" | "minItems" | "maxItems" => value.is_u64(),
+                "pattern" | "format" => value.is_string(),
+                // Draft 4 spells exclusive bounds as booleans.
+                "exclusiveMinimum" | "exclusiveMaximum" => value.is_number() || value.is_boolean(),
+                _ => value.is_number(),
+            }
+        } else {
+            bail!("unsupported JSON Schema keyword {path}.{keyword}");
+        };
+        ensure!(well_formed, "{path}.{keyword} has an invalid value");
     }
     Ok(())
 }
@@ -1684,6 +1772,83 @@ mod tests {
     }
 
     #[test]
+    fn annotations_are_ignored_and_unenforced_keywords_are_closed_mode_only() -> Result<()> {
+        let annotated = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Shell",
+            "description": "Run a command.",
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The command.", "examples": ["ls"]},
+                "timeout": {"type": "integer", "title": "Timeout", "default": 60, "$comment": "s"}
+            },
+            "required": ["command", "timeout"],
+            "additionalProperties": false
+        });
+        for compile in [
+            CompiledJsonSchema::compile,
+            CompiledJsonSchema::compile_closed,
+        ] {
+            let schema = compile(&annotated)?;
+            assert!(schema.accepts(&json!({"command": "ls", "timeout": 5})));
+            assert!(!schema.accepts(&json!({"command": "ls", "timeout": "5"})));
+        }
+
+        let validated = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "minLength": 1, "maxLength": 4, "pattern": "^/", "format": "uri"},
+                "count": {"type": "integer", "minimum": 1, "maximum": 3, "exclusiveMinimum": 0, "multipleOf": 1},
+                "ratio": {"type": "number", "exclusiveMaximum": true},
+                "tags": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 2}
+            },
+            "required": ["path"]
+        });
+        let closed = CompiledJsonSchema::compile_closed(&validated)?;
+        // Shown to the model, not enforced: these values violate every bound.
+        assert!(closed.accepts(&json!({"path": "too-long", "count": 9, "tags": []})));
+        let mut strict = validated;
+        strict["additionalProperties"] = json!(false);
+        strict["required"] = json!(["path", "count", "ratio", "tags"]);
+        let error = CompiledJsonSchema::compile(&strict).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported JSON Schema keyword")
+        );
+
+        for malformed in [
+            json!({"type": "string", "description": 5}),
+            json!({"type": "string", "examples": "ls"}),
+            json!({"type": "string", "minLength": -1}),
+            json!({"type": "integer", "minimum": "1"}),
+            json!({"type": "boolean", "minLength": 1}),
+        ] {
+            assert!(
+                CompiledJsonSchema::compile_closed(&malformed).is_err(),
+                "{malformed}"
+            );
+        }
+        // Composition and type arrays stay unsupported in both modes.
+        for composed in [
+            json!({"anyOf": [{"type": "string"}, {"type": "null"}]}),
+            json!({"type": ["string", "null"]}),
+            json!({"$ref": "#/$defs/x"}),
+            json!({"type": "object", "properties": {}, "allOf": []}),
+        ] {
+            assert!(
+                CompiledJsonSchema::compile(&composed).is_err(),
+                "{composed}"
+            );
+            assert!(
+                CompiledJsonSchema::compile_closed(&composed).is_err(),
+                "{composed}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn compiler_rejects_every_unsupported_or_open_ended_shape() {
         for schema in [
             json!(true),
@@ -1747,7 +1912,7 @@ mod tests {
         for schema in [
             json!({"type": "object"}),
             json!({"type": "object", "properties": {}, "additionalProperties": {"type": "string"}}),
-            json!({"type": "object", "properties": {"a": {"type": "string", "minLength": 1}}}),
+            json!({"type": "object", "properties": {"a": {"type": "string", "uniqueItems": true}}}),
             json!({"type": "object", "properties": {}, "required": ["missing"]}),
         ] {
             assert!(

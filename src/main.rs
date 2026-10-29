@@ -27,7 +27,7 @@ use macllm_infer::{
     rerank::{RerankScore, rerank_token_batch},
     runtime::{LoadedRuntime, ModelLoadConfig},
     sampling::{Sampler, SamplingConfig},
-    server::{ServerConfig, ServerOptions, serve},
+    server::{SamplingProfile, ServerConfig, ServerOptions, serve},
     token_stream::TokenStream,
     weights::{ModelFiles, ModelFormat},
 };
@@ -435,6 +435,28 @@ struct ServeArgs {
     /// Qwen3MoE templates support it; other models fail to start.
     #[arg(long)]
     disable_thinking: bool,
+    /// Sampling defaults for requests that omit temperature or top_p (top_k
+    /// always comes from the profile). `qwen3` applies the Qwen3 model card's
+    /// settings for each request's effective thinking mode.
+    #[arg(long, value_enum, default_value_t = SamplingProfileArg::Openai)]
+    sampling_profile: SamplingProfileArg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SamplingProfileArg {
+    /// Temperature 1, top_p 1, no top-k.
+    Openai,
+    /// Thinking 0.6 / top_p 0.95 / top_k 20; non-thinking 0.7 / 0.8 / 20.
+    Qwen3,
+}
+
+impl From<SamplingProfileArg> for SamplingProfile {
+    fn from(profile: SamplingProfileArg) -> Self {
+        match profile {
+            SamplingProfileArg::Openai => Self::OpenAi,
+            SamplingProfileArg::Qwen3 => Self::Qwen3,
+        }
+    }
 }
 
 #[tokio::main]
@@ -1284,6 +1306,7 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         engine,
         options: ServerOptions {
             default_max_completion_tokens: args.default_max_completion_tokens.get(),
+            sampling_profile: args.sampling_profile.into(),
         },
     })
     .await
@@ -1441,6 +1464,7 @@ mod tests {
             serve_args(Cli::try_parse_from(["macllm", "serve", "--model", "model-dir"]).unwrap());
         assert_eq!(defaults.default_max_completion_tokens.get(), 128);
         assert!(!defaults.disable_thinking);
+        assert_eq!(defaults.sampling_profile, SamplingProfileArg::Openai);
 
         let agent = serve_args(
             Cli::try_parse_from([
@@ -1451,11 +1475,14 @@ mod tests {
                 "--default-max-completion-tokens",
                 "4096",
                 "--disable-thinking",
+                "--sampling-profile",
+                "qwen3",
             ])
             .unwrap(),
         );
         assert_eq!(agent.default_max_completion_tokens.get(), 4_096);
         assert!(agent.disable_thinking);
+        assert_eq!(agent.sampling_profile, SamplingProfileArg::Qwen3);
         assert!(
             Cli::try_parse_from([
                 "macllm",
