@@ -322,6 +322,18 @@ impl LogitsConstraint for JsonSchemaTokenConstraint {
     fn finish(&self) -> Result<()> {
         self.grammar.finish()
     }
+
+    fn checks_tokens(&self) -> bool {
+        true
+    }
+
+    fn allows_token(&self, token: u32) -> Result<bool> {
+        ensure!(
+            !self.finished,
+            "cannot sample after the JSON grammar selected EOS"
+        );
+        Ok(self.candidate_is_allowed(token))
+    }
 }
 
 impl JsonSchemaGrammar {
@@ -798,6 +810,18 @@ impl LogitsConstraint for LazyToolCallConstraint {
         } else {
             Ok(())
         }
+    }
+
+    fn checks_tokens(&self) -> bool {
+        true
+    }
+
+    fn allows_token(&self, token: u32) -> Result<bool> {
+        ensure!(
+            !self.finished,
+            "cannot sample after the tool-call constraint selected EOS"
+        );
+        Ok(!self.call_opened || self.call_candidate_is_allowed(token))
     }
 }
 
