@@ -2,7 +2,8 @@
 /models/
 /.codex/
 /.codocia/
-/docs/
+/docs/*
+!/docs/public/
 /codocia.md
 /prefix-cache-demo.json
 /prefix-cache-demo.md
