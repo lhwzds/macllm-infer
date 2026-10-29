@@ -289,10 +289,12 @@ pub enum FunctionToolKind {
 impl FunctionTool {
     /// Compile the grammar that constrains this function's arguments.
     ///
-    /// A strict schema must already be in the closed subset. A non-strict
-    /// schema carries no conformance promise in the `OpenAI` contract; it is
-    /// closed to its declared properties, which only narrows what it accepts,
-    /// so constrained arguments still satisfy the declared schema.
+    /// Annotations (`title`, `description`, `default`, `examples`) are kept
+    /// in the rendered declaration and ignored by the grammar. A strict
+    /// schema must otherwise be in the closed subset. A non-strict schema
+    /// carries no conformance promise in the `OpenAI` contract: it is closed
+    /// to its declared properties, and its length, pattern, format, numeric
+    /// bound and item-count keywords are shown to the model but not enforced.
     pub fn compile_arguments_schema(&self) -> anyhow::Result<CompiledJsonSchema> {
         if self.function.strict {
             CompiledJsonSchema::compile(&self.function.parameters)
@@ -2237,7 +2239,7 @@ mod tests {
             (
                 json!({
                     "type": "object",
-                    "properties": {"command": {"type": "string", "minLength": 1}}
+                    "properties": {"command": {"anyOf": [{"type": "string"}, {"type": "null"}]}}
                 }),
                 "tools.0.function.parameters",
             ),
@@ -2301,6 +2303,59 @@ mod tests {
             assert_eq!(error.param.as_deref(), Some(param));
             assert_eq!(error.code.as_deref(), Some(code));
         }
+    }
+
+    #[test]
+    fn accepts_annotated_agent_tool_schemas_in_both_modes() {
+        // The shape agent SDKs emit: titles and descriptions everywhere,
+        // defaults and examples, plus bounds in a non-strict declaration.
+        let non_strict = json!({"type": "function", "function": {
+            "name": "read_file",
+            "description": "Read a file.",
+            "parameters": {
+                "type": "object",
+                "title": "ReadFileArgs",
+                "properties": {
+                    "path": {"type": "string", "title": "Path", "description": "File path.", "minLength": 1, "examples": ["README.md"]},
+                    "offset": {"type": "integer", "description": "First line.", "default": 0, "minimum": 0},
+                    "limit": {"type": "integer", "exclusiveMinimum": 0, "maximum": 2000}
+                },
+                "required": ["path"]
+            }
+        }});
+        let mut strict = json!({"type": "function", "function": {
+            "name": "lookup",
+            "strict": true,
+            "parameters": strict_schema()
+        }});
+        strict["function"]["parameters"]["properties"]["city"]["description"] = json!("City name.");
+        strict["function"]["parameters"]["description"] = json!("Weather lookup.");
+        let request = parse_and_validate(json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": [non_strict, strict]
+        }))
+        .unwrap();
+        assert_eq!(request.tools.len(), 2);
+        // Annotations reach the rendered declaration unchanged.
+        assert_eq!(
+            request.tools[0].function.parameters["properties"]["path"]["examples"],
+            json!(["README.md"])
+        );
+
+        let mut strict_bound = json!({"type": "function", "function": {
+            "name": "lookup",
+            "strict": true,
+            "parameters": strict_schema()
+        }});
+        strict_bound["function"]["parameters"]["properties"]["city"]["maxLength"] = json!(20);
+        let error = parse_and_validate(json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "go"}],
+            "tools": [strict_bound]
+        }))
+        .unwrap_err();
+        assert!(error.message.contains("maxLength"));
     }
 
     #[test]
