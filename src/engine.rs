@@ -2835,19 +2835,20 @@ fn prepare_request(
             tokens.clone()
         }
     };
+    let max_context = runtime.model.runtime_spec().max_context;
     let required_context = prompt_tokens
         .len()
         .checked_add(job.request.max_new_tokens.saturating_sub(1));
-    if prompt_tokens.is_empty()
-        || required_context
-            .is_none_or(|required| required > runtime.model.runtime_spec().max_context)
-    {
+    if prompt_tokens.is_empty() || required_context.is_none_or(|required| required > max_context) {
+        // Lead with OpenAI's wording so agent clients that recognize context
+        // overflow by provider phrases can shorten their history and retry.
         reject_preflight(
             job,
             EngineFailureKind::InvalidRequest,
             format!(
-                "prompt plus requested output exceeds model context limit ({})",
-                runtime.model.runtime_spec().max_context
+                "This model's maximum context length is {max_context} tokens; the prompt ({} tokens) plus requested output ({} tokens) exceeds it",
+                prompt_tokens.len(),
+                job.request.max_new_tokens
             ),
         );
         return None;
@@ -3932,6 +3933,32 @@ mod tests {
         let (mut raw_job, _ticket) = job("unused", 1, 4, Duration::from_secs(1));
         raw_job.request.input = EngineInput::RawPrompt("a b".to_owned());
         assert!(prepare_request(&runtime, &mut raw_job, disabled).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn context_overflow_uses_openai_wording_with_token_detail() -> Result<()> {
+        let (runtime, _state) = fake_runtime()?;
+        let max_context = runtime.model.runtime_spec().max_context;
+        let requested = max_context + 1;
+        let (mut long_job, mut ticket) = job("hello", requested, 4, Duration::from_secs(1));
+        assert!(prepare_request(&runtime, &mut long_job, ChatTemplateOptions::default()).is_none());
+        let error = ticket
+            .preflight
+            .as_mut()
+            .context("test ticket lost preflight")?
+            .try_recv()
+            .context("rejection was not delivered")?
+            .expect_err("an oversized request must fail preflight");
+        assert_eq!(error.kind, EngineFailureKind::InvalidRequest);
+        assert!(error.message.starts_with(&format!(
+            "This model's maximum context length is {max_context} tokens; the prompt ("
+        )));
+        assert!(
+            error
+                .message
+                .contains(&format!("requested output ({requested} tokens)"))
+        );
         Ok(())
     }
 
