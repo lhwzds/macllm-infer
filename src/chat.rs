@@ -50,6 +50,45 @@ impl ChatMessage {
     }
 }
 
+/// Chat-template keyword options, mirroring the `chat_template_kwargs`
+/// convention of vLLM, SGLang and llama.cpp. `None` keeps the template's own
+/// default. Adapters reject any option they do not implement instead of
+/// silently ignoring it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChatTemplateOptions {
+    /// Qwen3's `enable_thinking`: `false` pre-fills an empty reasoning block
+    /// in the generation prompt so the model answers directly.
+    pub enable_thinking: Option<bool>,
+}
+
+impl ChatTemplateOptions {
+    /// Fill every option the request left unset from server-wide defaults.
+    #[must_use]
+    pub const fn or(self, defaults: Self) -> Self {
+        Self {
+            enable_thinking: match self.enable_thinking {
+                Some(enabled) => Some(enabled),
+                None => defaults.enable_thinking,
+            },
+        }
+    }
+
+    /// Whether every option keeps the template default.
+    #[must_use]
+    pub const fn is_default(self) -> bool {
+        self.enable_thinking.is_none()
+    }
+
+    /// Fail closed for an adapter that implements no template options.
+    pub fn ensure_default(self, family: &str) -> Result<()> {
+        ensure!(
+            self.enable_thinking.is_none(),
+            "chat template option `enable_thinking` is not supported by the {family} adapter"
+        );
+        Ok(())
+    }
+}
+
 /// Validate the common text-chat subset supported by every model adapter.
 ///
 /// A conversation may begin with one system message. The remaining messages

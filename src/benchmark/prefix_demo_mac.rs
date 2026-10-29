@@ -757,6 +757,7 @@ fn token_request(token_ids: &[u32], max_new_tokens: usize) -> Result<(EngineRequ
             max_new_tokens,
             ignore_stop_tokens: true,
             stop: Vec::new(),
+            chat_template: crate::chat::ChatTemplateOptions::default(),
         },
         submitted_token_ids_sha256,
     ))

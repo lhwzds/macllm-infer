@@ -36,12 +36,17 @@ use crate::{
         EngineTicket, SubmitError,
     },
     generation::{FinishReason, GenerationMetrics},
+    grammar::{CompiledJsonSchema, CompiledToolCalls},
     openai::{
         AgentMessage as OpenAiAgentMessage, ApiError, AssistantFunctionCall, AssistantToolCall,
         ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatFinishReason,
-        FunctionToolKind, TokenUsage, ValidatedChatCompletionRequest, ValidatedMessages,
+        FunctionTool, FunctionToolKind, TokenUsage, ToolChoice, ToolChoiceMode,
+        ValidatedChatCompletionRequest, ValidatedMessages,
     },
     sampling::SamplingConfig,
+    tool_call::{
+        SplitEnd, TOOL_CALL_OPEN, ToolCallScan, ToolCallSplitter, parse_tool_call, scan_tool_call,
+    },
 };
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -74,6 +79,28 @@ pub const RAW_COMPLETION_RESPONSE_FIELDS: [&str; 22] = [
 pub struct ServerConfig {
     pub bind: SocketAddr,
     pub engine: EngineConfig,
+    pub options: ServerOptions,
+}
+
+/// Protocol defaults applied by the HTTP layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerOptions {
+    /// Completion budget for Chat Completions requests that set neither
+    /// `max_completion_tokens` nor `max_tokens`. It must be positive and fit
+    /// the model context; the server checks this at startup.
+    pub default_max_completion_tokens: usize,
+}
+
+impl ServerOptions {
+    pub const DEFAULT_MAX_COMPLETION_TOKENS: usize = 128;
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            default_max_completion_tokens: Self::DEFAULT_MAX_COMPLETION_TOKENS,
+        }
+    }
 }
 
 /// Minimal interface used by the HTTP layer. Production uses one
@@ -118,21 +145,33 @@ impl InferenceEngine for EngineHandle {
 #[derive(Clone)]
 struct AppState {
     engine: Arc<dyn InferenceEngine>,
+    options: ServerOptions,
 }
 
 /// Build the strict Chat Completions and raw benchmark router around one engine.
 pub fn router(engine: Arc<dyn InferenceEngine>) -> Router {
+    router_with_options(engine, ServerOptions::default())
+}
+
+/// Build the router with explicit protocol defaults.
+pub fn router_with_options(engine: Arc<dyn InferenceEngine>, options: ServerOptions) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/completion", post(raw_completion))
-        .with_state(AppState { engine })
+        .with_state(AppState { engine, options })
 }
 
 /// Load one model, bind the listener and serve until Ctrl-C.
 pub async fn serve(config: ServerConfig) -> Result<()> {
     let engine = EngineHandle::start(config.engine)?;
+    let max_context = engine.metadata().max_context;
+    let default_max_completion_tokens = config.options.default_max_completion_tokens;
+    anyhow::ensure!(
+        (1..=max_context).contains(&default_max_completion_tokens),
+        "default max completion tokens must be in 1..={max_context} for this model, got {default_max_completion_tokens}"
+    );
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("failed to bind inference server to {}", config.bind))?;
@@ -141,10 +180,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         "serving model `{}` at http://{address}",
         engine.metadata().served_model
     );
-    axum::serve(listener, router(Arc::new(engine)))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("inference HTTP server failed")
+    axum::serve(
+        listener,
+        router_with_options(Arc::new(engine), config.options),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("inference HTTP server failed")
 }
 
 async fn shutdown_signal() {
@@ -339,6 +381,7 @@ impl RawCompletionRequest {
             max_new_tokens: self.n_predict,
             ignore_stop_tokens: true,
             stop: Vec::new(),
+            chat_template: crate::chat::ChatTemplateOptions::default(),
         };
         Ok((request, settings, policy))
     }
@@ -734,7 +777,10 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
     };
     let metadata = state.engine.metadata();
-    let request = match request.validate(&metadata.served_model, 128) {
+    let request = match request.validate(
+        &metadata.served_model,
+        state.options.default_max_completion_tokens,
+    ) {
         Ok(request) => request,
         Err(error) => return api_error(status_for_api_error(&error), error),
     };
@@ -752,12 +798,11 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         );
     }
 
-    let forced_tool_name = request.forced_tool().map(|tool| tool.function.name.clone());
     let stream_response = request.stream;
     let include_usage = request.include_usage;
     let identity = RequestIdentity::new(request.model.clone());
-    let engine_request = match to_engine_request(request, identity.default_seed) {
-        Ok(request) => request,
+    let (engine_request, output) = match to_engine_request(request, identity.default_seed) {
+        Ok(lowered) => lowered,
         Err(error) => return api_error(status_for_api_error(&error), error),
     };
     let mut ticket = match state.engine.submit(engine_request) {
@@ -784,16 +829,30 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
     }
 
     if stream_response {
-        streaming_response(ticket, identity, include_usage, forced_tool_name).into_response()
+        streaming_response(ticket, identity, include_usage, output).into_response()
     } else {
-        non_streaming_response(ticket, identity, forced_tool_name).await
+        non_streaming_response(ticket, identity, output).await
     }
+}
+
+/// How the HTTP layer turns generated text into one assistant message.
+/// It is fixed while lowering the request, so the response parser always
+/// matches what the engine was asked to generate.
+enum AssistantOutput {
+    /// Generated text is the message content.
+    Text,
+    /// The prompt opened one named call; generated text is its arguments.
+    ForcedCall { name: String },
+    /// Generated text is content that may end in one native call. The lazy
+    /// grammar constrained the call; it is parsed and re-validated against
+    /// these declarations before any part of it is exposed.
+    AutoCall { calls: CompiledToolCalls },
 }
 
 fn to_engine_request(
     request: ValidatedChatCompletionRequest,
     request_default_seed: u64,
-) -> std::result::Result<EngineRequest, ApiError> {
+) -> std::result::Result<(EngineRequest, AssistantOutput), ApiError> {
     let sampling = SamplingConfig {
         temperature: request.temperature,
         top_k: 0,
@@ -803,6 +862,7 @@ fn to_engine_request(
     };
     let max_new_tokens = request.max_completion_tokens;
     let stop = request.stop.clone();
+    let chat_template = request.chat_template;
     let response_constraint = request
         .response_format
         .as_ref()
@@ -813,38 +873,60 @@ fn to_engine_request(
         })
         .transpose()?;
     let forced_tool = request.forced_tool().cloned();
-    let input = if let Some(tool) = forced_tool {
-        let schema = crate::grammar::CompiledJsonSchema::compile(&tool.function.parameters)
-            .map_err(|error| {
-                ApiError::invalid_request(
-                    format!("unsupported JSON schema for constrained tool arguments: {error:#}"),
-                    Some("tools".to_owned()),
-                    Some("invalid_value".to_owned()),
-                )
-            })?;
+    let automatic = matches!(request.tool_choice, ToolChoice::Mode(ToolChoiceMode::Auto));
+    let (input, output) = if let Some(tool) = forced_tool {
+        let schema = compile_tool_arguments(&tool)?;
+        let name = tool.function.name;
         let prompt = AgentPrompt {
             messages: lower_agent_messages(request.messages)?,
             tools: request
                 .tools
                 .into_iter()
-                .filter(|candidate| candidate.function.name == tool.function.name)
-                .map(|tool| RuntimeToolDefinition {
-                    name: tool.function.name,
-                    description: tool.function.description,
-                    parameters: tool.function.parameters,
-                    strict: tool.function.strict,
-                })
+                .filter(|candidate| candidate.function.name == name)
+                .map(runtime_tool_definition)
                 .collect(),
-            directive: AgentDirective::ForcedSingle {
-                name: tool.function.name,
-            },
+            directive: AgentDirective::ForcedSingle { name: name.clone() },
         };
-        EngineInput::Agent {
-            prompt,
-            constraint: Some(EngineConstraintSpec::tool_arguments(schema)),
-        }
+        (
+            EngineInput::Agent {
+                prompt,
+                constraint: Some(EngineConstraintSpec::tool_arguments(schema)),
+            },
+            AssistantOutput::ForcedCall { name },
+        )
+    } else if automatic {
+        let calls = CompiledToolCalls::new(
+            request
+                .tools
+                .iter()
+                .map(|tool| Ok((tool.function.name.clone(), compile_tool_arguments(tool)?)))
+                .collect::<std::result::Result<Vec<_>, ApiError>>()?,
+        )
+        .map_err(|error| {
+            ApiError::invalid_request(
+                format!("invalid native tool declarations: {error:#}"),
+                Some("tools".to_owned()),
+                Some("invalid_value".to_owned()),
+            )
+        })?;
+        let prompt = AgentPrompt {
+            messages: lower_agent_messages(request.messages)?,
+            tools: request
+                .tools
+                .into_iter()
+                .map(runtime_tool_definition)
+                .collect(),
+            directive: AgentDirective::Auto,
+        };
+        (
+            EngineInput::Agent {
+                prompt,
+                constraint: Some(EngineConstraintSpec::tool_call(calls.clone())),
+            },
+            AssistantOutput::AutoCall { calls },
+        )
     } else {
-        match request.messages {
+        let input = match request.messages {
             ValidatedMessages::Text(messages) => match response_constraint {
                 Some(constraint) => EngineInput::ConstrainedChat {
                     messages,
@@ -860,15 +942,41 @@ fn to_engine_request(
                 },
                 constraint: None,
             },
-        }
+        };
+        (input, AssistantOutput::Text)
     };
-    Ok(EngineRequest {
-        input,
-        sampling,
-        max_new_tokens,
-        ignore_stop_tokens: false,
-        stop,
+    Ok((
+        EngineRequest {
+            input,
+            sampling,
+            max_new_tokens,
+            ignore_stop_tokens: false,
+            stop,
+            chat_template,
+        },
+        output,
+    ))
+}
+
+fn compile_tool_arguments(
+    tool: &FunctionTool,
+) -> std::result::Result<CompiledJsonSchema, ApiError> {
+    tool.compile_arguments_schema().map_err(|error| {
+        ApiError::invalid_request(
+            format!("unsupported JSON schema for constrained tool arguments: {error:#}"),
+            Some("tools".to_owned()),
+            Some("invalid_value".to_owned()),
+        )
     })
+}
+
+fn runtime_tool_definition(tool: FunctionTool) -> RuntimeToolDefinition {
+    RuntimeToolDefinition {
+        name: tool.function.name,
+        description: tool.function.description,
+        parameters: tool.function.parameters,
+        strict: tool.function.strict,
+    }
 }
 
 fn lower_agent_messages(
@@ -957,7 +1065,7 @@ impl RequestIdentity {
 async fn non_streaming_response(
     mut ticket: EngineTicket,
     identity: RequestIdentity,
-    forced_tool_name: Option<String>,
+    output: AssistantOutput,
 ) -> Response {
     let mut content = String::new();
     while let Some(event) = ticket.recv().await {
@@ -966,7 +1074,7 @@ async fn non_streaming_response(
                 content: fragment, ..
             } => content.push_str(&fragment),
             EngineEvent::Finished(metrics) => {
-                if forced_tool_name.is_some()
+                if matches!(output, AssistantOutput::ForcedCall { .. })
                     && metrics.finish_reason != crate::generation::FinishReason::Stop
                 {
                     return api_error(
@@ -988,33 +1096,43 @@ async fn non_streaming_response(
                     metrics.generated_tokens,
                     metrics.cached_prompt_tokens,
                 );
-                let response = if let Some(name) = forced_tool_name {
-                    let arguments = match canonical_arguments(&content) {
-                        Ok(arguments) => arguments,
-                        Err(error) => {
-                            return api_error(StatusCode::INTERNAL_SERVER_ERROR, error);
-                        }
-                    };
-                    ChatCompletionResponse::tool_call(
+                let call = match &output {
+                    AssistantOutput::Text => Ok(None),
+                    AssistantOutput::ForcedCall { name } => {
+                        canonical_arguments(&content).map(|arguments| {
+                            Some((
+                                None,
+                                AssistantFunctionCall {
+                                    name: name.clone(),
+                                    arguments,
+                                },
+                            ))
+                        })
+                    }
+                    AssistantOutput::AutoCall { calls } => split_auto_call(&content, calls),
+                };
+                let response = match call {
+                    Ok(Some((content, function))) => ChatCompletionResponse::tool_call(
                         identity.id.clone(),
                         identity.created,
                         identity.model,
+                        content,
                         AssistantToolCall {
                             id: tool_call_id(&identity.id),
                             kind: FunctionToolKind::Function,
-                            function: AssistantFunctionCall { name, arguments },
+                            function,
                         },
                         usage,
-                    )
-                } else {
-                    ChatCompletionResponse::new(
+                    ),
+                    Ok(None) => ChatCompletionResponse::new(
                         identity.id,
                         identity.created,
                         identity.model,
                         content,
                         finish_reason,
                         usage,
-                    )
+                    ),
+                    Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
                 };
                 return (StatusCode::OK, Json(response)).into_response();
             }
@@ -1054,6 +1172,48 @@ fn tool_call_id(request_id: &str) -> String {
     )
 }
 
+/// Separate the visible content of an automatic turn from the one native
+/// call it may end with. Content is the text before the opening tag without
+/// the separating whitespace, or `None` when nothing precedes the call. Any
+/// opened call that fails to parse or validate is a server error: it is never
+/// returned as content, where a client would mistake it for a final answer.
+fn split_auto_call(
+    text: &str,
+    calls: &CompiledToolCalls,
+) -> std::result::Result<Option<(Option<String>, AssistantFunctionCall)>, ApiError> {
+    match scan_tool_call(text) {
+        ToolCallScan::Text { .. } => Ok(None),
+        ToolCallScan::Call { content_end, open } => {
+            let function = auto_call_function(&text[open + TOOL_CALL_OPEN.len()..], calls)?;
+            let content = (content_end > 0).then(|| text[..content_end].to_owned());
+            Ok(Some((content, function)))
+        }
+    }
+}
+
+fn auto_call_function(
+    after_open: &str,
+    calls: &CompiledToolCalls,
+) -> std::result::Result<AssistantFunctionCall, ApiError> {
+    let call = parse_tool_call(after_open)
+        .and_then(|call| {
+            calls.validate_call(&call.name, &call.arguments)?;
+            Ok(call)
+        })
+        .map_err(|error| {
+            ApiError::server_error(format!(
+                "model produced an invalid native tool call: {error:#}"
+            ))
+        })?;
+    let arguments = serde_json::to_string(&call.arguments).map_err(|error| {
+        ApiError::server_error(format!("failed to serialize tool arguments: {error}"))
+    })?;
+    Ok(AssistantFunctionCall {
+        name: call.name,
+        arguments,
+    })
+}
+
 fn canonical_arguments(arguments: &str) -> std::result::Result<String, ApiError> {
     let value: serde_json::Value = serde_json::from_str(arguments).map_err(|error| {
         ApiError::server_error(format!(
@@ -1076,7 +1236,7 @@ fn streaming_response(
     ticket: EngineTicket,
     identity: RequestIdentity,
     include_usage: bool,
-    forced_tool_name: Option<String>,
+    output: AssistantOutput,
 ) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
     let state = StreamState {
         ticket,
@@ -1085,8 +1245,9 @@ fn streaming_response(
         role_sent: false,
         terminal: false,
         pending: VecDeque::new(),
-        forced_tool_name,
+        output,
         buffered_tool_arguments: String::new(),
+        splitter: ToolCallSplitter::default(),
     };
     Sse::new(stream::unfold(state, next_stream_event)).keep_alive(
         KeepAlive::new()
@@ -1102,8 +1263,38 @@ struct StreamState {
     role_sent: bool,
     terminal: bool,
     pending: VecDeque<Event>,
-    forced_tool_name: Option<String>,
+    output: AssistantOutput,
+    /// Forced calls stream nothing until their arguments are complete.
     buffered_tool_arguments: String,
+    /// Automatic calls stream content and withhold everything from the
+    /// opening tag on until the call has been validated.
+    splitter: ToolCallSplitter,
+}
+
+impl StreamState {
+    fn chunk_event(&self, build: impl FnOnce(String, u64, String) -> ChatCompletionChunk) -> Event {
+        json_event(&build(
+            self.identity.id.clone(),
+            self.identity.created,
+            self.identity.model.clone(),
+        ))
+    }
+
+    /// Queue one validated call as `OpenAI` tool-call deltas: the header with
+    /// id and name, the complete arguments, then `finish_reason=tool_calls`.
+    fn push_tool_call(&mut self, function: AssistantFunctionCall) {
+        let call_id = tool_call_id(&self.identity.id);
+        let header = self.chunk_event(|id, created, model| {
+            ChatCompletionChunk::tool_call_header(id, created, model, call_id, function.name)
+        });
+        let arguments = self.chunk_event(|id, created, model| {
+            ChatCompletionChunk::tool_arguments(id, created, model, function.arguments)
+        });
+        let finished = self.chunk_event(|id, created, model| {
+            ChatCompletionChunk::finished(id, created, model, ChatFinishReason::ToolCalls)
+        });
+        self.pending.extend([header, arguments, finished]);
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1112,7 +1303,7 @@ async fn next_stream_event(
 ) -> Option<(std::result::Result<Event, Infallible>, StreamState)> {
     if !state.role_sent {
         state.role_sent = true;
-        if state.forced_tool_name.is_none() {
+        if !matches!(state.output, AssistantOutput::ForcedCall { .. }) {
             let chunk = ChatCompletionChunk::role(
                 state.identity.id.clone(),
                 state.identity.created,
@@ -1134,10 +1325,20 @@ async fn next_stream_event(
             Some(EngineEvent::Text {
                 content: fragment, ..
             }) => {
-                if state.forced_tool_name.is_some() {
-                    state.buffered_tool_arguments.push_str(&fragment);
-                    continue;
-                }
+                let fragment = match &state.output {
+                    AssistantOutput::Text => fragment,
+                    AssistantOutput::ForcedCall { .. } => {
+                        state.buffered_tool_arguments.push_str(&fragment);
+                        continue;
+                    }
+                    AssistantOutput::AutoCall { .. } => {
+                        let safe = state.splitter.push(&fragment);
+                        if safe.is_empty() {
+                            continue;
+                        }
+                        safe
+                    }
+                };
                 let chunk = ChatCompletionChunk::content(
                     state.identity.id.clone(),
                     state.identity.created,
@@ -1147,66 +1348,64 @@ async fn next_stream_event(
                 return Some((Ok(json_event(&chunk)), state));
             }
             Some(EngineEvent::Finished(metrics)) => {
-                if let Some(name) = state.forced_tool_name.take() {
-                    if metrics.finish_reason == crate::generation::FinishReason::Stop {
-                        match canonical_arguments(&state.buffered_tool_arguments) {
-                            Ok(arguments) => {
-                                state
-                                    .pending
-                                    .push_back(json_event(&ChatCompletionChunk::role(
-                                        state.identity.id.clone(),
-                                        state.identity.created,
-                                        state.identity.model.clone(),
-                                    )));
-                                state.pending.push_back(json_event(
-                                    &ChatCompletionChunk::tool_call_header(
-                                        state.identity.id.clone(),
-                                        state.identity.created,
-                                        state.identity.model.clone(),
-                                        tool_call_id(&state.identity.id),
-                                        name,
-                                    ),
-                                ));
-                                state.pending.push_back(json_event(
-                                    &ChatCompletionChunk::tool_arguments(
-                                        state.identity.id.clone(),
-                                        state.identity.created,
-                                        state.identity.model.clone(),
-                                        arguments,
-                                    ),
-                                ));
-                                state.pending.push_back(json_event(
-                                    &ChatCompletionChunk::finished(
-                                        state.identity.id.clone(),
-                                        state.identity.created,
-                                        state.identity.model.clone(),
-                                        ChatFinishReason::ToolCalls,
-                                    ),
-                                ));
+                let reason = ChatFinishReason::from_generation(metrics.finish_reason);
+                match std::mem::replace(&mut state.output, AssistantOutput::Text) {
+                    AssistantOutput::ForcedCall { name } => {
+                        if metrics.finish_reason == crate::generation::FinishReason::Stop {
+                            match canonical_arguments(&state.buffered_tool_arguments) {
+                                Ok(arguments) => {
+                                    let role = state.chunk_event(ChatCompletionChunk::role);
+                                    state.pending.push_back(role);
+                                    state.push_tool_call(AssistantFunctionCall { name, arguments });
+                                }
+                                Err(error) => {
+                                    state.pending.push_back(json_event(&error.into_response()));
+                                }
                             }
-                            Err(error) => {
-                                state.pending.push_back(json_event(&error.into_response()));
+                        } else {
+                            state.pending.push_back(json_event(
+                                &ApiError::server_error(
+                                    "forced tool generation reached its length limit before a stop token",
+                                )
+                                .into_response(),
+                            ));
+                        }
+                    }
+                    // A cancelled generation exposes neither held text nor a call.
+                    AssistantOutput::AutoCall { calls } => {
+                        if let Some(reason) = reason {
+                            match std::mem::take(&mut state.splitter).finish() {
+                                SplitEnd::Content(rest) => {
+                                    if !rest.is_empty() {
+                                        let content = state.chunk_event(|id, created, model| {
+                                            ChatCompletionChunk::content(id, created, model, rest)
+                                        });
+                                        state.pending.push_back(content);
+                                    }
+                                    let finished = state.chunk_event(|id, created, model| {
+                                        ChatCompletionChunk::finished(id, created, model, reason)
+                                    });
+                                    state.pending.push_back(finished);
+                                }
+                                SplitEnd::Call(after_open) => {
+                                    match auto_call_function(&after_open, &calls) {
+                                        Ok(function) => state.push_tool_call(function),
+                                        Err(error) => state
+                                            .pending
+                                            .push_back(json_event(&error.into_response())),
+                                    }
+                                }
                             }
                         }
-                    } else {
-                        state.pending.push_back(json_event(
-                            &ApiError::server_error(
-                                "forced tool generation reached its length limit before a stop token",
-                            )
-                            .into_response(),
-                        ));
                     }
-                } else if let Some(reason) =
-                    ChatFinishReason::from_generation(metrics.finish_reason)
-                {
-                    state
-                        .pending
-                        .push_back(json_event(&ChatCompletionChunk::finished(
-                            state.identity.id.clone(),
-                            state.identity.created,
-                            state.identity.model.clone(),
-                            reason,
-                        )));
+                    AssistantOutput::Text => {
+                        if let Some(reason) = reason {
+                            let finished = state.chunk_event(|id, created, model| {
+                                ChatCompletionChunk::finished(id, created, model, reason)
+                            });
+                            state.pending.push_back(finished);
+                        }
+                    }
                 }
                 if state.include_usage {
                     let usage = TokenUsage::with_cached_tokens(
@@ -1425,13 +1624,14 @@ mod tests {
                 .unwrap()
         };
 
-        let implicit = to_engine_request(validated(None), 91).unwrap();
+        let (implicit, _) = to_engine_request(validated(None), 91).unwrap();
         assert_eq!(implicit.sampling.seed, 91);
         assert!(matches!(implicit.input, EngineInput::Chat(_)));
         assert!(!implicit.ignore_stop_tokens);
         assert_eq!(
             to_engine_request(validated(Some(7)), 91)
                 .unwrap()
+                .0
                 .sampling
                 .seed,
             7
@@ -1460,7 +1660,7 @@ mod tests {
         .unwrap()
         .validate("test-model", 16)
         .unwrap();
-        let structured = to_engine_request(structured, 91).unwrap();
+        let (structured, _) = to_engine_request(structured, 91).unwrap();
         assert!(matches!(
             structured.input,
             EngineInput::ConstrainedChat {
@@ -1965,28 +2165,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_automatic_tools_never_submit_and_full_queue_is_shaped() {
+    async fn unsupported_tool_modes_never_submit_and_full_queue_is_shaped() {
         let engine = Arc::new(FakeEngine::healthy(Vec::new()));
         let app = router(engine.clone());
+        let tool = |name: &str| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": false
+                    },
+                    "strict": true
+                }
+            })
+        };
         let bad = Request::post("/v1/chat/completions")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
                 json!({
                     "model": "test-model",
                     "messages": [{"role": "user", "content": "hello"}],
-                    "tools": [{
-                        "type": "function",
-                        "function": {
-                            "name": "lookup",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {},
-                                "required": [],
-                                "additionalProperties": false
-                            },
-                            "strict": true
-                        }
-                    }]
+                    "tools": [tool("lookup"), tool("clock")],
+                    "tool_choice": "required",
+                    "parallel_tool_calls": false
                 })
                 .to_string(),
             ))
@@ -2052,7 +2257,7 @@ mod tests {
         .unwrap()
         .validate("test-model", 16)
         .unwrap();
-        let request = to_engine_request(request, 7).unwrap();
+        let (request, _) = to_engine_request(request, 7).unwrap();
         let EngineInput::Agent {
             prompt,
             constraint: Some(constraint),
@@ -2114,7 +2319,7 @@ mod tests {
             .unwrap()
             .validate("test-model", 16)
             .unwrap();
-        let request = to_engine_request(request, 7).unwrap();
+        let (request, _) = to_engine_request(request, 7).unwrap();
         let EngineInput::Agent { prompt, .. } = request.input else {
             panic!("expected native agent history");
         };
@@ -2248,6 +2453,446 @@ mod tests {
                 assert!(body.get("choices").is_none());
             }
         }
+    }
+
+    /// RestLoop's only tool: non-strict, with no `additionalProperties`.
+    fn shell_tool() -> Value {
+        json!({"type": "function", "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }
+        }})
+    }
+
+    fn chat_request(body: &Value) -> Request<Body> {
+        Request::post("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn auto_request(streaming: bool) -> Request<Body> {
+        chat_request(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "list files"}],
+            "tools": [shell_tool()],
+            "stream": streaming,
+            "stream_options": if streaming { json!({"include_usage": true}) } else { Value::Null }
+        }))
+    }
+
+    async fn body_text(response: Response) -> String {
+        String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    /// Decode every JSON `data:` event of an SSE body, in order.
+    fn sse_json(body: &str) -> Vec<Value> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect()
+    }
+
+    fn streamed_content(events: &[Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    const SHELL_CALL: &str =
+        "<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call>";
+
+    fn fragments(text: &str, sizes: &[usize]) -> Vec<EngineEvent> {
+        let mut events = Vec::new();
+        let mut rest = text;
+        for (index, size) in sizes.iter().enumerate() {
+            let (head, tail) = rest.split_at((*size).min(rest.len()));
+            events.push(text_event(head, 11, index + 1, 3));
+            rest = tail;
+        }
+        if !rest.is_empty() {
+            events.push(text_event(rest, 11, sizes.len() + 1, 3));
+        }
+        events
+    }
+
+    #[test]
+    fn automatic_choice_lowers_every_tool_and_a_lazy_tool_call_constraint() {
+        let mut clock = shell_tool();
+        clock["function"]["name"] = json!("clock");
+        let request = ChatCompletionRequest::from_json(
+            json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "list files"}],
+                "tools": [shell_tool(), clock]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap()
+        .validate("test-model", 16)
+        .unwrap();
+        let (request, output) = to_engine_request(request, 7).unwrap();
+        let EngineInput::Agent {
+            prompt,
+            constraint: Some(constraint),
+        } = request.input
+        else {
+            panic!("expected constrained native agent input");
+        };
+        assert_eq!(
+            constraint.purpose,
+            crate::engine::EngineConstraintPurpose::ToolCall
+        );
+        assert_eq!(prompt.directive, AgentDirective::Auto);
+        assert_eq!(
+            prompt
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["shell", "clock"]
+        );
+        let AssistantOutput::AutoCall { calls } = output else {
+            panic!("expected an automatic call response contract");
+        };
+        calls
+            .validate_call("clock", &json!({"command": "date"}))
+            .unwrap();
+        assert!(request.stop.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_defaults_and_template_kwargs_reach_the_engine_request() {
+        let engine = Arc::new(FakeEngine::healthy(vec![EngineEvent::Finished(metrics(
+            FinishReason::Stop,
+        ))]));
+        let options = ServerOptions {
+            default_max_completion_tokens: 64,
+        };
+        let response = router_with_options(engine.clone(), options)
+            .oneshot(chat_request(&json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": {"enable_thinking": false}
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = engine.last_request.lock().unwrap().take().unwrap();
+        assert_eq!(request.max_new_tokens, 64);
+        assert_eq!(request.chat_template.enable_thinking, Some(false));
+        assert!(matches!(request.input, EngineInput::Chat(_)));
+
+        // Explicit budgets still win, and the agent path carries the kwargs.
+        let engine = Arc::new(FakeEngine::healthy(vec![EngineEvent::Finished(metrics(
+            FinishReason::Stop,
+        ))]));
+        let response = router_with_options(engine.clone(), options)
+            .oneshot(chat_request(&json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "list files"}],
+                "tools": [shell_tool()],
+                "max_tokens": 7,
+                "chat_template_kwargs": {"enable_thinking": true}
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = engine.last_request.lock().unwrap().take().unwrap();
+        assert_eq!(request.max_new_tokens, 7);
+        assert_eq!(request.chat_template.enable_thinking, Some(true));
+        assert!(matches!(request.input, EngineInput::Agent { .. }));
+        assert_eq!(ServerOptions::default().default_max_completion_tokens, 128);
+    }
+
+    #[tokio::test]
+    async fn auto_non_streaming_separates_content_from_one_validated_call() {
+        let reasoning = "<think>\nNeed ls.\n</think>\n\nListing.\n";
+        let cases = [
+            (
+                format!("{reasoning}{SHELL_CALL}"),
+                json!("<think>\nNeed ls.\n</think>\n\nListing."),
+            ),
+            (format!("\n{SHELL_CALL}"), Value::Null),
+        ];
+        for (text, content) in cases {
+            let response = router(Arc::new(FakeEngine::healthy({
+                let mut events = fragments(&text, &[7, 30, 5]);
+                events.push(EngineEvent::Finished(metrics(FinishReason::Stop)));
+                events
+            })))
+            .oneshot(auto_request(false))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            let message = &body["choices"][0]["message"];
+            assert_eq!(message["content"], content);
+            let call = &message["tool_calls"][0];
+            assert!(call["id"].as_str().unwrap().starts_with("call_"));
+            assert_eq!(call["type"], "function");
+            assert_eq!(
+                call["function"],
+                json!({"name": "shell", "arguments": "{\"command\":\"ls\"}"})
+            );
+            assert_eq!(message["tool_calls"].as_array().unwrap().len(), 1);
+            assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        }
+
+        // An opening tag outside reasoning always starts a call. The lazy
+        // grammar would have constrained what follows; text that bypassed it
+        // is an error, never content a client could mistake for an answer.
+        let response = router(Arc::new(FakeEngine::healthy(vec![
+            text_event("Use <tool_call> tags", 11, 1, 3),
+            EngineEvent::Finished(metrics(FinishReason::Stop)),
+        ])))
+        .oneshot(auto_request(false))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Reasoning may spell the tag, and a held partial tag is released as
+        // content when generation ends without a call.
+        let response = router(Arc::new(FakeEngine::healthy(vec![
+            text_event(
+                "<think>\nWhat is <tool_call>?\n</think>\n\nA tag. <tool",
+                11,
+                1,
+                3,
+            ),
+            EngineEvent::Finished(metrics(FinishReason::Length)),
+        ])))
+        .oneshot(auto_request(false))
+        .await
+        .unwrap();
+        let body = body_json(response).await;
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "<think>\nWhat is <tool_call>?\n</think>\n\nA tag. <tool"
+        );
+        assert!(body["choices"][0]["message"].get("tool_calls").is_none());
+        assert_eq!(body["choices"][0]["finish_reason"], "length");
+    }
+
+    #[tokio::test]
+    async fn auto_calls_that_fail_validation_are_errors_never_content() {
+        let invalid = [
+            "Sure.\n<tool_call>\n{\"name\": \"rm\", \"arguments\": {\"path\": \"SECRET\"}}\n</tool_call>",
+            "Sure.\n<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\": 1, \"x\": \"SECRET\"}}\n</tool_call>",
+            "Sure.\n<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\": \"SECRET\"}}",
+        ];
+        for text in invalid {
+            for streaming in [false, true] {
+                let response = router(Arc::new(FakeEngine::healthy(vec![
+                    text_event(text, 11, 1, 3),
+                    EngineEvent::Finished(metrics(FinishReason::Stop)),
+                ])))
+                .oneshot(auto_request(streaming))
+                .await
+                .unwrap();
+                if streaming {
+                    let body = body_text(response).await;
+                    let events = sse_json(&body);
+                    assert_eq!(streamed_content(&events).concat(), "Sure.");
+                    assert!(body.contains("invalid native tool call"));
+                    assert!(!body.contains("SECRET"));
+                    assert!(!body.contains("tool_calls"));
+                    assert!(body.contains("data: [DONE]"));
+                } else {
+                    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                    let body = body_json(response).await;
+                    assert!(body.get("choices").is_none());
+                    assert!(!body.to_string().contains("SECRET"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_sse_streams_content_then_tool_call_deltas_without_leaking_the_tag() {
+        let text = format!("<think>\nok\n</think>\n\nListing.\n{SHELL_CALL}");
+        // Split the opening tag across several worker fragments.
+        let opening = text.find("<tool_call>").unwrap();
+        let mut events = fragments(&text, &[opening - 3, 4, 3, 4, 9]);
+        events.push(EngineEvent::Finished(metrics(FinishReason::Stop)));
+        let response = router(Arc::new(FakeEngine::healthy(events)))
+            .oneshot(auto_request(true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let events = sse_json(&body);
+
+        assert_eq!(events[0]["choices"][0]["delta"]["role"], "assistant");
+        let content = streamed_content(&events);
+        assert_eq!(content.concat(), "<think>\nok\n</think>\n\nListing.");
+        assert!(content.iter().all(|delta| !delta.contains("tool")));
+
+        let header = events
+            .iter()
+            .position(|event| event["choices"][0]["delta"]["tool_calls"][0]["id"].is_string())
+            .unwrap();
+        let header_call = &events[header]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(header_call["index"], 0);
+        assert_eq!(header_call["type"], "function");
+        assert_eq!(header_call["function"]["name"], "shell");
+        assert_eq!(
+            events[header + 1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            "{\"command\":\"ls\"}"
+        );
+        assert_eq!(
+            events[header + 2]["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
+        assert_eq!(events[header + 3]["usage"]["total_tokens"], 5);
+        assert!(body.trim_end().ends_with("data: [DONE]"));
+        let last_content = events
+            .iter()
+            .rposition(|event| event["choices"][0]["delta"]["content"].is_string())
+            .unwrap();
+        assert!(last_content < header);
+    }
+
+    #[tokio::test]
+    async fn auto_sse_releases_held_text_when_no_call_opens() {
+        let response = router(Arc::new(FakeEngine::healthy(vec![
+            text_event("Done", 11, 1, 3),
+            text_event(" \n", 12, 2, 3),
+            text_event("<tool", 13, 3, 3),
+            EngineEvent::Finished(metrics(FinishReason::Length)),
+        ])))
+        .oneshot(auto_request(true))
+        .await
+        .unwrap();
+        let body = body_text(response).await;
+        let events = sse_json(&body);
+        assert_eq!(streamed_content(&events), ["Done", " \n<tool"]);
+        assert!(body.contains("\"finish_reason\":\"length\""));
+        assert!(!body.contains("tool_calls"));
+    }
+
+    /// Apply RestLoop's bookkeeping to one reply: keep the assistant message
+    /// with `content` as a string and any `tool_calls`, then answer each call.
+    fn restloop_record(messages: &mut Vec<Value>, reply: &Value, output: &str) -> bool {
+        let message = &reply["choices"][0]["message"];
+        let text = message["content"].as_str().unwrap_or("");
+        let calls = message["tool_calls"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut keep = json!({"role": "assistant", "content": text});
+        if let Some(reasoning) = message.get("reasoning_content").filter(|r| !r.is_null()) {
+            keep["reasoning_content"] = reasoning.clone();
+        }
+        if !calls.is_empty() {
+            keep["tool_calls"] = json!(calls);
+        }
+        messages.push(keep);
+        for call in &calls {
+            messages.push(json!({"role": "tool", "tool_call_id": call["id"], "content": output}));
+        }
+        !calls.is_empty()
+    }
+
+    async fn restloop_step(messages: &[Value], generated: &str) -> (Value, String) {
+        let engine = Arc::new(FakeEngine::healthy(vec![
+            text_event(generated, 11, 1, 3),
+            EngineEvent::Finished(metrics(FinishReason::Stop)),
+        ]));
+        let response = router(engine.clone())
+            .oneshot(chat_request(&json!({
+                "model": "test-model",
+                "messages": messages,
+                "tools": [shell_tool()]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = engine.last_request.lock().unwrap().take().unwrap();
+        let EngineInput::Agent { prompt, constraint } = request.input else {
+            panic!("RestLoop requests use the native agent renderer");
+        };
+        assert_eq!(prompt.directive, AgentDirective::Auto);
+        assert!(constraint.is_some());
+        let rendered = crate::models::qwen3::format_qwen3_agent_prompt(
+            crate::agent::AgentTemplateProfile::Qwen3Current,
+            &prompt,
+            request.chat_template,
+        )
+        .unwrap();
+        (body_json(response).await, rendered)
+    }
+
+    #[tokio::test]
+    async fn restloop_multi_step_requests_round_trip_through_auto_tool_choice() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "You are a coding agent."}),
+            json!({"role": "user", "content": "What does a.txt say?"}),
+        ];
+
+        // Turn 1: reasoning, then a call.
+        let (reply, rendered) = restloop_step(
+            &messages,
+            &format!("<think>\nList first.\n</think>\n\n{SHELL_CALL}"),
+        )
+        .await;
+        assert!(rendered.ends_with(
+            "<|im_start|>user\nWhat does a.txt say?<|im_end|>\n<|im_start|>assistant\n"
+        ));
+        assert!(restloop_record(&mut messages, &reply, "exit: 0\na.txt\n"));
+        assert_eq!(messages[2]["content"], "<think>\nList first.\n</think>");
+
+        // Turn 2: the replayed call reproduces the model's own turn, then a
+        // second call with visible text before it.
+        let (reply, rendered) = restloop_step(
+            &messages,
+            "Reading it.\n<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\": \"cat a.txt\"}}\n</tool_call>",
+        )
+        .await;
+        assert!(rendered.ends_with(concat!(
+            "<|im_start|>assistant\n<think>\nList first.\n</think>\n\n",
+            "<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\":\"ls\"}}\n</tool_call><|im_end|>\n",
+            "<|im_start|>user\n<tool_response>\nexit: 0\na.txt\n\n</tool_response><|im_end|>\n",
+            "<|im_start|>assistant\n"
+        )));
+        assert_eq!(reply["choices"][0]["message"]["content"], "Reading it.");
+        assert!(restloop_record(&mut messages, &reply, "exit: 0\nhi\n"));
+
+        // Turn 3: the final answer has no call.
+        let (reply, rendered) =
+            restloop_step(&messages, "<think>\nDone.\n</think>\n\na.txt says hi.").await;
+        assert!(rendered.contains(concat!(
+            "<|im_start|>assistant\nReading it.\n<tool_call>\n",
+            "{\"name\": \"shell\", \"arguments\": {\"command\":\"cat a.txt\"}}\n</tool_call><|im_end|>\n"
+        )));
+        assert_eq!(reply["choices"][0]["finish_reason"], "stop");
+        assert!(!restloop_record(&mut messages, &reply, ""));
+
+        // An interactive follow-up continues the same conversation.
+        messages.push(json!({"role": "user", "content": "Thanks."}));
+        let (reply, rendered) = restloop_step(&messages, "You're welcome.").await;
+        assert!(
+            rendered.contains("a.txt says hi.<|im_end|>\n<|im_start|>user\nThanks.<|im_end|>\n")
+        );
+        assert_eq!(reply["choices"][0]["message"]["content"], "You're welcome.");
+        assert_eq!(messages.len(), 8);
     }
 
     #[tokio::test]

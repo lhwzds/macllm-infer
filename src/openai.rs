@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    chat::{ChatMessage, ChatRole, validate_chat_messages},
+    chat::{ChatMessage, ChatRole, ChatTemplateOptions, validate_chat_messages},
     generation::FinishReason as GenerationFinishReason,
     grammar::CompiledJsonSchema,
     output::MAX_STOP_SEQUENCES,
@@ -50,8 +50,9 @@ pub struct ChatCompletionRequest {
     pub n: Option<usize>,
 
     // Agent request fields are parsed and validated into an explicit contract.
-    // JSON-schema response formats and the narrow forced-single native tool
-    // subset are connected to constrained generation.
+    // JSON-schema response formats, forced single calls and automatic tool
+    // choice (at most one call per turn) are connected to constrained
+    // generation.
     #[serde(default)]
     pub tools: Option<Vec<FunctionTool>>,
     #[serde(default)]
@@ -70,6 +71,10 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f64>,
     #[serde(default)]
     pub presence_penalty: Option<f64>,
+    /// Template keyword options (vLLM/SGLang/llama.cpp convention). Only
+    /// `enable_thinking` is understood; any other key is rejected.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<serde_json::Map<String, Value>>,
 }
 
 impl ChatCompletionRequest {
@@ -174,6 +179,7 @@ impl ChatCompletionRequest {
             None => false,
         };
 
+        let chat_template = normalize_chat_template_kwargs(self.chat_template_kwargs)?;
         let messages = validate_messages(self.messages)?;
         let response_format = self
             .response_format
@@ -217,6 +223,7 @@ impl ChatCompletionRequest {
             tools,
             tool_choice,
             parallel_tool_calls,
+            chat_template,
         })
     }
 }
@@ -279,7 +286,24 @@ pub enum FunctionToolKind {
     Function,
 }
 
-/// Strict function schema retained for future grammar compilation.
+impl FunctionTool {
+    /// Compile the grammar that constrains this function's arguments.
+    ///
+    /// A strict schema must already be in the closed subset. A non-strict
+    /// schema carries no conformance promise in the `OpenAI` contract; it is
+    /// closed to its declared properties, which only narrows what it accepts,
+    /// so constrained arguments still satisfy the declared schema.
+    pub fn compile_arguments_schema(&self) -> anyhow::Result<CompiledJsonSchema> {
+        if self.function.strict {
+            CompiledJsonSchema::compile(&self.function.parameters)
+        } else {
+            CompiledJsonSchema::compile_closed(&self.function.parameters)
+        }
+    }
+}
+
+/// One function declaration. Non-strict schemas are accepted when they can
+/// be closed into the constrained-generation subset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FunctionDefinition {
@@ -456,6 +480,9 @@ pub struct ValidatedChatCompletionRequest {
     pub tools: Vec<FunctionTool>,
     pub tool_choice: ToolChoice,
     pub parallel_tool_calls: bool,
+    /// Template options set by this request; unset options use server
+    /// defaults, and the model adapter rejects any it cannot honor.
+    pub chat_template: ChatTemplateOptions,
 }
 
 impl ValidatedChatCompletionRequest {
@@ -514,6 +541,28 @@ fn reject_unsupported_fields(request: &ChatCompletionRequest) -> Result<(), ApiE
     Ok(())
 }
 
+fn normalize_chat_template_kwargs(
+    kwargs: Option<serde_json::Map<String, Value>>,
+) -> Result<ChatTemplateOptions, ApiError> {
+    let mut options = ChatTemplateOptions::default();
+    for (key, value) in kwargs.unwrap_or_default() {
+        let param = format!("chat_template_kwargs.{key}");
+        match (key.as_str(), value) {
+            ("enable_thinking", Value::Bool(enabled)) => options.enable_thinking = Some(enabled),
+            ("enable_thinking", _) => {
+                return Err(invalid_value(param, "enable_thinking must be a boolean"));
+            }
+            _ => {
+                return Err(unsupported_value(
+                    param,
+                    "only chat_template_kwargs.enable_thinking is supported",
+                ));
+            }
+        }
+    }
+    Ok(options)
+}
+
 fn validate_response_format(format: ResponseFormat) -> Result<ResponseFormat, ApiError> {
     match &format {
         ResponseFormat::JsonSchema { json_schema } => {
@@ -552,14 +601,18 @@ fn validate_tools(tools: Vec<FunctionTool>) -> Result<Vec<FunctionTool>, ApiErro
                 format!("duplicate tool function `{}`", tool.function.name),
             ));
         }
-        if !tool.function.strict {
+        if tool.function.strict {
+            validate_strict_object_schema(
+                &tool.function.parameters,
+                &format!("{base}.parameters"),
+            )?;
+        } else if tool.function.parameters.get("type").and_then(Value::as_str) != Some("object") {
             return Err(invalid_value(
-                format!("{base}.strict"),
-                "only strict=true function tools are supported",
+                format!("{base}.parameters.type"),
+                "function parameters must have an object root",
             ));
         }
-        validate_strict_object_schema(&tool.function.parameters, &format!("{base}.parameters"))?;
-        CompiledJsonSchema::compile(&tool.function.parameters).map_err(|error| {
+        tool.compile_arguments_schema().map_err(|error| {
             invalid_value(
                 format!("{base}.parameters"),
                 format!("unsupported JSON schema for constrained tool arguments: {error:#}"),
@@ -607,6 +660,11 @@ fn normalize_tool_choice(
     Ok(choice)
 }
 
+/// `parallel_tool_calls` grants permission for several calls in one turn; it
+/// never obliges more than one. The native runtime emits at most one call:
+/// automatic choice therefore accepts either value (`true` is the `OpenAI`
+/// default), while forced and `required` calls keep their explicit
+/// single-call contract and require `false`.
 fn normalize_parallel_tool_calls(
     requested: Option<bool>,
     tools: &[FunctionTool],
@@ -645,16 +703,13 @@ fn validate_tool_runtime_subset(
     if !stop.is_empty() {
         return Err(invalid_value(
             "stop",
-            "stop cannot be combined with a forced tool call because it could terminate before the arguments JSON is complete",
+            "stop cannot be combined with enabled tool calls because it could terminate before a call's arguments JSON is complete",
         ));
     }
     match choice {
-        ToolChoice::Mode(ToolChoiceMode::Auto) => {
-            return Err(unsupported_value(
-                "tool_choice",
-                "tool_choice=auto is not implemented; force one named tool or use required with exactly one declared tool",
-            ));
-        }
+        // The model chooses text or one native call; the runtime stops after
+        // the first call whatever `parallel_tool_calls` permits.
+        ToolChoice::Mode(ToolChoiceMode::Auto) => return Ok(()),
         ToolChoice::Mode(ToolChoiceMode::Required) if tools.len() != 1 => {
             return Err(unsupported_value(
                 "tool_choice",
@@ -991,12 +1046,9 @@ fn validate_tool_aware_messages(
                         "the native tool history subset supports exactly one call per assistant turn",
                     ));
                 }
-                if content.is_some() {
-                    return Err(unsupported_value(
-                        format!("messages.{index}.content"),
-                        "assistant tool-call history requires content=null",
-                    ));
-                }
+                // Content before a call (visible text or reasoning) is kept;
+                // clients that echo an empty string mean no content.
+                let content = content.filter(|content| !content.is_empty());
                 pending_tool_calls.clear();
                 for (call_index, call) in tool_calls.iter_mut().enumerate() {
                     call.function.arguments =
@@ -1385,11 +1437,14 @@ impl ChatCompletionResponse {
         }
     }
 
+    /// A turn that ends with one call. `content` is the visible text the
+    /// model produced before the call, or `None` when there was none.
     #[must_use]
     pub fn tool_call(
         id: impl Into<String>,
         created: u64,
         model: impl Into<String>,
+        content: Option<String>,
         call: AssistantToolCall,
         usage: TokenUsage,
     ) -> Self {
@@ -1402,7 +1457,7 @@ impl ChatCompletionResponse {
                 index: 0,
                 message: ResponseMessage {
                     role: ResponseRole::Assistant,
-                    content: None,
+                    content,
                     tool_calls: Some(vec![call]),
                 },
                 logprobs: None,
@@ -1963,14 +2018,32 @@ mod tests {
     }
 
     #[test]
-    fn validates_only_the_forced_single_tool_subset() {
+    fn validates_forced_single_and_automatic_tool_subsets() {
+        // Declared tools default to automatic choice, and `parallel_tool_calls`
+        // keeps its OpenAI default: permission, never an obligation.
         let automatic = parse_and_validate(json!({
             "model": MODEL,
             "messages": [{"role": "user", "content": "weather?"}],
             "tools": [function_tool("get_weather")]
         }))
-        .unwrap_err();
-        assert_eq!(automatic.param.as_deref(), Some("tool_choice"));
+        .unwrap();
+        assert_eq!(
+            automatic.tool_choice,
+            ToolChoice::Mode(ToolChoiceMode::Auto)
+        );
+        assert!(automatic.parallel_tool_calls);
+        assert!(automatic.forced_tool().is_none());
+        for parallel in [true, false] {
+            let explicit = parse_and_validate(json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "weather?"}],
+                "tools": [function_tool("get_weather"), function_tool("get_time")],
+                "tool_choice": "auto",
+                "parallel_tool_calls": parallel
+            }))
+            .unwrap();
+            assert_eq!(explicit.parallel_tool_calls, parallel);
+        }
 
         let forced = parse_and_validate(json!({
             "model": MODEL,
@@ -2055,7 +2128,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_every_tool_mode_outside_the_forced_single_matrix() {
+    fn rejects_every_tool_mode_outside_the_supported_matrix() {
         let named = json!({
             "type": "function",
             "function": {"name": "get_weather"}
@@ -2065,9 +2138,9 @@ mod tests {
                 json!({
                     "tools": [function_tool("get_weather")],
                     "tool_choice": "auto",
-                    "parallel_tool_calls": false
+                    "stop": "</tool_call>"
                 }),
-                "tool_choice",
+                "stop",
             ),
             (
                 json!({
@@ -2123,6 +2196,147 @@ mod tests {
                 .extend(patch.as_object().unwrap().clone());
             let error = parse_and_validate(request).unwrap_err();
             assert_eq!(error.param.as_deref(), Some(param));
+        }
+    }
+
+    fn restloop_shell_tool() -> Value {
+        json!({"type": "function", "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }
+        }})
+    }
+
+    #[test]
+    fn accepts_non_strict_tools_by_closing_them_to_declared_properties() {
+        let request = parse_and_validate(json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "list files"}],
+            "tools": [restloop_shell_tool()]
+        }))
+        .unwrap();
+        assert_eq!(request.tool_choice, ToolChoice::Mode(ToolChoiceMode::Auto));
+        let tool = &request.tools[0];
+        assert!(!tool.function.strict);
+        let schema = tool.compile_arguments_schema().unwrap();
+        assert!(schema.accepts(&json!({"command": "ls"})));
+        assert!(!schema.accepts(&json!({"command": "ls", "extra": true})));
+
+        for (parameters, param) in [
+            (
+                json!({"type": "string"}),
+                "tools.0.function.parameters.type",
+            ),
+            (
+                json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string", "minLength": 1}}
+                }),
+                "tools.0.function.parameters",
+            ),
+        ] {
+            let mut tool = restloop_shell_tool();
+            tool["function"]["parameters"] = parameters;
+            let error = parse_and_validate(json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "list files"}],
+                "tools": [tool]
+            }))
+            .unwrap_err();
+            assert_eq!(error.param.as_deref(), Some(param));
+        }
+    }
+
+    #[test]
+    fn accepts_only_the_enable_thinking_template_kwarg() {
+        let request = |kwargs: Value| {
+            parse_and_validate(json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": kwargs
+            }))
+        };
+        assert_eq!(
+            parse_and_validate(json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .unwrap()
+            .chat_template,
+            ChatTemplateOptions::default()
+        );
+        assert_eq!(
+            request(json!({})).unwrap().chat_template,
+            ChatTemplateOptions::default()
+        );
+        for enabled in [false, true] {
+            assert_eq!(
+                request(json!({"enable_thinking": enabled}))
+                    .unwrap()
+                    .chat_template
+                    .enable_thinking,
+                Some(enabled)
+            );
+        }
+        for (kwargs, param, code) in [
+            (
+                json!({"enable_thinking": "no"}),
+                "chat_template_kwargs.enable_thinking",
+                "invalid_value",
+            ),
+            (
+                json!({"enable_thinking": false, "add_generation_prompt": false}),
+                "chat_template_kwargs.add_generation_prompt",
+                "unsupported_value",
+            ),
+        ] {
+            let error = request(kwargs).unwrap_err();
+            assert_eq!(error.param.as_deref(), Some(param));
+            assert_eq!(error.code.as_deref(), Some(code));
+        }
+    }
+
+    #[test]
+    fn keeps_visible_content_before_a_historical_tool_call() {
+        let history = |content: Value| {
+            parse_and_validate(json!({
+                "model": MODEL,
+                "messages": [
+                    {"role": "user", "content": "list files"},
+                    {
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": [{
+                            "id": "call_1", "type": "function",
+                            "function": {"name": "shell", "arguments": "{\"command\":\"ls\"}"}
+                        }]
+                    },
+                    {"role": "tool", "content": "exit: 0", "tool_call_id": "call_1"}
+                ],
+                "tools": [restloop_shell_tool()]
+            }))
+            .unwrap()
+        };
+        for (content, expected) in [
+            (
+                json!("<think>\nls\n</think>"),
+                Some("<think>\nls\n</think>"),
+            ),
+            (json!("Listing."), Some("Listing.")),
+            (json!(""), None),
+            (Value::Null, None),
+        ] {
+            let request = history(content);
+            let AgentMessage::Assistant { content, .. } =
+                &request.messages.as_tool_aware().unwrap()[1]
+            else {
+                panic!("expected an assistant tool call");
+            };
+            assert_eq!(content.as_deref(), expected);
         }
     }
 
@@ -2281,14 +2495,19 @@ mod tests {
                     {
                         "role": "assistant",
                         "content": "calling",
-                        "tool_calls": [{
-                            "id": "call_1", "type": "function",
-                            "function": {"name": "lookup", "arguments": "{}"}
-                        }]
-                    },
-                    {"role": "tool", "content": "result", "tool_call_id": "call_1"}
+                        "tool_calls": [
+                            {
+                                "id": "call_1", "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"}
+                            },
+                            {
+                                "id": "call_2", "type": "function",
+                                "function": {"name": "lookup", "arguments": "{}"}
+                            }
+                        ]
+                    }
                 ]),
-                "messages.1.content",
+                "messages.1.tool_calls",
                 "unsupported_value",
             ),
         ];
@@ -2399,7 +2618,8 @@ mod tests {
             "chatcmpl-1",
             123,
             MODEL,
-            call,
+            None,
+            call.clone(),
             TokenUsage::new(3, 2),
         );
         let response = serde_json::to_value(response).unwrap();
@@ -2409,6 +2629,24 @@ mod tests {
             json!({"name": "get_weather", "arguments": "{\"city\":\"LA\"}"})
         );
         assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+
+        let with_content = ChatCompletionResponse::tool_call(
+            "chatcmpl-1",
+            123,
+            MODEL,
+            Some("Checking.".to_owned()),
+            call,
+            TokenUsage::new(3, 2),
+        );
+        let with_content = serde_json::to_value(with_content).unwrap();
+        assert_eq!(
+            with_content["choices"][0]["message"]["content"],
+            "Checking."
+        );
+        assert_eq!(
+            with_content["choices"][0]["message"]["tool_calls"][0]["type"],
+            "function"
+        );
 
         let header = ChatCompletionChunk::tool_call_header(
             "chatcmpl-1",

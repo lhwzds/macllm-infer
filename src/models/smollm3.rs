@@ -303,6 +303,31 @@ mod tests {
     }
 
     #[test]
+    fn rejects_qwen3_template_options_fail_closed() {
+        let adapter = SmolLm3Adapter {
+            spec: tiny_spec(),
+            chat_template: Some(SmolLm3ChatTemplate::OfficialSystemOverrideTextSubset),
+        };
+        let messages = [
+            ChatMessage::system("/system_override"),
+            ChatMessage::user("Hi"),
+        ];
+        for enabled in [false, true] {
+            let options = crate::chat::ChatTemplateOptions {
+                enable_thinking: Some(enabled),
+            };
+            let error = adapter
+                .format_chat_messages_with(&messages, options)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("not supported by the smollm3 adapter")
+            );
+        }
+    }
+
+    #[test]
     fn dynamic_date_and_unknown_template_paths_require_raw_prompt() -> Result<()> {
         for messages in [
             vec![ChatMessage::user("Hello")],

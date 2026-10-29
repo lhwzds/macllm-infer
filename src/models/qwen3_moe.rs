@@ -3,7 +3,7 @@ use anyhow::{Result, bail, ensure};
 use crate::{
     agent::{AgentPrompt, AgentTemplateProfile},
     architecture::{DecoderSpec, RuntimeSpec},
-    chat::ChatMessage,
+    chat::{ChatMessage, ChatTemplateOptions},
     decoder::DecoderModel,
     model_weights::WeightSource,
     models::{
@@ -66,9 +66,17 @@ impl ModelAdapter for Qwen3MoeAdapter {
     }
 
     fn format_chat_messages(&self, messages: &[ChatMessage]) -> Result<String> {
+        self.format_chat_messages_with(messages, ChatTemplateOptions::default())
+    }
+
+    fn format_chat_messages_with(
+        &self,
+        messages: &[ChatMessage],
+        options: ChatTemplateOptions,
+    ) -> Result<String> {
         match self.chat_template {
             Some(Qwen3ChatTemplate::Current | Qwen3ChatTemplate::Gguf) => {
-                format_qwen3_chat_messages(messages)
+                format_qwen3_chat_messages(messages, options)
             }
             None => bail!(
                 "unsupported or missing Qwen3MoE chat template; pass --raw-prompt or use the pinned official Qwen3 template"
@@ -85,9 +93,17 @@ impl ModelAdapter for Qwen3MoeAdapter {
     }
 
     fn format_agent_prompt(&self, prompt: &AgentPrompt) -> Result<String> {
+        self.format_agent_prompt_with(prompt, ChatTemplateOptions::default())
+    }
+
+    fn format_agent_prompt_with(
+        &self,
+        prompt: &AgentPrompt,
+        options: ChatTemplateOptions,
+    ) -> Result<String> {
         let Some(profile) = self.agent_template_profile() else {
             bail!("unsupported or missing Qwen3MoE native agent template profile");
         };
-        format_qwen3_agent_prompt(profile, prompt)
+        format_qwen3_agent_prompt(profile, prompt, options)
     }
 }
