@@ -27,7 +27,7 @@ use macllm_infer::{
     rerank::{RerankScore, rerank_token_batch},
     runtime::{LoadedRuntime, ModelLoadConfig},
     sampling::{Sampler, SamplingConfig},
-    server::{ServerConfig, serve},
+    server::{ServerConfig, ServerOptions, serve},
     token_stream::TokenStream,
     weights::{ModelFiles, ModelFormat},
 };
@@ -426,6 +426,15 @@ struct ServeArgs {
         default_value_t = ModelLoadConfig::DEFAULT_SERVER_PREFIX_CACHE_CAPACITY_TOKENS
     )]
     prefix_cache_capacity_tokens: usize,
+    /// Completion budget for chat requests that omit `max_completion_tokens`
+    /// and `max_tokens`. Must fit the model context.
+    #[arg(long, default_value_t = NonZeroUsize::new(ServerOptions::DEFAULT_MAX_COMPLETION_TOKENS).unwrap())]
+    default_max_completion_tokens: NonZeroUsize,
+    /// Render chat and tool prompts with `enable_thinking=false` unless a
+    /// request sets `chat_template_kwargs.enable_thinking`. Only Qwen3 and
+    /// Qwen3MoE templates support it; other models fail to start.
+    #[arg(long)]
+    disable_thinking: bool,
 }
 
 #[tokio::main]
@@ -1267,9 +1276,15 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
     engine.prefill_token_quantum = args.prefill_token_quantum;
     engine.event_capacity = args.event_capacity;
     engine.event_send_timeout = Duration::from_secs(args.event_send_timeout_seconds);
+    if args.disable_thinking {
+        engine.chat_template_defaults.enable_thinking = Some(false);
+    }
     serve(ServerConfig {
         bind: SocketAddr::new(args.host, args.port),
         engine,
+        options: ServerOptions {
+            default_max_completion_tokens: args.default_max_completion_tokens.get(),
+        },
     })
     .await
 }
@@ -1418,6 +1433,40 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(disabled.prefix_cache_capacity_tokens, 0);
+    }
+
+    #[test]
+    fn serve_keeps_protocol_defaults_unless_flags_change_them() {
+        let defaults =
+            serve_args(Cli::try_parse_from(["macllm", "serve", "--model", "model-dir"]).unwrap());
+        assert_eq!(defaults.default_max_completion_tokens.get(), 128);
+        assert!(!defaults.disable_thinking);
+
+        let agent = serve_args(
+            Cli::try_parse_from([
+                "macllm",
+                "serve",
+                "--model",
+                "model-dir",
+                "--default-max-completion-tokens",
+                "4096",
+                "--disable-thinking",
+            ])
+            .unwrap(),
+        );
+        assert_eq!(agent.default_max_completion_tokens.get(), 4_096);
+        assert!(agent.disable_thinking);
+        assert!(
+            Cli::try_parse_from([
+                "macllm",
+                "serve",
+                "--model",
+                "model-dir",
+                "--default-max-completion-tokens",
+                "0",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

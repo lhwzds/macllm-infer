@@ -19,7 +19,7 @@ use crate::{
         CausalLm, CausalLmBatchCapability, CausalLmKvReservation, CausalLmSession,
         KvCacheExhausted, KvCacheReservationError, PrefixCacheDiagnostics,
     },
-    chat::ChatMessage,
+    chat::{ChatMessage, ChatTemplateOptions},
     generation::{
         FinishReason, GenerationConfig, GenerationForwardPreview, GenerationMetrics,
         GenerationPreparation, GenerationPreview, GenerationSequence, GenerationStep,
@@ -184,6 +184,10 @@ pub struct EngineRequest {
     pub max_new_tokens: usize,
     pub ignore_stop_tokens: bool,
     pub stop: Vec<String>,
+    /// Template options the request set explicitly. Unset options fall back
+    /// to [`EngineConfig::chat_template_defaults`]; raw inputs bypass the
+    /// template and therefore reject explicit options.
+    pub chat_template: ChatTemplateOptions,
 }
 
 /// Per-request serving behavior that does not change prompt or sampling
@@ -297,6 +301,9 @@ pub struct EngineConfig {
     /// production scheduler does not allocate trace records or inspect lane
     /// phases on its hot path.
     pub capture_benchmark_trace: bool,
+    /// Server-wide chat-template options for templated requests. A model
+    /// whose adapter cannot honor them fails to start.
+    pub chat_template_defaults: ChatTemplateOptions,
 }
 
 impl EngineConfig {
@@ -312,6 +319,7 @@ impl EngineConfig {
             event_capacity: 16,
             event_send_timeout: Duration::from_secs(30),
             capture_benchmark_trace: false,
+            chat_template_defaults: ChatTemplateOptions::default(),
         }
     }
 
@@ -811,6 +819,7 @@ impl EngineHandle {
             max_active_sequences: config.max_active_sequences,
             scheduler_token_budget: config.scheduler_token_budget,
             prefill_token_quantum: config.prefill_token_quantum,
+            chat_template_defaults: config.chat_template_defaults,
         };
         thread::Builder::new()
             .name("macllm-inference".to_owned())
@@ -1090,6 +1099,7 @@ struct SchedulerConfig {
     max_active_sequences: usize,
     scheduler_token_budget: usize,
     prefill_token_quantum: usize,
+    chat_template_defaults: ChatTemplateOptions,
 }
 
 fn sample_prefix_cache_snapshot(
@@ -1213,6 +1223,18 @@ fn worker_main(
             return;
         }
     };
+    if !scheduler_config.chat_template_defaults.is_default()
+        && let Err(error) = runtime.adapter.format_chat_messages_with(
+            &[ChatMessage::user("health check")],
+            scheduler_config.chat_template_defaults,
+        )
+    {
+        status.store(EngineStatus::Stopped as u8, Ordering::Release);
+        let _ = ready.send(Err(format!(
+            "model cannot honor the server chat template options: {error:#}"
+        )));
+        return;
+    }
     match runtime.encode(rendered, false) {
         Ok(tokens) if !tokens.is_empty() => {}
         Ok(_) => {
@@ -1582,7 +1604,9 @@ impl<'a> ServingScheduler<'a> {
         };
         let constraint_spec = job.request.input.constraint().cloned();
         let constraint_label = constraint_spec.as_ref().map(EngineConstraintSpec::label);
-        let Some((prompt_tokens, sampler)) = prepare_request(self.runtime, &mut job) else {
+        let Some((prompt_tokens, sampler)) =
+            prepare_request(self.runtime, &mut job, self.config.chat_template_defaults)
+        else {
             return Ok(());
         };
         let logits_constraint = match initialize_logits_constraint(self.runtime, constraint_spec) {
@@ -2689,10 +2713,30 @@ fn kv_capacity_rejection(
 }
 
 #[allow(clippy::too_many_lines)]
-fn prepare_request(runtime: &LoadedRuntime, job: &mut InferenceJob) -> Option<(Vec<u32>, Sampler)> {
+fn prepare_request(
+    runtime: &LoadedRuntime,
+    job: &mut InferenceJob,
+    chat_template_defaults: ChatTemplateOptions,
+) -> Option<(Vec<u32>, Sampler)> {
+    let chat_template = job.request.chat_template.or(chat_template_defaults);
+    if matches!(
+        job.request.input,
+        EngineInput::RawPrompt(_) | EngineInput::TokenIds(_)
+    ) && !job.request.chat_template.is_default()
+    {
+        reject_preflight(
+            job,
+            EngineFailureKind::InvalidRequest,
+            "chat template options require a templated chat or agent request".to_owned(),
+        );
+        return None;
+    }
     let prompt_tokens = match &job.request.input {
         EngineInput::Chat(messages) | EngineInput::ConstrainedChat { messages, .. } => {
-            let rendered = match runtime.adapter.format_chat_messages(messages) {
+            let rendered = match runtime
+                .adapter
+                .format_chat_messages_with(messages, chat_template)
+            {
                 Ok(rendered) => rendered,
                 Err(error) => {
                     reject_preflight(
@@ -2716,7 +2760,10 @@ fn prepare_request(runtime: &LoadedRuntime, job: &mut InferenceJob) -> Option<(V
             }
         }
         EngineInput::Agent { prompt, .. } => {
-            let rendered = match runtime.adapter.format_agent_prompt(prompt) {
+            let rendered = match runtime
+                .adapter
+                .format_agent_prompt_with(prompt, chat_template)
+            {
                 Ok(rendered) => rendered,
                 Err(error) => {
                     reject_preflight(
@@ -3398,6 +3445,7 @@ mod tests {
             max_active_sequences: 2,
             scheduler_token_budget: 4,
             prefill_token_quantum: 2,
+            chat_template_defaults: ChatTemplateOptions::default(),
         }
     }
 
@@ -3457,6 +3505,7 @@ mod tests {
                     max_new_tokens,
                     ignore_stop_tokens: false,
                     stop: Vec::new(),
+                    chat_template: ChatTemplateOptions::default(),
                 },
                 request_policy: EngineRequestPolicy::default(),
                 events,
@@ -3614,6 +3663,7 @@ mod tests {
             max_new_tokens: 1,
             ignore_stop_tokens: false,
             stop: Vec::new(),
+            chat_template: ChatTemplateOptions::default(),
         }
     }
 
@@ -3801,7 +3851,8 @@ mod tests {
         raw_job.request.ignore_stop_tokens = true;
 
         let (tokens, _sampler) =
-            prepare_request(&runtime, &mut raw_job).context("raw-token preflight failed")?;
+            prepare_request(&runtime, &mut raw_job, ChatTemplateOptions::default())
+                .context("raw-token preflight failed")?;
 
         assert_eq!(tokens, vec![4, 0, 2]);
         assert!(raw_job.request.ignore_stop_tokens);
@@ -3817,7 +3868,8 @@ mod tests {
         raw_job.request.ignore_stop_tokens = true;
 
         let (tokens, _sampler) =
-            prepare_request(&runtime, &mut raw_job).context("raw-prompt preflight failed")?;
+            prepare_request(&runtime, &mut raw_job, ChatTemplateOptions::default())
+                .context("raw-prompt preflight failed")?;
 
         assert_eq!(tokens, vec![1, 2]);
         assert!(raw_job.request.ignore_stop_tokens);
@@ -3830,7 +3882,7 @@ mod tests {
         let (mut raw_job, mut ticket) = job("unused", 1, 4, Duration::from_secs(1));
         raw_job.request.input = EngineInput::RawPrompt(String::new());
 
-        assert!(prepare_request(&runtime, &mut raw_job).is_none());
+        assert!(prepare_request(&runtime, &mut raw_job, ChatTemplateOptions::default()).is_none());
         let error = ticket
             .preflight
             .as_mut()
@@ -3844,6 +3896,46 @@ mod tests {
     }
 
     #[test]
+    fn chat_template_options_fail_closed_without_adapter_support() -> Result<()> {
+        let (runtime, _state) = fake_runtime()?;
+        let disabled = ChatTemplateOptions {
+            enable_thinking: Some(false),
+        };
+        let rejected = |job: &mut InferenceJob, ticket: &mut EngineTicket, defaults| {
+            assert!(prepare_request(&runtime, job, defaults).is_none());
+            ticket
+                .preflight
+                .as_mut()
+                .expect("test ticket keeps preflight")
+                .try_recv()
+                .expect("rejection is delivered")
+                .expect_err("options must fail preflight")
+        };
+
+        // The fake adapter implements no template options, whether they come
+        // from the request or from server-wide defaults.
+        let (mut chat_job, mut ticket) = job("hello", 1, 4, Duration::from_secs(1));
+        chat_job.request.chat_template = disabled;
+        let error = rejected(&mut chat_job, &mut ticket, ChatTemplateOptions::default());
+        assert!(error.message.contains("enable_thinking"));
+        let (mut chat_job, mut ticket) = job("hello", 1, 4, Duration::from_secs(1));
+        let error = rejected(&mut chat_job, &mut ticket, disabled);
+        assert!(error.message.contains("enable_thinking"));
+
+        // Raw inputs bypass templates: explicit options are an error, while
+        // server defaults do not apply to them.
+        let (mut raw_job, mut ticket) = job("unused", 1, 4, Duration::from_secs(1));
+        raw_job.request.input = EngineInput::RawPrompt("a b".to_owned());
+        raw_job.request.chat_template = disabled;
+        let error = rejected(&mut raw_job, &mut ticket, ChatTemplateOptions::default());
+        assert!(error.message.contains("templated"));
+        let (mut raw_job, _ticket) = job("unused", 1, 4, Duration::from_secs(1));
+        raw_job.request.input = EngineInput::RawPrompt("a b".to_owned());
+        assert!(prepare_request(&runtime, &mut raw_job, disabled).is_some());
+        Ok(())
+    }
+
+    #[test]
     fn raw_token_input_rejects_empty_and_out_of_vocabulary_prompts() -> Result<()> {
         let (runtime, _state) = fake_runtime()?;
 
@@ -3853,7 +3945,9 @@ mod tests {
         ] {
             let (mut raw_job, mut ticket) = job("unused", 1, 4, Duration::from_secs(1));
             raw_job.request.input = EngineInput::TokenIds(tokens);
-            assert!(prepare_request(&runtime, &mut raw_job).is_none());
+            assert!(
+                prepare_request(&runtime, &mut raw_job, ChatTemplateOptions::default()).is_none()
+            );
             let error = ticket
                 .preflight
                 .as_mut()
@@ -3989,6 +4083,7 @@ mod tests {
             max_active_sequences: 3,
             scheduler_token_budget: 3,
             prefill_token_quantum: 1,
+            chat_template_defaults: ChatTemplateOptions::default(),
         };
         let mut scheduler = scheduler(&runtime, receiver, status, config)?;
 
@@ -4072,6 +4167,7 @@ mod tests {
             max_active_sequences: 2,
             scheduler_token_budget: 2,
             prefill_token_quantum: 1,
+            chat_template_defaults: ChatTemplateOptions::default(),
         };
         let mut scheduler = scheduler(&runtime, receiver, status, config)?;
 
@@ -4305,6 +4401,7 @@ mod tests {
             max_active_sequences: 3,
             scheduler_token_budget: 3,
             prefill_token_quantum: 1,
+            chat_template_defaults: ChatTemplateOptions::default(),
         };
         let mut scheduler = scheduler(&runtime, receiver, status, config)?;
         let (first, mut first_ticket) = job("a", 1, 8, Duration::from_secs(1));
@@ -4339,6 +4436,7 @@ mod tests {
             max_active_sequences: 3,
             scheduler_token_budget: 3,
             prefill_token_quantum: 1,
+            chat_template_defaults: ChatTemplateOptions::default(),
         };
         let mut scheduler = scheduler(&runtime, receiver, status, config)?;
         let (first, mut first_ticket) = job("a", 1, 8, Duration::from_secs(1));
@@ -4391,6 +4489,7 @@ mod tests {
             max_active_sequences: 1,
             scheduler_token_budget: 1,
             prefill_token_quantum: 1,
+            chat_template_defaults: ChatTemplateOptions::default(),
         };
         let mut scheduler = scheduler(&runtime, receiver, status, config)?;
         let (request, mut ticket) = job("a", 1, 8, Duration::from_secs(1));
@@ -4459,6 +4558,7 @@ mod tests {
             max_active_sequences: 3,
             scheduler_token_budget: 2,
             prefill_token_quantum: 1,
+            chat_template_defaults: ChatTemplateOptions::default(),
         };
         let mut scheduler = scheduler(&runtime, receiver, status, config)?;
         let (first, mut first_ticket) = job("a a a a", 1, 8, Duration::from_secs(1));
@@ -4507,6 +4607,7 @@ mod tests {
             max_active_sequences: 1,
             scheduler_token_budget: 1,
             prefill_token_quantum: 1,
+            chat_template_defaults: ChatTemplateOptions::default(),
         };
         let mut scheduler = scheduler(&runtime, receiver, status, config)?;
         let (active, active_ticket) = job("a a a a", 1, 8, Duration::from_secs(1));
@@ -4728,6 +4829,7 @@ mod tests {
             max_active_sequences: 3,
             scheduler_token_budget: 3,
             prefill_token_quantum: 1,
+            chat_template_defaults: ChatTemplateOptions::default(),
         };
         let mut scheduler = scheduler(&runtime, receiver, status, config)?;
         let (first, _first_ticket) = job("a", 3, 8, Duration::from_secs(1));
@@ -4773,6 +4875,7 @@ mod tests {
             max_active_sequences: 3,
             scheduler_token_budget: 3,
             prefill_token_quantum: 1,
+            chat_template_defaults: ChatTemplateOptions::default(),
         };
         let mut scheduler = scheduler(&runtime, receiver, status, config)?;
         let (cancelled, mut cancelled_ticket) = job("a", 2, 8, Duration::from_secs(1));
@@ -4892,6 +4995,7 @@ mod tests {
             max_active_sequences: 1,
             scheduler_token_budget: 1,
             prefill_token_quantum: 1,
+            chat_template_defaults: ChatTemplateOptions::default(),
         };
         let mut scheduler = scheduler(&runtime, receiver, Arc::clone(&status), config)?;
         let (mut constrained, mut constrained_ticket) = job("a", 1, 8, Duration::from_secs(1));

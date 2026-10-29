@@ -9,7 +9,7 @@ use crate::{
     architecture::{
         DecoderLayerSpec, DecoderSpec, ProjectionBias, RopeLayout, RopeSpec, RuntimeSpec,
     },
-    chat::{ChatMessage, ChatRole, validate_chat_messages},
+    chat::{ChatMessage, ChatRole, ChatTemplateOptions, validate_chat_messages},
     decoder::DecoderModel,
     model_weights::WeightSource,
     models::{ModelAdapter, load_stop_token_ids, resolve_default_rope_theta},
@@ -251,9 +251,17 @@ impl ModelAdapter for Qwen3Adapter {
     }
 
     fn format_chat_messages(&self, messages: &[ChatMessage]) -> Result<String> {
+        self.format_chat_messages_with(messages, ChatTemplateOptions::default())
+    }
+
+    fn format_chat_messages_with(
+        &self,
+        messages: &[ChatMessage],
+        options: ChatTemplateOptions,
+    ) -> Result<String> {
         match self.chat_template {
             Some(Qwen3ChatTemplate::Current | Qwen3ChatTemplate::Gguf) => {
-                format_qwen3_chat_messages(messages)
+                format_qwen3_chat_messages(messages, options)
             }
             None => bail!(
                 "unsupported or missing Qwen3 chat template; pass --raw-prompt or use the pinned official Qwen3 template"
@@ -270,14 +278,36 @@ impl ModelAdapter for Qwen3Adapter {
     }
 
     fn format_agent_prompt(&self, prompt: &AgentPrompt) -> Result<String> {
+        self.format_agent_prompt_with(prompt, ChatTemplateOptions::default())
+    }
+
+    fn format_agent_prompt_with(
+        &self,
+        prompt: &AgentPrompt,
+        options: ChatTemplateOptions,
+    ) -> Result<String> {
         let profile = self
             .agent_template_profile()
             .context("unsupported or missing Qwen3 native agent template profile")?;
-        format_qwen3_agent_prompt(profile, prompt)
+        format_qwen3_agent_prompt(profile, prompt, options)
     }
 }
 
-pub(crate) fn format_qwen3_chat_messages(messages: &[ChatMessage]) -> Result<String> {
+/// Append the official generation prompt. Both pinned templates end with
+/// `<|im_start|>assistant\n` and, only when `enable_thinking` is false,
+/// `<think>\n\n</think>\n\n`, which closes an empty reasoning block so the
+/// model answers directly. Historical turns render identically either way.
+fn push_qwen3_generation_prompt(rendered: &mut String, options: ChatTemplateOptions) {
+    rendered.push_str("<|im_start|>assistant\n");
+    if options.enable_thinking == Some(false) {
+        rendered.push_str("<think>\n\n</think>\n\n");
+    }
+}
+
+pub(crate) fn format_qwen3_chat_messages(
+    messages: &[ChatMessage],
+    options: ChatTemplateOptions,
+) -> Result<String> {
     validate_chat_messages(messages)?;
     let mut prompt = String::new();
     for message in messages {
@@ -300,7 +330,7 @@ pub(crate) fn format_qwen3_chat_messages(messages: &[ChatMessage]) -> Result<Str
         prompt.push_str(content);
         prompt.push_str("<|im_end|>\n");
     }
-    prompt.push_str("<|im_start|>assistant\n");
+    push_qwen3_generation_prompt(&mut prompt, options);
     Ok(prompt)
 }
 
@@ -344,6 +374,7 @@ fn serialize_native_tool(tool: &ToolDefinition) -> Result<String> {
 pub(crate) fn format_qwen3_agent_prompt(
     profile: AgentTemplateProfile,
     prompt: &AgentPrompt,
+    options: ChatTemplateOptions,
 ) -> Result<String> {
     ensure!(
         matches!(
@@ -448,8 +479,9 @@ pub(crate) fn format_qwen3_agent_prompt(
     }
     // Text-only and automatic turns both end at an open assistant turn; for
     // `Auto` the serving layer constrains a call lazily once the model opens
-    // one with the envelope rendered in the system block above.
-    rendered.push_str("<|im_start|>assistant\n");
+    // one with the envelope rendered in the system block above. A forced
+    // call's envelope follows the (possibly pre-closed) reasoning block.
+    push_qwen3_generation_prompt(&mut rendered, options);
     if let AgentDirective::ForcedSingle { name } = &prompt.directive {
         rendered.push_str("<tool_call>\n{\"name\":\"");
         rendered.push_str(name);
@@ -509,18 +541,24 @@ mod tests {
 
     #[test]
     fn renders_official_text_only_default_thinking_subset() -> Result<()> {
-        let prompt = format_qwen3_chat_messages(&[
-            ChatMessage::system("Be concise."),
-            ChatMessage::user("First?"),
-            ChatMessage::assistant("<think>old</think>\n\nFirst."),
-            ChatMessage::user("Second?"),
-        ])?;
+        let prompt = format_qwen3_chat_messages(
+            &[
+                ChatMessage::system("Be concise."),
+                ChatMessage::user("First?"),
+                ChatMessage::assistant("<think>old</think>\n\nFirst."),
+                ChatMessage::user("Second?"),
+            ],
+            ChatTemplateOptions::default(),
+        )?;
         assert_eq!(
             prompt,
             "<|im_start|>system\nBe concise.<|im_end|>\n<|im_start|>user\nFirst?<|im_end|>\n<|im_start|>assistant\nFirst.<|im_end|>\n<|im_start|>user\nSecond?<|im_end|>\n<|im_start|>assistant\n"
         );
         assert_eq!(
-            format_qwen3_chat_messages(&[ChatMessage::user("Hello")])?,
+            format_qwen3_chat_messages(
+                &[ChatMessage::user("Hello")],
+                ChatTemplateOptions::default()
+            )?,
             "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
         );
         Ok(())
@@ -629,7 +667,10 @@ mod tests {
             AgentTemplateProfile::Qwen3Current,
             AgentTemplateProfile::Qwen3Gguf,
         ] {
-            assert_eq!(format_qwen3_agent_prompt(profile, &prompt)?, expected);
+            assert_eq!(
+                format_qwen3_agent_prompt(profile, &prompt, ChatTemplateOptions::default())?,
+                expected
+            );
         }
         Ok(())
     }
@@ -659,7 +700,11 @@ mod tests {
                 name: "lookup".to_owned(),
             },
         };
-        let rendered = format_qwen3_agent_prompt(AgentTemplateProfile::Qwen3Current, &prompt)?;
+        let rendered = format_qwen3_agent_prompt(
+            AgentTemplateProfile::Qwen3Current,
+            &prompt,
+            ChatTemplateOptions::default(),
+        )?;
         assert!(rendered.contains(concat!(
             "<|im_start|>assistant\n<tool_call>\n",
             "{\"name\": \"lookup\", \"arguments\": {\"symbol\":\"AAPL\"}}\n",
@@ -670,7 +715,11 @@ mod tests {
         )));
         assert_eq!(
             rendered,
-            format_qwen3_agent_prompt(AgentTemplateProfile::Qwen3Gguf, &prompt)?
+            format_qwen3_agent_prompt(
+                AgentTemplateProfile::Qwen3Gguf,
+                &prompt,
+                ChatTemplateOptions::default()
+            )?
         );
         Ok(())
     }
@@ -750,7 +799,10 @@ mod tests {
             AgentTemplateProfile::Qwen3Current,
             AgentTemplateProfile::Qwen3Gguf,
         ] {
-            assert_eq!(format_qwen3_agent_prompt(profile, &prompt)?, expected);
+            assert_eq!(
+                format_qwen3_agent_prompt(profile, &prompt, ChatTemplateOptions::default())?,
+                expected
+            );
         }
         Ok(())
     }
@@ -782,17 +834,92 @@ mod tests {
             tool_call_head(&serde_json::to_string(&call.name)?),
             call.arguments
         );
-        let rendered = format_qwen3_agent_prompt(AgentTemplateProfile::Qwen3Current, &prompt)?;
+        let rendered = format_qwen3_agent_prompt(
+            AgentTemplateProfile::Qwen3Current,
+            &prompt,
+            ChatTemplateOptions::default(),
+        )?;
         assert!(rendered.contains(&format!("<|im_start|>assistant\n{envelope}<|im_end|>\n")));
 
         let mut no_tools = prompt;
         no_tools.tools.clear();
         assert!(
-            format_qwen3_agent_prompt(AgentTemplateProfile::Qwen3Current, &no_tools)
-                .unwrap_err()
-                .to_string()
-                .contains("requires at least one declared tool")
+            format_qwen3_agent_prompt(
+                AgentTemplateProfile::Qwen3Current,
+                &no_tools,
+                ChatTemplateOptions::default()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("requires at least one declared tool")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_thinking_prefills_an_empty_reasoning_block_on_both_profiles() -> Result<()> {
+        let disabled = ChatTemplateOptions {
+            enable_thinking: Some(false),
+        };
+        let enabled = ChatTemplateOptions {
+            enable_thinking: Some(true),
+        };
+        let messages = [
+            ChatMessage::user("First?"),
+            ChatMessage::assistant("<think>old</think>\n\nFirst."),
+            ChatMessage::user("Second?"),
+        ];
+        let history = "<|im_start|>user\nFirst?<|im_end|>\n<|im_start|>assistant\nFirst.<|im_end|>\n<|im_start|>user\nSecond?<|im_end|>\n";
+        let auto = AgentPrompt {
+            messages: vec![AgentMessage::User {
+                content: "List files.".to_owned(),
+            }],
+            tools: vec![shell_tool()],
+            directive: AgentDirective::Auto,
+        };
+        let forced = AgentPrompt {
+            directive: AgentDirective::ForcedSingle {
+                name: "shell".to_owned(),
+            },
+            ..auto.clone()
+        };
+        for template in [Qwen3ChatTemplate::Current, Qwen3ChatTemplate::Gguf] {
+            let adapter = Qwen3Adapter {
+                spec: official_config().to_spec()?,
+                chat_template: Some(template),
+            };
+            // Official tail: `<|im_start|>assistant\n` plus, only for
+            // `enable_thinking=false`, `<think>\n\n</think>\n\n`.
+            assert_eq!(
+                adapter.format_chat_messages_with(&messages, disabled)?,
+                format!("{history}<|im_start|>assistant\n<think>\n\n</think>\n\n")
+            );
+            assert_eq!(
+                adapter.format_chat_messages_with(&messages, enabled)?,
+                adapter.format_chat_messages(&messages)?
+            );
+            assert_eq!(
+                adapter.format_chat_messages(&messages)?,
+                format!("{history}<|im_start|>assistant\n")
+            );
+
+            let default_auto = adapter.format_agent_prompt(&auto)?;
+            assert!(
+                default_auto
+                    .ends_with("<|im_start|>user\nList files.<|im_end|>\n<|im_start|>assistant\n")
+            );
+            assert_eq!(
+                adapter.format_agent_prompt_with(&auto, disabled)?,
+                format!("{default_auto}<think>\n\n</think>\n\n")
+            );
+            assert_eq!(
+                adapter.format_agent_prompt_with(&auto, enabled)?,
+                default_auto
+            );
+            assert!(adapter.format_agent_prompt_with(&forced, disabled)?.ends_with(
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n{\"name\":\"shell\",\"arguments\":"
+            ));
+        }
         Ok(())
     }
 
@@ -811,8 +938,12 @@ mod tests {
             prompt.messages[0] = AgentMessage::User {
                 content: injected.to_owned(),
             };
-            let error =
-                format_qwen3_agent_prompt(AgentTemplateProfile::Qwen3Current, &prompt).unwrap_err();
+            let error = format_qwen3_agent_prompt(
+                AgentTemplateProfile::Qwen3Current,
+                &prompt,
+                ChatTemplateOptions::default(),
+            )
+            .unwrap_err();
             assert!(error.to_string().contains("reserved native control string"));
         }
     }

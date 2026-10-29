@@ -61,6 +61,10 @@ cargo build --release
 默认设备是 Metal；使用 `--device cpu` 可以切换到 CPU。遇到未知 chat template 时，
 请显式传入 `--raw-prompt`。MacLLM 不执行任意 Jinja，也不会静默猜测模板。
 
+面向 agent 客户端时，`serve --default-max-completion-tokens N` 设置未指定输出长度的请求的
+默认上限（默认 128），`--disable-thinking` 以 `enable_thinking=false` 渲染 Qwen3 prompt；
+单个请求也可以发送 `chat_template_kwargs: {"enable_thinking": false}`。
+
 ## Benchmark
 
 仓库中的 manifest 会固定主机、模型 bytes/SHA-256、prompt token IDs、量化方式和

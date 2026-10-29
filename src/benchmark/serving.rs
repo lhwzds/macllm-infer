@@ -201,6 +201,7 @@ impl ServingRunSpec {
             max_new_tokens: self.completion_tokens,
             ignore_stop_tokens: self.ignore_stop_tokens,
             stop: Vec::new(),
+            chat_template: crate::chat::ChatTemplateOptions::default(),
         }
     }
 }

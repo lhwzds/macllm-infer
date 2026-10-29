@@ -79,6 +79,28 @@ pub const RAW_COMPLETION_RESPONSE_FIELDS: [&str; 22] = [
 pub struct ServerConfig {
     pub bind: SocketAddr,
     pub engine: EngineConfig,
+    pub options: ServerOptions,
+}
+
+/// Protocol defaults applied by the HTTP layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerOptions {
+    /// Completion budget for Chat Completions requests that set neither
+    /// `max_completion_tokens` nor `max_tokens`. It must be positive and fit
+    /// the model context; the server checks this at startup.
+    pub default_max_completion_tokens: usize,
+}
+
+impl ServerOptions {
+    pub const DEFAULT_MAX_COMPLETION_TOKENS: usize = 128;
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            default_max_completion_tokens: Self::DEFAULT_MAX_COMPLETION_TOKENS,
+        }
+    }
 }
 
 /// Minimal interface used by the HTTP layer. Production uses one
@@ -123,21 +145,33 @@ impl InferenceEngine for EngineHandle {
 #[derive(Clone)]
 struct AppState {
     engine: Arc<dyn InferenceEngine>,
+    options: ServerOptions,
 }
 
 /// Build the strict Chat Completions and raw benchmark router around one engine.
 pub fn router(engine: Arc<dyn InferenceEngine>) -> Router {
+    router_with_options(engine, ServerOptions::default())
+}
+
+/// Build the router with explicit protocol defaults.
+pub fn router_with_options(engine: Arc<dyn InferenceEngine>, options: ServerOptions) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/completion", post(raw_completion))
-        .with_state(AppState { engine })
+        .with_state(AppState { engine, options })
 }
 
 /// Load one model, bind the listener and serve until Ctrl-C.
 pub async fn serve(config: ServerConfig) -> Result<()> {
     let engine = EngineHandle::start(config.engine)?;
+    let max_context = engine.metadata().max_context;
+    let default_max_completion_tokens = config.options.default_max_completion_tokens;
+    anyhow::ensure!(
+        (1..=max_context).contains(&default_max_completion_tokens),
+        "default max completion tokens must be in 1..={max_context} for this model, got {default_max_completion_tokens}"
+    );
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("failed to bind inference server to {}", config.bind))?;
@@ -146,10 +180,13 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         "serving model `{}` at http://{address}",
         engine.metadata().served_model
     );
-    axum::serve(listener, router(Arc::new(engine)))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("inference HTTP server failed")
+    axum::serve(
+        listener,
+        router_with_options(Arc::new(engine), config.options),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("inference HTTP server failed")
 }
 
 async fn shutdown_signal() {
@@ -344,6 +381,7 @@ impl RawCompletionRequest {
             max_new_tokens: self.n_predict,
             ignore_stop_tokens: true,
             stop: Vec::new(),
+            chat_template: crate::chat::ChatTemplateOptions::default(),
         };
         Ok((request, settings, policy))
     }
@@ -739,7 +777,10 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
     };
     let metadata = state.engine.metadata();
-    let request = match request.validate(&metadata.served_model, 128) {
+    let request = match request.validate(
+        &metadata.served_model,
+        state.options.default_max_completion_tokens,
+    ) {
         Ok(request) => request,
         Err(error) => return api_error(status_for_api_error(&error), error),
     };
@@ -821,6 +862,7 @@ fn to_engine_request(
     };
     let max_new_tokens = request.max_completion_tokens;
     let stop = request.stop.clone();
+    let chat_template = request.chat_template;
     let response_constraint = request
         .response_format
         .as_ref()
@@ -910,6 +952,7 @@ fn to_engine_request(
             max_new_tokens,
             ignore_stop_tokens: false,
             stop,
+            chat_template,
         },
         output,
     ))
@@ -2536,6 +2579,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_defaults_and_template_kwargs_reach_the_engine_request() {
+        let engine = Arc::new(FakeEngine::healthy(vec![EngineEvent::Finished(metrics(
+            FinishReason::Stop,
+        ))]));
+        let options = ServerOptions {
+            default_max_completion_tokens: 64,
+        };
+        let response = router_with_options(engine.clone(), options)
+            .oneshot(chat_request(&json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": {"enable_thinking": false}
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = engine.last_request.lock().unwrap().take().unwrap();
+        assert_eq!(request.max_new_tokens, 64);
+        assert_eq!(request.chat_template.enable_thinking, Some(false));
+        assert!(matches!(request.input, EngineInput::Chat(_)));
+
+        // Explicit budgets still win, and the agent path carries the kwargs.
+        let engine = Arc::new(FakeEngine::healthy(vec![EngineEvent::Finished(metrics(
+            FinishReason::Stop,
+        ))]));
+        let response = router_with_options(engine.clone(), options)
+            .oneshot(chat_request(&json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "list files"}],
+                "tools": [shell_tool()],
+                "max_tokens": 7,
+                "chat_template_kwargs": {"enable_thinking": true}
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = engine.last_request.lock().unwrap().take().unwrap();
+        assert_eq!(request.max_new_tokens, 7);
+        assert_eq!(request.chat_template.enable_thinking, Some(true));
+        assert!(matches!(request.input, EngineInput::Agent { .. }));
+        assert_eq!(ServerOptions::default().default_max_completion_tokens, 128);
+    }
+
+    #[tokio::test]
     async fn auto_non_streaming_separates_content_from_one_validated_call() {
         let reasoning = "<think>\nNeed ls.\n</think>\n\nListing.\n";
         let cases = [
@@ -2747,6 +2834,7 @@ mod tests {
         let rendered = crate::models::qwen3::format_qwen3_agent_prompt(
             crate::agent::AgentTemplateProfile::Qwen3Current,
             &prompt,
+            request.chat_template,
         )
         .unwrap();
         (body_json(response).await, rendered)

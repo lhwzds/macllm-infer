@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    chat::{ChatMessage, ChatRole, validate_chat_messages},
+    chat::{ChatMessage, ChatRole, ChatTemplateOptions, validate_chat_messages},
     generation::FinishReason as GenerationFinishReason,
     grammar::CompiledJsonSchema,
     output::MAX_STOP_SEQUENCES,
@@ -71,6 +71,10 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f64>,
     #[serde(default)]
     pub presence_penalty: Option<f64>,
+    /// Template keyword options (vLLM/SGLang/llama.cpp convention). Only
+    /// `enable_thinking` is understood; any other key is rejected.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<serde_json::Map<String, Value>>,
 }
 
 impl ChatCompletionRequest {
@@ -175,6 +179,7 @@ impl ChatCompletionRequest {
             None => false,
         };
 
+        let chat_template = normalize_chat_template_kwargs(self.chat_template_kwargs)?;
         let messages = validate_messages(self.messages)?;
         let response_format = self
             .response_format
@@ -218,6 +223,7 @@ impl ChatCompletionRequest {
             tools,
             tool_choice,
             parallel_tool_calls,
+            chat_template,
         })
     }
 }
@@ -474,6 +480,9 @@ pub struct ValidatedChatCompletionRequest {
     pub tools: Vec<FunctionTool>,
     pub tool_choice: ToolChoice,
     pub parallel_tool_calls: bool,
+    /// Template options set by this request; unset options use server
+    /// defaults, and the model adapter rejects any it cannot honor.
+    pub chat_template: ChatTemplateOptions,
 }
 
 impl ValidatedChatCompletionRequest {
@@ -530,6 +539,28 @@ fn reject_unsupported_fields(request: &ChatCompletionRequest) -> Result<(), ApiE
         ));
     }
     Ok(())
+}
+
+fn normalize_chat_template_kwargs(
+    kwargs: Option<serde_json::Map<String, Value>>,
+) -> Result<ChatTemplateOptions, ApiError> {
+    let mut options = ChatTemplateOptions::default();
+    for (key, value) in kwargs.unwrap_or_default() {
+        let param = format!("chat_template_kwargs.{key}");
+        match (key.as_str(), value) {
+            ("enable_thinking", Value::Bool(enabled)) => options.enable_thinking = Some(enabled),
+            ("enable_thinking", _) => {
+                return Err(invalid_value(param, "enable_thinking must be a boolean"));
+            }
+            _ => {
+                return Err(unsupported_value(
+                    param,
+                    "only chat_template_kwargs.enable_thinking is supported",
+                ));
+            }
+        }
+    }
+    Ok(options)
 }
 
 fn validate_response_format(format: ResponseFormat) -> Result<ResponseFormat, ApiError> {
@@ -2217,6 +2248,55 @@ mod tests {
             }))
             .unwrap_err();
             assert_eq!(error.param.as_deref(), Some(param));
+        }
+    }
+
+    #[test]
+    fn accepts_only_the_enable_thinking_template_kwarg() {
+        let request = |kwargs: Value| {
+            parse_and_validate(json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": kwargs
+            }))
+        };
+        assert_eq!(
+            parse_and_validate(json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .unwrap()
+            .chat_template,
+            ChatTemplateOptions::default()
+        );
+        assert_eq!(
+            request(json!({})).unwrap().chat_template,
+            ChatTemplateOptions::default()
+        );
+        for enabled in [false, true] {
+            assert_eq!(
+                request(json!({"enable_thinking": enabled}))
+                    .unwrap()
+                    .chat_template
+                    .enable_thinking,
+                Some(enabled)
+            );
+        }
+        for (kwargs, param, code) in [
+            (
+                json!({"enable_thinking": "no"}),
+                "chat_template_kwargs.enable_thinking",
+                "invalid_value",
+            ),
+            (
+                json!({"enable_thinking": false, "add_generation_prompt": false}),
+                "chat_template_kwargs.add_generation_prompt",
+                "unsupported_value",
+            ),
+        ] {
+            let error = request(kwargs).unwrap_err();
+            assert_eq!(error.param.as_deref(), Some(param));
+            assert_eq!(error.code.as_deref(), Some(code));
         }
     }
 

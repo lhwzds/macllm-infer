@@ -22,7 +22,7 @@ use crate::model_weights::{DenseWeightSource, WeightSource};
 use crate::{
     agent::{AgentPrompt, AgentTemplateProfile},
     architecture::{CausalLm, DecoderSpec, RuntimeSpec},
-    chat::{ChatMessage, ChatRole, validate_chat_messages},
+    chat::{ChatMessage, ChatRole, ChatTemplateOptions, validate_chat_messages},
 };
 
 /// Family-specific code stops at this boundary. It translates configuration,
@@ -68,6 +68,28 @@ pub trait ModelAdapter {
     /// opt in with a pinned profile; the default fails closed.
     fn format_agent_prompt(&self, _prompt: &AgentPrompt) -> Result<String> {
         bail!("native agent prompt rendering is unavailable for this model adapter")
+    }
+
+    /// Render a chat history with explicit template options. Adapters that
+    /// implement none keep this fail-closed default.
+    fn format_chat_messages_with(
+        &self,
+        messages: &[ChatMessage],
+        options: ChatTemplateOptions,
+    ) -> Result<String> {
+        options.ensure_default(self.family())?;
+        self.format_chat_messages(messages)
+    }
+
+    /// Render an agent prompt with explicit template options. Adapters that
+    /// implement none keep this fail-closed default.
+    fn format_agent_prompt_with(
+        &self,
+        prompt: &AgentPrompt,
+        options: ChatTemplateOptions,
+    ) -> Result<String> {
+        options.ensure_default(self.family())?;
+        self.format_agent_prompt(prompt)
     }
 
     /// Render and validate the adapter-specific serving startup probe through

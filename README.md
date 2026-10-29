@@ -65,6 +65,11 @@ Metal is the default device; pass `--device cpu` to use the CPU. For an unknown
 chat template, pass `--raw-prompt` explicitly. MacLLM does not execute arbitrary
 Jinja templates or silently guess a template.
 
+For agent clients, `serve --default-max-completion-tokens N` sets the budget of
+requests that omit one (default 128), and `--disable-thinking` renders Qwen3
+prompts with `enable_thinking=false`; a request may instead send
+`chat_template_kwargs: {"enable_thinking": false}`.
+
 ## Benchmarking
 
 The checked-in manifests pin the host, model bytes and SHA-256, prompt token IDs,
