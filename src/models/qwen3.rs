@@ -354,7 +354,11 @@ struct NativeFunction<'a> {
 }
 
 fn serialize_native_tool(tool: &ToolDefinition) -> Result<String> {
-    serde_json::to_string(&NativeTool {
+    // `preserve_order` retains client order throughout nested schemas. The
+    // grammar explicitly sorts exact literals for its old duplicate and
+    // matching behavior; property traversal may use declared order. Other
+    // consumers access maps by key or treat their order as presentation only.
+    let fallback = serde_json::to_value(NativeTool {
         kind: "function",
         function: NativeFunction {
             name: &tool.name,
@@ -362,8 +366,64 @@ fn serialize_native_tool(tool: &ToolDefinition) -> Result<String> {
             parameters: &tool.parameters,
             strict: tool.strict,
         },
-    })
-    .context("failed to serialize Qwen3 tool definition")
+    })?;
+    python_json(tool.declaration.as_ref().unwrap_or(&fallback))
+}
+
+pub(crate) fn python_json(value: &serde_json::Value) -> Result<String> {
+    let mut bytes = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut bytes, PythonJsonFormatter);
+    value
+        .serialize(&mut serializer)
+        .context("failed to serialize Python-style JSON")?;
+    Ok(String::from_utf8(bytes)?)
+}
+
+// Python json.dumps defaults use a space after both separators.
+struct PythonJsonFormatter;
+impl serde_json::ser::Formatter for PythonJsonFormatter {
+    fn write_f64<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        value: f64,
+    ) -> std::io::Result<()> {
+        // Rust and Python use shortest-roundtrip float representations with
+        // the same fixed/scientific thresholds. Python pads the exponent to
+        // two digits and always includes its sign.
+        let number = format!("{value:?}");
+        if let Some((mantissa, exponent)) = number.split_once('e') {
+            let exponent: i32 = exponent.parse().expect("formatted exponent");
+            write!(writer, "{mantissa}e{exponent:+03}")
+        } else {
+            writer.write_all(number.as_bytes())
+        }
+    }
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if !first {
+            writer.write_all(b", ")?;
+        }
+        Ok(())
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if !first {
+            writer.write_all(b", ")?;
+        }
+        Ok(())
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(b": ")
+    }
 }
 
 /// Render the audited Qwen3 native-tool subset without executing Jinja from a
@@ -634,6 +694,7 @@ mod tests {
                 "additionalProperties": false
             }),
             strict: true,
+            declaration: None,
         }
     }
 
@@ -657,7 +718,7 @@ mod tests {
             "<|im_start|>system\nUse tools.\n\n",
             "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n",
             "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
-            "{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"description\":\"Look up a symbol\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"symbol\":{\"type\":\"string\"}},\"required\":[\"symbol\"],\"type\":\"object\"},\"strict\":true}}",
+            "{\"type\": \"function\", \"function\": {\"name\": \"lookup\", \"description\": \"Look up a symbol\", \"parameters\": {\"type\": \"object\", \"properties\": {\"symbol\": {\"type\": \"string\"}}, \"required\": [\"symbol\"], \"additionalProperties\": false}, \"strict\": true}}",
             "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n",
             "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n",
             "<|im_start|>user\nFind AAPL.<|im_end|>\n",
@@ -734,6 +795,7 @@ mod tests {
                 "required": ["command"]
             }),
             strict: false,
+            declaration: None,
         }
     }
 
@@ -783,7 +845,7 @@ mod tests {
             "<|im_start|>system\nYou are a coding agent.\n\n",
             "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n",
             "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
-            "{\"type\":\"function\",\"function\":{\"name\":\"shell\",\"description\":\"Run a shell command.\",\"parameters\":{\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"],\"type\":\"object\"}}}",
+            "{\"type\": \"function\", \"function\": {\"name\": \"shell\", \"description\": \"Run a shell command.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}}, \"required\": [\"command\"]}}}",
             "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n",
             "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n",
             "<|im_start|>user\nList files.<|im_end|>\n",

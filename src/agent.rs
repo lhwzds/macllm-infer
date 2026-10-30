@@ -65,6 +65,9 @@ impl AgentPrompt {
                 reject_native_control("tool description", description)?;
             }
             reject_native_control("tool parameters", &tool.parameters.to_string())?;
+            if let Some(declaration) = &tool.declaration {
+                reject_native_control("tool declaration", &declaration.to_string())?;
+            }
             ensure!(
                 tool_names.insert(tool.name.as_str()),
                 "duplicate tool name `{}`",
@@ -195,6 +198,8 @@ pub struct ToolDefinition {
     pub description: Option<String>,
     pub parameters: Value,
     pub strict: bool,
+    /// Original ordered wire declaration, when supplied by a client.
+    pub declaration: Option<Value>,
 }
 
 /// One function call retained in conversation history.
@@ -202,7 +207,7 @@ pub struct ToolDefinition {
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    /// Canonical JSON text for one arguments object.
+    /// Validated JSON text for one arguments object.
     pub arguments: String,
 }
 

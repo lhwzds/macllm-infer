@@ -89,6 +89,7 @@ pub fn scan_tool_call(text: &str) -> ToolCallScan {
 pub struct NativeToolCall {
     pub name: String,
     pub arguments: Value,
+    pub arguments_text: String,
 }
 
 /// Parse the text that followed [`TOOL_CALL_OPEN`]: exactly one
@@ -116,9 +117,12 @@ pub fn parse_tool_call(after_open: &str) -> Result<NativeToolCall> {
         .get("arguments")
         .filter(|arguments| arguments.is_object())
         .context("tool call arguments must be a JSON object")?;
+    let raw: std::collections::HashMap<String, Box<serde_json::value::RawValue>> =
+        serde_json::from_str(body.trim())?;
     Ok(NativeToolCall {
         name: name.to_owned(),
         arguments: arguments.clone(),
+        arguments_text: raw["arguments"].get().to_owned(),
     })
 }
 
@@ -261,6 +265,7 @@ mod tests {
         assert_eq!(
             parse_tool_call(after_open).unwrap(),
             NativeToolCall {
+                arguments_text: r#"{"command": "ls"}"#.to_owned(),
                 name: "shell".to_owned(),
                 arguments: json!({"command": "ls"})
             }

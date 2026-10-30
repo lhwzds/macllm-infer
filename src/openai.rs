@@ -272,12 +272,35 @@ const MAX_FUNCTION_TOOLS: usize = 128;
 const MAX_SCHEMA_NAME_CHARS: usize = 64;
 
 /// One supported function tool declaration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FunctionTool {
     #[serde(rename = "type")]
     pub kind: FunctionToolKind,
     pub function: FunctionDefinition,
+    #[serde(skip)]
+    pub declaration: Value,
+}
+
+// Preserve the complete ordered wire declaration for native templates, while
+// retaining typed validation of the fields used by the runtime.
+impl<'de> Deserialize<'de> for FunctionTool {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            #[serde(rename = "type")]
+            kind: FunctionToolKind,
+            function: FunctionDefinition,
+        }
+        let declaration = Value::deserialize(deserializer)?;
+        let fields: Fields =
+            serde_json::from_value(declaration.clone()).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            kind: fields.kind,
+            function: fields.function,
+            declaration,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1024,7 +1047,7 @@ fn validate_tool_aware_messages(
                 }
                 let tool_calls_were_present = message.tool_calls.is_some();
                 let content = optional_assistant_content(message.content, index)?;
-                let mut tool_calls = message.tool_calls.unwrap_or_default();
+                let tool_calls = message.tool_calls.unwrap_or_default();
                 if tool_calls_were_present && tool_calls.is_empty() {
                     return Err(invalid_value(
                         format!("messages.{index}.tool_calls"),
@@ -1055,9 +1078,8 @@ fn validate_tool_aware_messages(
                 // clients that echo an empty string mean no content.
                 let content = content.filter(|content| !content.is_empty());
                 pending_tool_calls.clear();
-                for (call_index, call) in tool_calls.iter_mut().enumerate() {
-                    call.function.arguments =
-                        validate_assistant_tool_call(call, index, call_index)?;
+                for (call_index, call) in tool_calls.iter().enumerate() {
+                    validate_assistant_tool_call(call, index, call_index)?;
                     if !all_tool_call_ids.insert(call.id.clone()) {
                         return Err(invalid_value(
                             format!("messages.{index}.tool_calls.{call_index}.id"),
@@ -1203,7 +1225,7 @@ fn validate_assistant_tool_call(
     call: &AssistantToolCall,
     message_index: usize,
     call_index: usize,
-) -> Result<String, ApiError> {
+) -> Result<(), ApiError> {
     let base = format!("messages.{message_index}.tool_calls.{call_index}");
     if call.id.is_empty() {
         return Err(invalid_value(
@@ -1224,12 +1246,7 @@ fn validate_assistant_tool_call(
             "tool arguments must encode a JSON object",
         ));
     }
-    serde_json::to_string(&arguments).map_err(|error| {
-        invalid_value(
-            format!("{base}.function.arguments"),
-            format!("failed to canonicalize tool arguments JSON: {error}"),
-        )
-    })
+    Ok(())
 }
 
 fn invalid_value(param: impl Into<String>, message: impl Into<String>) -> ApiError {
@@ -2482,7 +2499,7 @@ mod tests {
         let AgentMessage::Assistant { tool_calls, .. } = &messages[1] else {
             panic!("expected assistant tool call");
         };
-        assert_eq!(tool_calls[0].function.arguments, r#"{"city":"LA"}"#);
+        assert_eq!(tool_calls[0].function.arguments, r#"{ "city" : "LA" }"#);
         assert_eq!(
             request
                 .into_text_runtime_messages()

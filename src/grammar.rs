@@ -1142,7 +1142,11 @@ fn compile_exact_values(
 
     let mut seen = BTreeSet::new();
     let mut exact = Vec::with_capacity(values.len());
-    for value in values {
+    for mut value in values {
+        // `preserve_order` is needed by Qwen3 tool rendering, but exact
+        // grammar literals and duplicate detection previously used sorted
+        // object keys recursively. Keep those grammar semantics unchanged.
+        value.sort_all_objects();
         let bytes = serde_json::to_vec(&value).context("serializing enum/const value")?;
         ensure!(
             seen.insert(bytes.clone()),
@@ -1634,6 +1638,17 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn exact_object_literals_keep_sorted_grammar_and_detect_reordered_duplicates() {
+        let schema = json!({"const": {"z": {"b": 1, "a": 2}, "a": 0}});
+        let exact = compile_exact_values(schema.as_object().unwrap(), "root")
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact[0].bytes, br#"{"a":0,"z":{"a":2,"b":1}}"#);
+        let schema = json!({"enum": [{"b": 1, "a": 2}, {"a": 2, "b": 1}]});
+        assert!(compile_exact_values(schema.as_object().unwrap(), "root").is_err());
+    }
 
     fn agent_schema() -> Value {
         json!({

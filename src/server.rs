@@ -1037,6 +1037,7 @@ fn runtime_tool_definition(tool: FunctionTool) -> RuntimeToolDefinition {
         description: tool.function.description,
         parameters: tool.function.parameters,
         strict: tool.function.strict,
+        declaration: Some(tool.declaration),
     }
 }
 
@@ -1160,7 +1161,7 @@ async fn non_streaming_response(
                 let call = match &output {
                     AssistantOutput::Text => Ok(None),
                     AssistantOutput::ForcedCall { name } => {
-                        canonical_arguments(&content).map(|arguments| {
+                        validated_arguments(&content).map(|arguments| {
                             Some((
                                 None,
                                 AssistantFunctionCall {
@@ -1266,16 +1267,13 @@ fn auto_call_function(
                 "model produced an invalid native tool call: {error:#}"
             ))
         })?;
-    let arguments = serde_json::to_string(&call.arguments).map_err(|error| {
-        ApiError::server_error(format!("failed to serialize tool arguments: {error}"))
-    })?;
     Ok(AssistantFunctionCall {
         name: call.name,
-        arguments,
+        arguments: call.arguments_text,
     })
 }
 
-fn canonical_arguments(arguments: &str) -> std::result::Result<String, ApiError> {
+fn validated_arguments(arguments: &str) -> std::result::Result<String, ApiError> {
     let value: serde_json::Value = serde_json::from_str(arguments).map_err(|error| {
         ApiError::server_error(format!(
             "constrained tool arguments were not valid JSON: {error}"
@@ -1286,11 +1284,7 @@ fn canonical_arguments(arguments: &str) -> std::result::Result<String, ApiError>
             "constrained tool arguments were not a JSON object",
         ));
     }
-    serde_json::to_string(&value).map_err(|error| {
-        ApiError::server_error(format!(
-            "failed to serialize constrained tool arguments: {error}"
-        ))
-    })
+    Ok(arguments.to_owned())
 }
 
 fn streaming_response(
@@ -1413,7 +1407,7 @@ async fn next_stream_event(
                 match std::mem::replace(&mut state.output, AssistantOutput::Text) {
                     AssistantOutput::ForcedCall { name } => {
                         if metrics.finish_reason == crate::generation::FinishReason::Stop {
-                            match canonical_arguments(&state.buffered_tool_arguments) {
+                            match validated_arguments(&state.buffered_tool_arguments) {
                                 Ok(arguments) => {
                                     let role = state.chunk_event(ChatCompletionChunk::role);
                                     state.pending.push_back(role);
@@ -1565,6 +1559,133 @@ mod tests {
     use crate::generation::{FinishReason, GenerationMetrics};
 
     use super::*;
+
+    #[test]
+    fn qwen3_official_template_fixtures_through_server_lowering() {
+        use crate::agent::AgentTemplateProfile;
+        use crate::models::qwen3::{
+            format_qwen3_agent_prompt, format_qwen3_chat_messages, python_json,
+        };
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/chat_templates/rendered/qwen3");
+        let cases: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("cases.json")).unwrap()).unwrap();
+        let mut count = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|x| x.to_str()) != Some("txt") {
+                continue;
+            }
+            count += 1;
+            let name = path.file_stem().unwrap().to_str().unwrap();
+            let mut parts = name.split("__");
+            let profile = match parts.next().unwrap() {
+                "qwen3-current" => AgentTemplateProfile::Qwen3Current,
+                "qwen3-gguf" => AgentTemplateProfile::Qwen3Gguf,
+                other => panic!("unknown template {other}"),
+            };
+            let case = parts.next().unwrap();
+            let next = parts.next().unwrap();
+            let (string_variant, thinking) = if next == "string_args" {
+                (true, parts.next().unwrap())
+            } else {
+                (false, next)
+            };
+            assert!(parts.next().is_none());
+            let thinking = thinking.strip_prefix("thinking-").unwrap();
+            let case_name = if string_variant {
+                format!("{case}__string_args")
+            } else {
+                case.to_owned()
+            };
+            let mut request = cases["cases"][&case_name].clone();
+            // The object variant is not OpenAI wire syntax. Convert it using
+            // the template's tojson operation before entering the same path.
+            for message in request["messages"].as_array_mut().unwrap() {
+                if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                    for call in calls {
+                        let args = &mut call["function"]["arguments"];
+                        if args.is_object() {
+                            *args = Value::String(python_json(args).unwrap());
+                        }
+                    }
+                }
+            }
+            request["model"] = json!("test-model");
+            request["chat_template_kwargs"] = cases["thinking"][thinking].clone();
+            let validated =
+                ChatCompletionRequest::from_json(&serde_json::to_vec(&request).unwrap())
+                    .unwrap()
+                    .validate("test-model", 128)
+                    .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let (engine, _) =
+                to_engine_request(validated, 0, SamplingProfile::OpenAi.defaults(true))
+                    .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let actual = match engine.input {
+                EngineInput::Chat(messages) => {
+                    format_qwen3_chat_messages(&messages, engine.chat_template).unwrap()
+                }
+                EngineInput::Agent { prompt, .. } => {
+                    format_qwen3_agent_prompt(profile, &prompt, engine.chat_template).unwrap()
+                }
+                _ => panic!("unexpected engine input: {name}"),
+            };
+            assert_eq!(
+                actual.as_bytes(),
+                std::fs::read(&path).unwrap(),
+                "fixture {name}"
+            );
+        }
+        assert_eq!(count, 72);
+    }
+
+    #[test]
+    fn tool_declarations_reject_unknown_fields_with_bad_request() {
+        for tools in [
+            json!([{"type":"function","function":{"name":"go","parameters":{},"extra":true}}]),
+            json!([{"type":"function","function":{"name":"go","parameters":{}},"extra":true}]),
+        ] {
+            let body = json!({
+                "model":"test-model",
+                "messages":[{"role":"user","content":"go"}],
+                "tools":tools
+            });
+            let error =
+                ChatCompletionRequest::from_json(&serde_json::to_vec(&body).unwrap()).unwrap_err();
+            let response = api_error(StatusCode::BAD_REQUEST, error);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn qwen3_tool_declaration_preserves_wire_order_fields_and_python_escaping() {
+        use crate::agent::AgentTemplateProfile;
+        use crate::models::qwen3::format_qwen3_agent_prompt;
+        let body = r#"{
+          "model":"test-model", "messages":[{"role":"user","content":"go"}],
+          "tools":[{"function":{
+             "strict":false,
+             "parameters":{"type":"object","properties":{"x":{"type":"string","enum":["雪\"\\\n\r\t\b\f\u0001\u001f"]},"y":{"type":"number","enum":[1e-7]}}},
+             "description":"雪\"\\\n\r\t\b\f\u0001\u001f",
+             "name":"go"}, "type":"function"}]
+        }"#;
+        let request = ChatCompletionRequest::from_json(body.as_bytes())
+            .unwrap()
+            .validate("test-model", 128)
+            .unwrap();
+        let (engine, _) =
+            to_engine_request(request, 0, SamplingProfile::OpenAi.defaults(true)).unwrap();
+        let EngineInput::Agent { prompt, .. } = engine.input else {
+            panic!("expected agent")
+        };
+        let rendered = format_qwen3_agent_prompt(
+            AgentTemplateProfile::Qwen3Current,
+            &prompt,
+            engine.chat_template,
+        )
+        .unwrap();
+        assert!(rendered.contains(r#"{"function": {"strict": false, "parameters": {"type": "object", "properties": {"x": {"type": "string", "enum": ["雪\"\\\n\r\t\b\f\u0001\u001f"]}, "y": {"type": "number", "enum": [1e-07]}}}, "description": "雪\"\\\n\r\t\b\f\u0001\u001f", "name": "go"}, "type": "function"}"#));
+    }
 
     struct FakeEngine {
         metadata: EngineMetadata,
@@ -2402,7 +2523,7 @@ mod tests {
         };
         assert_eq!(call.id, "call_1");
         assert_eq!(call.name, "lookup");
-        assert_eq!(call.arguments, r#"{"symbol":"AAPL"}"#);
+        assert_eq!(call.arguments, r#"{ "symbol" : "AAPL" }"#);
         assert_eq!(
             prompt.messages[2],
             RuntimeAgentMessage::Tool {
@@ -2413,7 +2534,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forced_tool_non_streaming_returns_only_a_canonical_tool_call() {
+    async fn forced_tool_non_streaming_returns_exact_arguments() {
         let response = router(Arc::new(FakeEngine::healthy(vec![
             text_event("{ \"symbol\" :", 11, 1, 3),
             text_event(" \"AAPL\" }", 12, 2, 3),
@@ -2427,7 +2548,7 @@ mod tests {
         assert_eq!(body["choices"][0]["message"]["content"], Value::Null);
         assert_eq!(
             body["choices"][0]["message"]["tool_calls"][0]["function"],
-            json!({"name": "lookup", "arguments": "{\"symbol\":\"AAPL\"}"})
+            json!({"name": "lookup", "arguments": "{ \"symbol\" : \"AAPL\" }"})
         );
         assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
     }
@@ -2435,8 +2556,8 @@ mod tests {
     #[tokio::test]
     async fn forced_tool_sse_buffers_until_success_and_never_leaks_failed_arguments() {
         let success = router(Arc::new(FakeEngine::healthy(vec![
-            text_event("{\"symbol\":", 11, 1, 3),
-            text_event("\"AAPL\"}", 12, 2, 3),
+            text_event("{ \"symbol\" :", 11, 1, 3),
+            text_event(" \"AAPL\" }", 12, 2, 3),
             EngineEvent::Finished(metrics(FinishReason::Stop)),
         ])))
         .oneshot(forced_tool_request(true, true))
@@ -2454,7 +2575,7 @@ mod tests {
         .unwrap();
         let role = success.find("\"role\":\"assistant\"").unwrap();
         let header = success.find("\"name\":\"lookup\"").unwrap();
-        let arguments = success.find("{\\\"symbol\\\":\\\"AAPL\\\"}").unwrap();
+        let arguments = success.find("{ \\\"symbol\\\" : \\\"AAPL\\\" }").unwrap();
         let finish = success.find("\"finish_reason\":\"tool_calls\"").unwrap();
         let usage = success.find("\"total_tokens\":5").unwrap();
         let done = success.find("data: [DONE]").unwrap();
@@ -2781,7 +2902,7 @@ mod tests {
             assert_eq!(call["type"], "function");
             assert_eq!(
                 call["function"],
-                json!({"name": "shell", "arguments": "{\"command\":\"ls\"}"})
+                json!({"name": "shell", "arguments": "{\"command\": \"ls\"}"})
             );
             assert_eq!(message["tool_calls"].as_array().unwrap().len(), 1);
             assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
@@ -2886,7 +3007,7 @@ mod tests {
         assert_eq!(header_call["function"]["name"], "shell");
         assert_eq!(
             events[header + 1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
-            "{\"command\":\"ls\"}"
+            "{\"command\": \"ls\"}"
         );
         assert_eq!(
             events[header + 2]["choices"][0]["finish_reason"],
@@ -2999,7 +3120,7 @@ mod tests {
         .await;
         assert!(rendered.ends_with(concat!(
             "<|im_start|>assistant\n<think>\nList first.\n</think>\n\n",
-            "<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\":\"ls\"}}\n</tool_call><|im_end|>\n",
+            "<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call><|im_end|>\n",
             "<|im_start|>user\n<tool_response>\nexit: 0\na.txt\n\n</tool_response><|im_end|>\n",
             "<|im_start|>assistant\n"
         )));
@@ -3011,7 +3132,7 @@ mod tests {
             restloop_step(&messages, "<think>\nDone.\n</think>\n\na.txt says hi.").await;
         assert!(rendered.contains(concat!(
             "<|im_start|>assistant\nReading it.\n<tool_call>\n",
-            "{\"name\": \"shell\", \"arguments\": {\"command\":\"cat a.txt\"}}\n</tool_call><|im_end|>\n"
+            "{\"name\": \"shell\", \"arguments\": {\"command\": \"cat a.txt\"}}\n</tool_call><|im_end|>\n"
         )));
         assert_eq!(reply["choices"][0]["finish_reason"], "stop");
         assert!(!restloop_record(&mut messages, &reply, ""));
