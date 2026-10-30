@@ -319,9 +319,9 @@ Scoreboard manifest（`schema_version` 1，见 `benchmarks/manifests/`）固定�
 
 ## 代码结构
 
-本页由 Codocia 根据代码自动生成，每次 build 重新计算：功能区划分、各区自带的说明、区之间的 import 依赖，以及哪一页讲了它。
+本页由 Codocia 根据代码自动生成，每次 build 重新计算：功能区划分、各区自带的说明、区之间的 import 依赖，以及讲解各区的页面。
 
-范围内共 96 个文件, 92,879 行；已排除 `tests/fixtures/**`, `Cargo.lock`, `LICENSE-MIT`, `README_CN.md`, `.gitignore`
+范围内共 96 个文件，92,879 行；已排除 `tests/fixtures/**`、`Cargo.lock`、`LICENSE-MIT`、`README_CN.md`、`.gitignore`
 
 ### 文件结构
 

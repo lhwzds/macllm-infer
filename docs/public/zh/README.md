@@ -22,6 +22,6 @@ manifest 如何为正确性和性能结论把关。文档只描述当前能力�
 
 ## 附录
 
-- [代码结构](structure.md) — 由 Codocia 从代码生成：功能区、依赖、讲解页
+- [代码结构](structure.md) — 从代码生成：功能区、依赖、讲解页
 
 <sub>生成自 https://github.com/lhwzds/macllm-infer @ `15bfbd64e8`</sub>

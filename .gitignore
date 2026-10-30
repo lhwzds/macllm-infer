@@ -1,7 +1,8 @@
 /target/
 /models/
 /.codex/
-/.codocia/
+/.codocia/runs/
+/.codocia/starlight/
 /docs/*
 !/docs/public/
 /codocia.md
