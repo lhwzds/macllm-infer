@@ -1227,7 +1227,9 @@ fn worker_main(
         }
         .to_owned(),
         dtype: format!("{:?}", runtime.dtype).to_ascii_lowercase(),
-        chat_template_defaults: scheduler_config.chat_template_defaults,
+        chat_template_defaults: scheduler_config
+            .chat_template_defaults
+            .or(runtime.adapter.chat_template_defaults()),
     };
     let rendered = match runtime.adapter.format_serving_chat_probe() {
         Ok(rendered) => rendered,

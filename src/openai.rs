@@ -225,7 +225,7 @@ impl ChatCompletionRequest {
             max_completion_tokens,
             temperature,
             top_p,
-            presence_penalty: self.presence_penalty.unwrap_or(0.0) as f32,
+            presence_penalty: self.presence_penalty.map(|value| value as f32),
             frequency_penalty: self.frequency_penalty.unwrap_or(0.0) as f32,
             seed,
             stop,
@@ -512,7 +512,7 @@ pub struct ValidatedChatCompletionRequest {
     pub temperature: Option<f64>,
     /// `None` when the request omitted it; see `temperature`.
     pub top_p: Option<f64>,
-    pub presence_penalty: f32,
+    pub presence_penalty: Option<f32>,
     pub frequency_penalty: f32,
     pub seed: Option<u64>,
     pub stop: Vec<String>,

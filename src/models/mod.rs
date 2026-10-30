@@ -58,6 +58,11 @@ pub trait ModelAdapter {
     /// template. Callers can bypass this with their raw-prompt path.
     fn format_chat_messages(&self, messages: &[ChatMessage]) -> Result<String>;
 
+    /// Template defaults relevant to serving and sampling.
+    fn chat_template_defaults(&self) -> ChatTemplateOptions {
+        ChatTemplateOptions::default()
+    }
+
     /// Return the exact native agent-template profile verified for this
     /// checkpoint, or `None` when tool-aware prompt rendering is unavailable.
     fn agent_template_profile(&self) -> Option<AgentTemplateProfile> {

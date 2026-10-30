@@ -353,7 +353,7 @@ struct NativeFunction<'a> {
     strict: bool,
 }
 
-fn serialize_native_tool(tool: &ToolDefinition) -> Result<String> {
+pub(crate) fn serialize_native_tool(tool: &ToolDefinition) -> Result<String> {
     // `preserve_order` retains client order throughout nested schemas. The
     // grammar explicitly sorts exact literals for its old duplicate and
     // matching behavior; property traversal may use declared order. Other

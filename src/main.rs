@@ -431,13 +431,13 @@ struct ServeArgs {
     #[arg(long, default_value_t = NonZeroUsize::new(ServerOptions::DEFAULT_MAX_COMPLETION_TOKENS).unwrap())]
     default_max_completion_tokens: NonZeroUsize,
     /// Render chat and tool prompts with `enable_thinking=false` unless a
-    /// request sets `chat_template_kwargs.enable_thinking`. Only Qwen3 and
+    /// request sets `chat_template_kwargs.enable_thinking`. Only Qwen3, Qwen3.5 and
     /// Qwen3MoE templates support it; other models fail to start.
     #[arg(long)]
     disable_thinking: bool,
-    /// Sampling defaults for requests that omit temperature or top_p (top_k
-    /// always comes from the profile). `qwen3` applies the Qwen3 model card's
-    /// settings for each request's effective thinking mode.
+    /// Sampling defaults for omitted temperature, top_p and presence_penalty
+    /// (top_k always comes from the profile). `qwen3` and `qwen35` apply their
+    /// model card settings for each request's effective thinking mode.
     #[arg(long, value_enum, default_value_t = SamplingProfileArg::Openai)]
     sampling_profile: SamplingProfileArg,
 }
@@ -448,6 +448,8 @@ enum SamplingProfileArg {
     Openai,
     /// Thinking 0.6 / top_p 0.95 / top_k 20; non-thinking 0.7 / 0.8 / 20.
     Qwen3,
+    /// Qwen3.5 defaults, including non-thinking presence penalty 1.5.
+    Qwen35,
 }
 
 impl From<SamplingProfileArg> for SamplingProfile {
@@ -455,6 +457,7 @@ impl From<SamplingProfileArg> for SamplingProfile {
         match profile {
             SamplingProfileArg::Openai => Self::OpenAi,
             SamplingProfileArg::Qwen3 => Self::Qwen3,
+            SamplingProfileArg::Qwen35 => Self::Qwen35,
         }
     }
 }
@@ -1483,6 +1486,18 @@ mod tests {
         assert_eq!(agent.default_max_completion_tokens.get(), 4_096);
         assert!(agent.disable_thinking);
         assert_eq!(agent.sampling_profile, SamplingProfileArg::Qwen3);
+        let qwen35 = serve_args(
+            Cli::try_parse_from([
+                "macllm",
+                "serve",
+                "--model",
+                "model-dir",
+                "--sampling-profile",
+                "qwen35",
+            ])
+            .unwrap(),
+        );
+        assert_eq!(qwen35.sampling_profile, SamplingProfileArg::Qwen35);
         assert!(
             Cli::try_parse_from([
                 "macllm",

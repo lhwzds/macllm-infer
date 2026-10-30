@@ -173,6 +173,8 @@ impl AgentPrompt {
 pub enum AgentTemplateProfile {
     Qwen3Current,
     Qwen3Gguf,
+    Qwen35Official,
+    Qwen35Unsloth,
 }
 
 /// Whether the next assistant turn is ordinary text, exactly one named
@@ -211,10 +213,9 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-/// The deliberately small history subset supported by the first native tool
-/// runtime.  Validation permits at most one call and exactly one matching
-/// response per assistant tool turn.  A tool-call turn may also carry the
-/// visible text (including reasoning) the model produced before its call.
+/// A native tool history turn. Common validation permits one call per turn;
+/// Qwen3.5 additionally accepts complete batches of historical calls. A call
+/// turn may carry visible text and reasoning before the calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentMessage {
     System {

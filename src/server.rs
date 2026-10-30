@@ -114,6 +114,7 @@ pub struct SamplingDefaults {
     pub temperature: f64,
     pub top_p: f64,
     pub top_k: usize,
+    pub presence_penalty: f32,
 }
 
 /// Named server sampling defaults.
@@ -130,6 +131,8 @@ pub enum SamplingProfile {
     /// The Qwen3 model card's recommendation: temperature 0.6, top_p 0.95,
     /// top_k 20 when thinking; 0.7, 0.8, 20 when not.
     Qwen3,
+    /// Qwen3.5 model card defaults, including presence penalty.
+    Qwen35,
 }
 
 impl SamplingProfile {
@@ -140,16 +143,23 @@ impl SamplingProfile {
                 temperature: crate::openai::DEFAULT_TEMPERATURE,
                 top_p: crate::openai::DEFAULT_TOP_P,
                 top_k: 0,
+                presence_penalty: 0.0,
             },
-            (Self::Qwen3, true) => SamplingDefaults {
+            (Self::Qwen3 | Self::Qwen35, true) => SamplingDefaults {
                 temperature: 0.6,
                 top_p: 0.95,
                 top_k: 20,
+                presence_penalty: 0.0,
             },
-            (Self::Qwen3, false) => SamplingDefaults {
+            (Self::Qwen3 | Self::Qwen35, false) => SamplingDefaults {
                 temperature: 0.7,
                 top_p: 0.8,
                 top_k: 20,
+                presence_penalty: if matches!(self, Self::Qwen35) {
+                    1.5
+                } else {
+                    0.0
+                },
             },
         }
     }
@@ -831,6 +841,25 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
     };
     let metadata = state.engine.metadata();
+    let tools_enabled = match &request.tool_choice {
+        Some(ToolChoice::Mode(ToolChoiceMode::None)) => false,
+        Some(_) => true,
+        None => request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty()),
+    };
+    if metadata.family == "qwen35" && tools_enabled {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            ApiError::invalid_request(
+                "Qwen3.5 native tool output parsing is not supported; use tool_choice none"
+                    .to_owned(),
+                Some("tool_choice".to_owned()),
+                Some("invalid_value".to_owned()),
+            ),
+        );
+    }
     let request = match request.validate(
         &metadata.served_model,
         state.options.default_max_completion_tokens,
@@ -855,7 +884,7 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
     let stream_response = request.stream;
     let include_usage = request.include_usage;
     let identity = RequestIdentity::new(request.model.clone());
-    // Templates think unless a request or the server disables it.
+    // Metadata merges the server override with the recognized template default.
     let thinking = request
         .chat_template
         .or(metadata.chat_template_defaults)
@@ -1012,7 +1041,9 @@ fn to_engine_request(
         EngineRequest {
             input,
             sampling,
-            presence_penalty: request.presence_penalty,
+            presence_penalty: request
+                .presence_penalty
+                .unwrap_or(defaults.presence_penalty),
             frequency_penalty: request.frequency_penalty,
             max_new_tokens,
             ignore_stop_tokens: false,
@@ -1641,6 +1672,89 @@ mod tests {
             );
         }
         assert_eq!(count, 72);
+    }
+
+    fn qwen35_test_adapter(name: &str) -> crate::models::qwen35::Qwen35Adapter {
+        use crate::models::qwen3::Qwen3Config;
+        let config: Qwen3Config = serde_json::from_value(json!({
+            "model_type":"qwen3", "vocab_size":128, "hidden_size":64,
+            "intermediate_size":128, "num_hidden_layers":1, "num_attention_heads":4,
+            "num_key_value_heads":2, "head_dim":16, "max_position_embeddings":128,
+            "tie_word_embeddings":true, "rms_norm_eps":0.000_001, "hidden_act":"silu"
+        }))
+        .unwrap();
+        let mut spec = config.to_spec().unwrap();
+        spec.architecture = "qwen35".into();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "tests/fixtures/chat_templates/templates/qwen35-{name}.jinja"
+        ));
+        let template = std::fs::read_to_string(path).unwrap();
+        crate::models::qwen35::Qwen35Adapter::from_decoder_spec(spec, Some(&template)).unwrap()
+    }
+
+    #[test]
+    fn qwen35_template_fixtures_through_server_lowering() {
+        use crate::agent::AgentTemplateProfile;
+        use crate::models::ModelAdapter;
+        use crate::models::qwen3::python_json;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/chat_templates/rendered/qwen35");
+        let cases: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("cases.json")).unwrap()).unwrap();
+        let mut count = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|x| x.to_str()) != Some("txt") {
+                continue;
+            }
+            count += 1;
+            let name = path.file_stem().unwrap().to_str().unwrap();
+            let mut parts = name.split("__");
+            let (profile, template_name) = match parts.next().unwrap() {
+                "qwen35-official" => (AgentTemplateProfile::Qwen35Official, "official"),
+                "qwen35-unsloth" => (AgentTemplateProfile::Qwen35Unsloth, "unsloth"),
+                other => panic!("unknown template {other}"),
+            };
+            let adapter = qwen35_test_adapter(template_name);
+            assert_eq!(adapter.agent_template_profile(), Some(profile));
+            let case = parts.next().unwrap();
+            let thinking = parts.next().unwrap().strip_prefix("thinking-").unwrap();
+            assert!(parts.next().is_none());
+            let mut request = cases["cases"][case].clone();
+            for message in request["messages"].as_array_mut().unwrap() {
+                if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                    for call in calls {
+                        let args = &mut call["function"]["arguments"];
+                        *args = Value::String(python_json(args).unwrap());
+                    }
+                }
+            }
+            request["model"] = json!("test-model");
+            request["chat_template_kwargs"] = cases["thinking"][thinking].clone();
+            let validated =
+                ChatCompletionRequest::from_json(&serde_json::to_vec(&request).unwrap())
+                    .unwrap()
+                    .validate("test-model", 128)
+                    .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let (engine, _) =
+                to_engine_request(validated, 0, SamplingProfile::OpenAi.defaults(true))
+                    .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let actual = match engine.input {
+                EngineInput::Chat(messages) => adapter
+                    .format_chat_messages_with(&messages, engine.chat_template)
+                    .unwrap(),
+                EngineInput::Agent { prompt, .. } => adapter
+                    .format_agent_prompt_with(&prompt, engine.chat_template)
+                    .unwrap(),
+                _ => panic!("unexpected engine input: {name}"),
+            };
+            assert_eq!(
+                actual.as_bytes(),
+                std::fs::read(&path).unwrap(),
+                "fixture {name}"
+            );
+        }
+        assert_eq!(count, 36);
     }
 
     #[test]
@@ -2920,6 +3034,181 @@ mod tests {
             sampled(with(json!({"temperature": 1.2, "top_p": 0.5})), true, qwen3).await,
             (1.2, 0.5, 20)
         );
+    }
+
+    #[tokio::test]
+    async fn qwen35_thinking_precedence_and_sampling_defaults() {
+        use crate::chat::{ChatMessage, ChatTemplateOptions};
+        use crate::models::ModelAdapter;
+        for (name, template_default) in [("official", true), ("unsloth", false)] {
+            let adapter = qwen35_test_adapter(name);
+            assert_eq!(
+                adapter.chat_template_defaults().enable_thinking,
+                Some(template_default)
+            );
+            for (server, request, effective) in [
+                (None, None, template_default),
+                (Some(false), None, false),
+                (Some(false), Some(true), true),
+                (None, Some(false), false),
+                (None, Some(true), true),
+            ] {
+                let server_options = ChatTemplateOptions {
+                    enable_thinking: server,
+                };
+                let request_options = ChatTemplateOptions {
+                    enable_thinking: request,
+                };
+                let prompt = adapter
+                    .format_chat_messages_with(
+                        &[ChatMessage::user("hello")],
+                        request_options.or(server_options),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    prompt.ends_with("<think>\n"),
+                    effective,
+                    "{name} {server:?} {request:?}"
+                );
+                for profile in [SamplingProfile::Qwen3, SamplingProfile::Qwen35] {
+                    let mut fake = FakeEngine::healthy(vec![EngineEvent::Finished(metrics(
+                        FinishReason::Stop,
+                    ))]);
+                    fake.metadata.family = "qwen35".into();
+                    fake.metadata.chat_template_defaults =
+                        server_options.or(adapter.chat_template_defaults());
+                    let engine = Arc::new(fake);
+                    let mut body = json!({"model":"test-model", "messages":[{"role":"user", "content":"hello"}]});
+                    if let Some(enabled) = request {
+                        body["chat_template_kwargs"] = json!({"enable_thinking": enabled});
+                    }
+                    let response = router_with_options(
+                        engine.clone(),
+                        ServerOptions {
+                            sampling_profile: profile,
+                            ..ServerOptions::default()
+                        },
+                    )
+                    .oneshot(chat_request(&body))
+                    .await
+                    .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let lowered = engine.last_request.lock().unwrap().take().unwrap();
+                    let (temp, top_p, penalty) = if effective {
+                        (0.6, 0.95, 0.0)
+                    } else {
+                        (
+                            0.7,
+                            0.8,
+                            if profile == SamplingProfile::Qwen35 {
+                                1.5
+                            } else {
+                                0.0
+                            },
+                        )
+                    };
+                    assert_eq!(
+                        (
+                            lowered.sampling.temperature,
+                            lowered.sampling.top_p,
+                            lowered.sampling.top_k,
+                            lowered.presence_penalty
+                        ),
+                        (temp, top_p, 20, penalty)
+                    );
+                }
+            }
+        }
+        let mut fake =
+            FakeEngine::healthy(vec![EngineEvent::Finished(metrics(FinishReason::Stop))]);
+        fake.metadata.family = "qwen35".into();
+        fake.metadata.chat_template_defaults.enable_thinking = Some(false);
+        let engine = Arc::new(fake);
+        let body = json!({"model":"test-model", "messages":[{"role":"user", "content":"hello"}], "temperature":1.1, "top_p":0.4, "presence_penalty":0.0});
+        let response = router_with_options(
+            engine.clone(),
+            ServerOptions {
+                sampling_profile: SamplingProfile::Qwen35,
+                ..ServerOptions::default()
+            },
+        )
+        .oneshot(chat_request(&body))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let lowered = engine.last_request.lock().unwrap().take().unwrap();
+        assert_eq!(
+            (
+                lowered.sampling.temperature,
+                lowered.sampling.top_p,
+                lowered.sampling.top_k,
+                lowered.presence_penalty
+            ),
+            (1.1, 0.4, 20, 0.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn qwen35_rejects_multiple_calls_in_history() {
+        let body = json!({
+            "model":"test-model", "tool_choice":"none", "tools":[shell_tool()],
+            "messages":[
+                {"role":"user", "content":"go"},
+                {"role":"assistant", "content":"Checking.", "tool_calls":[
+                    {"id":"a", "type":"function", "function":{"name":"shell", "arguments":"{\"n\":3}"}},
+                    {"id":"b", "type":"function", "function":{"name":"shell", "arguments":"{\"n\":4}"}}
+                ]},
+                {"role":"tool", "tool_call_id":"a", "content":"first"},
+                {"role":"tool", "tool_call_id":"b", "content":"second"}
+            ]
+        });
+        let mut fake = FakeEngine::healthy(vec![]);
+        fake.metadata.family = "qwen35".into();
+        let engine = Arc::new(fake);
+        let response = router(engine.clone())
+            .oneshot(chat_request(&body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(engine.submit_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn qwen35_rejects_tool_output_choices_until_parser_exists() {
+        for choice in [
+            json!("auto"),
+            json!("required"),
+            json!({"type":"function", "function":{"name":"shell"}}),
+            Value::Null,
+            json!("none"),
+        ] {
+            let mut fake =
+                FakeEngine::healthy(vec![EngineEvent::Finished(metrics(FinishReason::Stop))]);
+            fake.metadata.family = "qwen35".into();
+            let engine = Arc::new(fake);
+            let mut body = json!({"model":"test-model", "messages":[{"role":"user", "content":"hello"}], "tools":[shell_tool()]});
+            if !choice.is_null() {
+                body["tool_choice"] = choice.clone();
+            }
+            let response = router(engine.clone())
+                .oneshot(chat_request(&body))
+                .await
+                .unwrap();
+            if choice == json!("none") {
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(engine.submit_count.load(Ordering::Relaxed), 1);
+            } else {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let body = body_json(response).await;
+                assert!(
+                    body["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Qwen3.5 native tool output parsing")
+                );
+                assert_eq!(engine.submit_count.load(Ordering::Relaxed), 0);
+            }
+        }
     }
 
     #[tokio::test]
