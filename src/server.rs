@@ -44,9 +44,7 @@ use crate::{
         ValidatedChatCompletionRequest, ValidatedMessages,
     },
     sampling::SamplingConfig,
-    tool_call::{
-        SplitEnd, TOOL_CALL_OPEN, ToolCallScan, ToolCallSplitter, parse_tool_call, scan_tool_call,
-    },
+    tool_call::{SplitEnd, TOOL_CALL_OPEN, ToolCallScan, ToolCallSplitter, scan_tool_call},
 };
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -841,20 +839,16 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
     };
     let metadata = state.engine.metadata();
-    let tools_enabled = match &request.tool_choice {
-        Some(ToolChoice::Mode(ToolChoiceMode::None)) => false,
-        Some(_) => true,
-        None => request
-            .tools
-            .as_ref()
-            .is_some_and(|tools| !tools.is_empty()),
-    };
-    if metadata.family == "qwen35" && tools_enabled {
+    if metadata.family == "qwen35"
+        && matches!(
+            request.tool_choice,
+            Some(ToolChoice::Mode(ToolChoiceMode::Required) | ToolChoice::Function { .. })
+        )
+    {
         return api_error(
             StatusCode::BAD_REQUEST,
             ApiError::invalid_request(
-                "Qwen3.5 native tool output parsing is not supported; use tool_choice none"
-                    .to_owned(),
+                "Qwen3.5 supports tool_choice auto or none only; forced named and required tool choices are not supported".to_owned(),
                 Some("tool_choice".to_owned()),
                 Some("invalid_value".to_owned()),
             ),
@@ -891,8 +885,12 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         .enable_thinking
         != Some(false);
     let sampling = state.options.sampling_profile.defaults(thinking);
-    let (engine_request, output) = match to_engine_request(request, identity.default_seed, sampling)
-    {
+    let (engine_request, output) = match to_engine_request_with_syntax(
+        request,
+        identity.default_seed,
+        sampling,
+        metadata.family == "qwen35",
+    ) {
         Ok(lowered) => lowered,
         Err(error) => return api_error(status_for_api_error(&error), error),
     };
@@ -940,10 +938,20 @@ enum AssistantOutput {
     AutoCall { calls: CompiledToolCalls },
 }
 
+#[cfg(test)]
 fn to_engine_request(
     request: ValidatedChatCompletionRequest,
     request_default_seed: u64,
     defaults: SamplingDefaults,
+) -> std::result::Result<(EngineRequest, AssistantOutput), ApiError> {
+    to_engine_request_with_syntax(request, request_default_seed, defaults, false)
+}
+
+fn to_engine_request_with_syntax(
+    request: ValidatedChatCompletionRequest,
+    request_default_seed: u64,
+    defaults: SamplingDefaults,
+    qwen35: bool,
 ) -> std::result::Result<(EngineRequest, AssistantOutput), ApiError> {
     let sampling = SamplingConfig {
         temperature: request.temperature.unwrap_or(defaults.temperature),
@@ -987,7 +995,12 @@ fn to_engine_request(
             AssistantOutput::ForcedCall { name },
         )
     } else if automatic {
-        let calls = CompiledToolCalls::new(
+        let compile_calls = if qwen35 {
+            CompiledToolCalls::qwen35
+        } else {
+            CompiledToolCalls::new
+        };
+        let calls = compile_calls(
             request
                 .tools
                 .iter()
@@ -1292,16 +1305,11 @@ fn auto_call_function(
     after_open: &str,
     calls: &CompiledToolCalls,
 ) -> std::result::Result<AssistantFunctionCall, ApiError> {
-    let call = parse_tool_call(after_open)
-        .and_then(|call| {
-            calls.validate_call(&call.name, &call.arguments)?;
-            Ok(call)
-        })
-        .map_err(|error| {
-            ApiError::server_error(format!(
-                "model produced an invalid native tool call: {error:#}"
-            ))
-        })?;
+    let call = calls.parse_call(after_open).map_err(|error| {
+        ApiError::server_error(format!(
+            "model produced an invalid native tool call: {error:#}"
+        ))
+    })?;
     Ok(AssistantFunctionCall {
         name: call.name,
         arguments: call.arguments_text,
@@ -3174,7 +3182,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn qwen35_rejects_tool_output_choices_until_parser_exists() {
+    async fn qwen35_accepts_auto_and_none_but_rejects_forced_and_required() {
         for choice in [
             json!("auto"),
             json!("required"),
@@ -3194,7 +3202,7 @@ mod tests {
                 .oneshot(chat_request(&body))
                 .await
                 .unwrap();
-            if choice == json!("none") {
+            if choice == json!("none") || choice == json!("auto") || choice.is_null() {
                 assert_eq!(response.status(), StatusCode::OK);
                 assert_eq!(engine.submit_count.load(Ordering::Relaxed), 1);
             } else {
@@ -3204,7 +3212,7 @@ mod tests {
                     body["error"]["message"]
                         .as_str()
                         .unwrap()
-                        .contains("Qwen3.5 native tool output parsing")
+                        .contains("forced named and required tool choices are not supported")
                 );
                 assert_eq!(engine.submit_count.load(Ordering::Relaxed), 0);
             }
@@ -3375,6 +3383,249 @@ mod tests {
         assert_eq!(streamed_content(&events), ["Done", " \n<tool"]);
         assert!(body.contains("\"finish_reason\":\"length\""));
         assert!(!body.contains("tool_calls"));
+    }
+
+    const QWEN35_CALL: &str = "<tool_call>\n<function=shell>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>";
+
+    fn qwen35_engine(events: Vec<EngineEvent>) -> Arc<FakeEngine> {
+        let mut engine = FakeEngine::healthy(events);
+        engine.metadata.family = "qwen35".to_owned();
+        Arc::new(engine)
+    }
+
+    #[tokio::test]
+    async fn qwen35_auto_non_streaming_returns_native_calls_and_visible_prefix() {
+        for (prefix, content) in [
+            ("", Value::Null),
+            ("\n", Value::Null),
+            (
+                "<think>Use <tool_call> later.</think>\n\nListing.\n",
+                json!("<think>Use <tool_call> later.</think>\n\nListing."),
+            ),
+        ] {
+            for explicit_auto in [false, true] {
+                let text = format!("{prefix}{QWEN35_CALL}");
+                let engine = qwen35_engine(vec![
+                    text_event(&text, 11, 1, 3),
+                    EngineEvent::Finished(metrics(FinishReason::Stop)),
+                ]);
+                let mut request = json!({"model":"test-model", "messages":[{"role":"user", "content":"list files"}], "tools":[shell_tool()]});
+                if explicit_auto {
+                    request["tool_choice"] = json!("auto");
+                }
+                let response = router(engine.clone())
+                    .oneshot(chat_request(&request))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = body_json(response).await;
+                let message = &body["choices"][0]["message"];
+                assert_eq!(message["content"], content);
+                let call = &message["tool_calls"][0];
+                assert!(call["id"].as_str().unwrap().starts_with("call_"));
+                assert_eq!(call["type"], "function");
+                assert_eq!(
+                    call["function"],
+                    json!({"name":"shell", "arguments":"{\"command\":\"ls\"}"})
+                );
+                assert_eq!(message["tool_calls"].as_array().unwrap().len(), 1);
+                assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+                let request = engine.last_request.lock().unwrap().take().unwrap();
+                let EngineInput::Agent {
+                    constraint: Some(constraint),
+                    ..
+                } = request.input
+                else {
+                    panic!("Qwen3.5 auto must carry the lazy constraint");
+                };
+                let crate::engine::EngineConstraintGrammar::LazyToolCall(calls) =
+                    constraint.grammar
+                else {
+                    panic!("expected lazy tool grammar");
+                };
+                assert_eq!(
+                    calls
+                        .parse_call(&QWEN35_CALL[TOOL_CALL_OPEN.len()..])
+                        .unwrap()
+                        .arguments_text,
+                    "{\"command\":\"ls\"}"
+                );
+                assert!(
+                    calls
+                        .parse_call(&SHELL_CALL[TOOL_CALL_OPEN.len()..])
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn qwen35_auto_sse_every_split_preserves_content_and_buffers_the_call() {
+        let visible = "<think>Use <tool_call> later.</think>\n\nListing.";
+        let text = format!("{visible}\n{QWEN35_CALL}");
+        for cut in 0..=text.len() {
+            let engine = qwen35_engine(vec![
+                text_event(&text[..cut], 11, 1, 3),
+                text_event(&text[cut..], 11, 2, 3),
+                EngineEvent::Finished(metrics(FinishReason::Stop)),
+            ]);
+            let response = router(engine).oneshot(auto_request(true)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_text(response).await;
+            let events = sse_json(&body);
+            let content = streamed_content(&events);
+            assert_eq!(content.concat(), visible, "split at {cut}");
+            let mut accumulated = String::new();
+            for fragment in content {
+                accumulated.push_str(&fragment);
+                assert!(
+                    visible.starts_with(&accumulated),
+                    "partial tag leaked at {cut}"
+                );
+            }
+            let header = events
+                .iter()
+                .position(|event| event["choices"][0]["delta"]["tool_calls"][0]["id"].is_string())
+                .unwrap();
+            assert!(
+                events[..header]
+                    .iter()
+                    .all(|event| event["choices"][0]["delta"]["tool_calls"].is_null())
+            );
+            let call = &events[header]["choices"][0]["delta"]["tool_calls"][0];
+            assert_eq!(call["index"], 0);
+            assert_eq!(call["type"], "function");
+            assert_eq!(call["function"]["name"], "shell");
+            assert_eq!(call["function"]["arguments"], "");
+            assert_eq!(
+                events[header + 1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+                "{\"command\":\"ls\"}"
+            );
+            assert_eq!(
+                events[header + 2]["choices"][0]["finish_reason"],
+                "tool_calls"
+            );
+            assert!(!body.contains("<parameter="));
+            assert!(body.ends_with("data: [DONE]\n\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn qwen35_invalid_xml_calls_are_never_exposed_as_content_or_deltas() {
+        for invalid in [
+            QWEN35_CALL.replace("function=shell", "function=unknown"),
+            QWEN35_CALL.replace("parameter=command", "parameter=unknown"),
+            QWEN35_CALL.replace("<parameter=command>\nls\n</parameter>\n", ""),
+            QWEN35_CALL.replace(
+                "</function>",
+                "<parameter=command>\nSECRET\n</parameter>\n</function>",
+            ),
+            QWEN35_CALL.replace("</tool_call>", ""),
+            QWEN35_CALL.to_owned() + "SECRET",
+            SHELL_CALL.to_owned(),
+        ] {
+            for stream in [false, true] {
+                let engine = qwen35_engine(vec![
+                    text_event(format!("Listing.\n{invalid}"), 11, 1, 3),
+                    EngineEvent::Finished(metrics(FinishReason::Stop)),
+                ]);
+                let response = router(engine).oneshot(auto_request(stream)).await.unwrap();
+                if !stream {
+                    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                }
+                let body = body_text(response).await;
+                assert!(body.contains("invalid native tool call"), "{body}");
+                assert!(!body.contains("SECRET"));
+                assert!(!body.contains("tool_calls"));
+                assert!(!body.contains("<parameter="));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn qwen35_none_leaves_xml_as_text_and_auto_allows_plain_answers() {
+        for (choice, text) in [("none", QWEN35_CALL), ("auto", "No call needed. <tool_c")] {
+            let engine = qwen35_engine(vec![
+                text_event(text, 11, 1, 3),
+                EngineEvent::Finished(metrics(FinishReason::Stop)),
+            ]);
+            let response = router(engine.clone())
+                .oneshot(chat_request(&json!({
+                    "model":"test-model", "messages":[{"role":"user", "content":"hello"}],
+                    "tools":[shell_tool()], "tool_choice":choice
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            assert_eq!(body["choices"][0]["message"]["content"], text);
+            assert!(body["choices"][0]["message"].get("tool_calls").is_none());
+            assert_eq!(body["choices"][0]["finish_reason"], "stop");
+            if choice == "none" {
+                assert!(!matches!(
+                    engine.last_request.lock().unwrap().as_ref().unwrap().input,
+                    EngineInput::Agent {
+                        constraint: Some(_),
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn qwen35_returned_arguments_round_trip_through_both_pinned_renderers() {
+        use crate::models::ModelAdapter;
+        let mut tool = shell_tool();
+        tool["function"]["parameters"] = json!({"type":"object", "properties":{
+            "command":{"type":"string"}, "enabled":{"type":"boolean"}
+        }, "required":["command", "enabled"]});
+        let text = "<think>Need a tool.</think>\n\nListing.\n<tool_call>\n<function=shell>\n<parameter=enabled>\ntrue\n</parameter>\n<parameter=command>\necho a\necho b\n</parameter>\n</function>\n</tool_call>";
+        let mut messages = vec![json!({"role":"user", "content":"list files"})];
+        let response = router(qwen35_engine(vec![
+            text_event(text, 11, 1, 3),
+            EngineEvent::Finished(metrics(FinishReason::Stop)),
+        ]))
+        .oneshot(chat_request(&json!({
+            "model":"test-model", "messages":messages, "tools":[tool.clone()]
+        })))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let reply = body_json(response).await;
+        assert_eq!(
+            reply["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"enabled\":true,\"command\":\"echo a\\necho b\"}"
+        );
+        assert!(restloop_record(&mut messages, &reply, "done"));
+        let validated = ChatCompletionRequest::from_json(
+            &serde_json::to_vec(&json!({
+                "model":"test-model", "messages":messages, "tools":[tool]
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .validate("test-model", 128)
+        .unwrap();
+        let (request, _) = to_engine_request_with_syntax(
+            validated,
+            0,
+            SamplingProfile::Qwen35.defaults(false),
+            true,
+        )
+        .unwrap();
+        let EngineInput::Agent { prompt, .. } = request.input else {
+            panic!("expected agent history");
+        };
+        for template in ["official", "unsloth"] {
+            let rendered = qwen35_test_adapter(template)
+                .format_agent_prompt_with(&prompt, request.chat_template)
+                .unwrap();
+            // Python str(bool), raw multi-line string, and emitted key order
+            // must survive the returned JSON-string history representation.
+            assert!(rendered.contains("Listing.\n\n<tool_call>\n<function=shell>\n<parameter=enabled>\nTrue\n</parameter>\n<parameter=command>\necho a\necho b\n</parameter>\n</function>\n</tool_call>"), "{template}: {rendered}");
+            assert!(rendered.contains("<tool_response>\ndone\n</tool_response>"));
+        }
     }
 
     /// Apply RestLoop's bookkeeping to one reply: keep the assistant message

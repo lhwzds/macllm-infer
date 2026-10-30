@@ -22,8 +22,9 @@
 //! subset of the representations accepted by JSON Schema.
 //!
 //! Native tool calls wrap the same argument grammar in the Qwen3 call
-//! envelope. [`LazyToolCallConstraint`] leaves ordinary text unconstrained
-//! and applies that envelope only after the model opens a call.
+//! JSON envelope or Qwen3.5's schema-directed XML parameter blocks.
+//! [`LazyToolCallConstraint`] leaves ordinary text unconstrained and applies
+//! the selected envelope only after the model opens a call.
 
 use std::{
     collections::{BTreeSet, HashSet, VecDeque},
@@ -36,7 +37,10 @@ use tokenizers::{Tokenizer, tokenizer::step_decode_stream};
 
 use crate::{
     sampling::LogitsConstraint,
-    tool_call::{TOOL_CALL_OPEN, TOOL_CALL_TAIL, ToolCallScan, scan_tool_call, tool_call_head},
+    tool_call::{
+        NativeToolCall, TOOL_CALL_OPEN, TOOL_CALL_TAIL, ToolCallScan, parse_tool_call,
+        parse_xml_tool_call, scan_tool_call, tool_call_head,
+    },
 };
 
 /// Default hard limit for one constrained response.
@@ -510,6 +514,7 @@ struct ToolCallSchema {
 #[derive(Debug, Clone)]
 pub struct CompiledToolCalls {
     tools: Vec<ToolCallSchema>,
+    xml: bool,
 }
 
 impl CompiledToolCalls {
@@ -531,7 +536,72 @@ impl CompiledToolCalls {
             !compiled.is_empty(),
             "a native tool call grammar requires at least one declared tool"
         );
-        Ok(Self { tools: compiled })
+        Ok(Self {
+            tools: compiled,
+            xml: false,
+        })
+    }
+
+    /// Compile the same declarations for Qwen3.5's native XML envelope.
+    /// Function and parameter names must be representable as literal tag names.
+    pub fn qwen35(tools: impl IntoIterator<Item = (String, CompiledJsonSchema)>) -> Result<Self> {
+        let mut calls = Self::new(tools)?;
+        for tool in &mut calls.tools {
+            ensure!(
+                xml_name_is_safe(&tool.name),
+                "tool name cannot be represented in XML: {:?}",
+                tool.name
+            );
+            let Some(SchemaKind::Object(object)) = &tool.arguments.root.kind else {
+                bail!("Qwen3.5 tool arguments must have type object");
+            };
+            for property in &object.properties {
+                ensure!(
+                    xml_name_is_safe(&property.name),
+                    "parameter name cannot be represented in XML: {:?}",
+                    property.name
+                );
+            }
+            tool.head = format!("\n<function={}>\n", tool.name).into_bytes();
+        }
+        calls.xml = true;
+        Ok(calls)
+    }
+
+    /// Parse and revalidate a generated call using this declaration's syntax.
+    /// XML values are converted by their declared types; insertion order is
+    /// preserved when serializing the compact arguments object.
+    pub fn parse_call(&self, after_open: &str) -> Result<NativeToolCall> {
+        let call = if self.xml {
+            let raw = parse_xml_tool_call(after_open)?;
+            let tool = self
+                .tools
+                .iter()
+                .find(|tool| tool.name == raw.name)
+                .with_context(|| format!("tool `{}` is not declared", raw.name))?;
+            let Some(SchemaKind::Object(object)) = &tool.arguments.root.kind else {
+                bail!("XML tool arguments must have type object");
+            };
+            let mut arguments = Map::new();
+            for (name, text) in raw.parameters {
+                let property = object
+                    .properties
+                    .iter()
+                    .find(|property| property.name == name)
+                    .with_context(|| format!("parameter {name:?} is not declared"))?;
+                arguments.insert(name, convert_xml_value(&property.schema, &text)?);
+            }
+            let arguments = Value::Object(arguments);
+            NativeToolCall {
+                name: raw.name,
+                arguments_text: serde_json::to_string(&arguments)?,
+                arguments,
+            }
+        } else {
+            parse_tool_call(after_open)?
+        };
+        self.validate_call(&call.name, &call.arguments)?;
+        Ok(call)
     }
 
     /// Check a parsed call against the declared names and their schemas.
@@ -558,9 +628,10 @@ impl CompiledToolCalls {
 /// Request-local grammar for the bytes after a native call's opening tag:
 /// `\n{"name": "<declared>", "arguments": <schema-valid object>}\n</tool_call>`.
 ///
-/// The envelope is the canonical spelling Qwen3 is prompted with. Only the
-/// arguments object admits JSON whitespace; once the closing tag completes,
-/// no further byte is viable.
+/// The default envelope is the canonical spelling Qwen3 is prompted with.
+/// Declarations compiled with [`CompiledToolCalls::qwen35`] instead select
+/// `\n<function=NAME>\n` and schema-directed raw parameter blocks. Both
+/// envelopes admit exactly one call and no bytes after its closing tag.
 #[derive(Debug, Clone)]
 pub struct ToolCallGrammar {
     calls: CompiledToolCalls,
@@ -580,7 +651,15 @@ impl ToolCallGrammar {
 
     #[must_use]
     pub fn status(&self) -> GrammarStatus {
-        analyze_tool_call(&self.calls.tools, &self.output, self.max_output_bytes)
+        self.analyze(&self.output)
+    }
+
+    fn analyze(&self, bytes: &[u8]) -> GrammarStatus {
+        if self.calls.xml {
+            analyze_xml_tool_call(&self.calls.tools, bytes, self.max_output_bytes)
+        } else {
+            analyze_tool_call(&self.calls.tools, bytes, self.max_output_bytes)
+        }
     }
 
     #[must_use]
@@ -609,8 +688,7 @@ impl ToolCallGrammar {
         }
         let mut candidate = self.output.clone();
         candidate.extend_from_slice(token_text.as_bytes());
-        analyze_tool_call(&self.calls.tools, &candidate, self.max_output_bytes)
-            != GrammarStatus::Dead
+        self.analyze(&candidate) != GrammarStatus::Dead
     }
 
     pub fn commit_token_text(&mut self, token_text: &str) -> Result<GrammarStatus> {
@@ -665,7 +743,233 @@ fn analyze_tool_call(
     }
 }
 
-/// Tool-choice `auto` sampling constraint for the native Qwen3 call syntax.
+const XML_PARAMETER_END: &str = "\n</parameter>\n";
+const XML_FUNCTION_END: &[u8] = b"</function>\n</tool_call>";
+
+fn xml_name_is_safe(name: &str) -> bool {
+    // These are raw template fields, not XML identifiers. Only the field
+    // terminator is unrepresentable; punctuation and empty property names
+    // otherwise round-trip literally.
+    !name.contains(">\n")
+}
+
+fn xml_exact_spellings(exact: &ExactValue) -> Vec<String> {
+    match &exact.value {
+        Value::String(text) => {
+            if text.contains("\n</parameter>") {
+                Vec::new()
+            } else {
+                vec![text.clone()]
+            }
+        }
+        Value::Bool(true) => vec!["true".to_owned(), "True".to_owned()],
+        Value::Bool(false) => vec!["false".to_owned(), "False".to_owned()],
+        Value::Null => vec!["null".to_owned(), "None".to_owned()],
+        _ => vec![String::from_utf8(exact.bytes.clone()).expect("serialized JSON is UTF-8")],
+    }
+}
+
+/// Unlike JSON strings, XML string parameters have no quoting or escaping.
+/// The newline-prefixed closing tag is their only reserved byte sequence.
+fn convert_xml_value(schema: &SchemaNode, text: &str) -> Result<Value> {
+    let value = match schema.kind.as_ref() {
+        None => schema
+            .exact
+            .as_ref()
+            .and_then(|values| {
+                values.iter().find(|value| {
+                    xml_exact_spellings(value)
+                        .iter()
+                        .any(|spelling| spelling == text)
+                })
+            })
+            .context("parameter does not match enum or const")?
+            .value
+            .clone(),
+        Some(SchemaKind::String) => {
+            ensure!(
+                !text.contains("\n</parameter>"),
+                "string contains a parameter closing tag"
+            );
+            Value::String(text.to_owned())
+        }
+        Some(SchemaKind::Boolean) => match text {
+            "true" | "True" => Value::Bool(true),
+            "false" | "False" => Value::Bool(false),
+            _ => bail!("invalid boolean parameter"),
+        },
+        Some(SchemaKind::Null) => {
+            ensure!(matches!(text, "null" | "None"), "invalid null parameter");
+            Value::Null
+        }
+        _ => {
+            ensure!(
+                parse_xml_value(schema, text.as_bytes(), 0)
+                    .complete
+                    .contains(&text.len()),
+                "invalid JSON parameter"
+            );
+            serde_json::from_str(text).context("invalid JSON parameter")?
+        }
+    };
+    ensure!(
+        node_conforms(schema, &value),
+        "parameter does not satisfy its schema"
+    );
+    Ok(value)
+}
+
+fn parse_xml_value(schema: &SchemaNode, input: &[u8], position: usize) -> ParseOutcomes {
+    match schema.kind.as_ref() {
+        None => {
+            let mut outcomes = ParseOutcomes::default();
+            for exact in schema.exact.iter().flatten() {
+                for spelling in xml_exact_spellings(exact) {
+                    outcomes.merge(match_terminal(input, position, spelling.as_bytes()));
+                }
+            }
+            outcomes
+        }
+        Some(SchemaKind::String) => {
+            if let Some(exact) = &schema.exact {
+                let mut outcomes = ParseOutcomes::default();
+                for candidate in exact {
+                    if let Some(text) = candidate.value.as_str()
+                        && !text.contains("\n</parameter>")
+                    {
+                        outcomes.merge(match_terminal(input, position, text.as_bytes()));
+                    }
+                }
+                outcomes
+            } else {
+                // The full delimiter is handled by analyze_xml_function. In
+                // its absence arbitrary raw text can always be extended.
+                ParseOutcomes::incomplete()
+            }
+        }
+        Some(SchemaKind::Boolean | SchemaKind::Null) => {
+            let candidates = [
+                ("true", Value::Bool(true)),
+                ("True", Value::Bool(true)),
+                ("false", Value::Bool(false)),
+                ("False", Value::Bool(false)),
+                ("null", Value::Null),
+                ("None", Value::Null),
+            ];
+            let mut outcomes = ParseOutcomes::default();
+            for (text, value) in candidates {
+                if node_conforms(schema, &value) {
+                    outcomes.merge(match_terminal(input, position, text.as_bytes()));
+                }
+            }
+            outcomes
+        }
+        Some(SchemaKind::Object(_) | SchemaKind::Array(_)) => {
+            let mut outcomes = parse_node(schema, input, skip_json_whitespace(input, position), 0);
+            // JSON whitespace belongs to VALUE, but the separator's newline
+            // must remain available as the start of the parameter tail.
+            for end in outcomes.complete.clone() {
+                for cursor in end..skip_json_whitespace(input, end) {
+                    outcomes.complete.insert(cursor + 1);
+                }
+            }
+            outcomes
+        }
+        _ => parse_node(schema, input, position, 0),
+    }
+}
+
+fn analyze_xml_tool_call(tools: &[ToolCallSchema], bytes: &[u8], limit: usize) -> GrammarStatus {
+    if bytes.len() > limit || std::str::from_utf8(bytes).is_err() {
+        return GrammarStatus::Dead;
+    }
+    let mut viable = false;
+    for tool in tools {
+        let head = match_terminal(bytes, 0, &tool.head);
+        viable |= head.incomplete;
+        for position in head.complete {
+            match analyze_xml_function(tool, bytes, position) {
+                GrammarStatus::Complete => return GrammarStatus::Complete,
+                GrammarStatus::Viable => viable = true,
+                GrammarStatus::Dead => (),
+            }
+        }
+    }
+    if viable {
+        GrammarStatus::Viable
+    } else {
+        GrammarStatus::Dead
+    }
+}
+
+fn analyze_xml_function(tool: &ToolCallSchema, bytes: &[u8], mut position: usize) -> GrammarStatus {
+    let Some(SchemaKind::Object(object)) = &tool.arguments.root.kind else {
+        return GrammarStatus::Dead;
+    };
+    let mut arguments = Map::new();
+    loop {
+        if object
+            .properties
+            .iter()
+            .all(|property| !property.required || arguments.contains_key(&property.name))
+            && tool.arguments.accepts(&Value::Object(arguments.clone()))
+        {
+            let tail = match_terminal(bytes, position, XML_FUNCTION_END);
+            if tail.complete.contains(&bytes.len()) {
+                return GrammarStatus::Complete;
+            }
+            if tail.incomplete {
+                return GrammarStatus::Viable;
+            }
+        }
+        let mut next = None;
+        for property in &object.properties {
+            if arguments.contains_key(&property.name) {
+                continue;
+            }
+            let head = format!("<parameter={}>\n", property.name);
+            let matched = match_terminal(bytes, position, head.as_bytes());
+            if matched.incomplete {
+                return GrammarStatus::Viable;
+            }
+            if let Some(&start) = matched.complete.first() {
+                next = Some((property, start));
+                break;
+            }
+        }
+        let Some((property, start)) = next else {
+            return GrammarStatus::Dead;
+        };
+        let rest = std::str::from_utf8(&bytes[start..]).expect("checked UTF-8");
+        if let Some(end) = rest.find("\n</parameter>") {
+            let Ok(value) = convert_xml_value(&property.schema, &rest[..end]) else {
+                return GrammarStatus::Dead;
+            };
+            let tail = match_terminal(bytes, start + end, XML_PARAMETER_END.as_bytes());
+            if tail.incomplete {
+                return GrammarStatus::Viable;
+            }
+            let Some(&end) = tail.complete.first() else {
+                return GrammarStatus::Dead;
+            };
+            arguments.insert(property.name.clone(), value);
+            position = end;
+        } else {
+            let value = parse_xml_value(&property.schema, bytes, start);
+            if value.incomplete
+                || value
+                    .complete
+                    .iter()
+                    .any(|&end| match_terminal(bytes, end, XML_PARAMETER_END.as_bytes()).incomplete)
+            {
+                return GrammarStatus::Viable;
+            }
+            return GrammarStatus::Dead;
+        }
+    }
+}
+
+/// Tool-choice `auto` sampling constraint for native Qwen3 or Qwen3.5 calls.
 ///
 /// Like llama.cpp's lazy grammars, sampling is unconstrained while the
 /// decoded output is ordinary text or reasoning. Once [`scan_tool_call`]

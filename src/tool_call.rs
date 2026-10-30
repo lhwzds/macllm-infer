@@ -1,11 +1,13 @@
-//! Native single tool-call syntax shared by the pinned Qwen3 agent profiles.
+//! Native single tool-call syntax shared by the pinned Qwen agent profiles.
 //!
 //! Qwen3 emits one function call as
 //! `<tool_call>\n{"name": "<name>", "arguments": <object>}\n</tool_call>`,
 //! optionally after a leading `<think>…</think>` reasoning block and visible
 //! text. The prompt renderer, the lazy sampling constraint and the HTTP
 //! response parser all use this module, so they cannot disagree about where a
-//! model-chosen call starts or how its envelope is spelled.
+//! model-chosen call starts or how its envelope is spelled. Qwen3.5 shares
+//! the scanner and streaming splitter, but uses raw XML parameter blocks
+//! parsed by [`parse_xml_tool_call`] before schema-directed conversion.
 
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
@@ -123,6 +125,48 @@ pub fn parse_tool_call(after_open: &str) -> Result<NativeToolCall> {
         name: name.to_owned(),
         arguments: arguments.clone(),
         arguments_text: raw["arguments"].get().to_owned(),
+    })
+}
+
+/// Native Qwen3-Coder/Qwen3.5 XML envelope, before schema-directed conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlToolCall {
+    pub name: String,
+    pub parameters: Vec<(String, String)>,
+}
+
+/// Parse exactly one Qwen3.5 function block. Values are raw text, not XML:
+/// entities are not decoded and only the newline-prefixed parameter closing
+/// tag terminates a value. Schema-directed conversion is done by the caller.
+pub fn parse_xml_tool_call(after_open: &str) -> Result<XmlToolCall> {
+    let rest = after_open
+        .strip_prefix("\n<function=")
+        .context("tool call must open a function block")?;
+    let (name, mut rest) = rest
+        .split_once(">\n")
+        .context("unterminated function name")?;
+    let mut parameters = Vec::new();
+    while let Some(parameter) = rest.strip_prefix("<parameter=") {
+        let (name, value) = parameter
+            .split_once(">\n")
+            .context("unterminated parameter name")?;
+        let (value, tail) = value
+            .split_once("\n</parameter>\n")
+            .context("unterminated parameter value")?;
+        ensure!(
+            !parameters.iter().any(|(seen, _)| seen == name),
+            "repeated parameter {name:?}"
+        );
+        parameters.push((name.to_owned(), value.to_owned()));
+        rest = tail;
+    }
+    ensure!(
+        rest == "</function>\n</tool_call>",
+        "tool call must end after one closed function block"
+    );
+    Ok(XmlToolCall {
+        name: name.to_owned(),
+        parameters,
     })
 }
 
