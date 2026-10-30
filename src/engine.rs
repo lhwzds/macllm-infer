@@ -184,6 +184,9 @@ impl EngineConstraintSpec {
 pub struct EngineRequest {
     pub input: EngineInput,
     pub sampling: SamplingConfig,
+    /// Kept on EngineRequest rather than SamplingConfig to avoid changing unrelated sampling literals.
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
     pub max_new_tokens: usize,
     pub ignore_stop_tokens: bool,
     pub stop: Vec<String>,
@@ -191,6 +194,15 @@ pub struct EngineRequest {
     /// to [`EngineConfig::chat_template_defaults`]; raw inputs bypass the
     /// template and therefore reject explicit options.
     pub chat_template: ChatTemplateOptions,
+}
+
+impl EngineRequest {
+    /// Build the sampler with all request-local sampling parameters.
+    pub(crate) fn sampler(&self) -> Result<Sampler> {
+        let mut sampler = Sampler::new(self.sampling)?;
+        sampler.set_penalties(self.presence_penalty, self.frequency_penalty)?;
+        Ok(sampler)
+    }
 }
 
 /// Per-request serving behavior that does not change prompt or sampling
@@ -2724,7 +2736,7 @@ fn prepare_request(
 ) -> Option<(Vec<u32>, Sampler)> {
     let chat_template = job.request.chat_template.or(chat_template_defaults);
     if matches!(
-        job.request.input,
+        &job.request.input,
         EngineInput::RawPrompt(_) | EngineInput::TokenIds(_)
     ) && !job.request.chat_template.is_default()
     {
@@ -2857,7 +2869,7 @@ fn prepare_request(
         );
         return None;
     }
-    let sampler = match Sampler::new(job.request.sampling) {
+    let sampler = match job.request.sampler() {
         Ok(sampler) => sampler,
         Err(error) => {
             reject_preflight(
@@ -3503,6 +3515,8 @@ mod tests {
             InferenceJob {
                 request: EngineRequest {
                     input: EngineInput::Chat(vec![ChatMessage::user(prompt)]),
+                    presence_penalty: 0.0,
+                    frequency_penalty: 0.0,
                     sampling: SamplingConfig {
                         temperature: 0.0,
                         ..SamplingConfig::default()
@@ -3665,6 +3679,8 @@ mod tests {
         EngineRequest {
             input: EngineInput::Chat(vec![ChatMessage::user("hello")]),
             sampling: SamplingConfig::default(),
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             max_new_tokens: 1,
             ignore_stop_tokens: false,
             stop: Vec::new(),

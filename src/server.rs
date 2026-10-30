@@ -423,6 +423,8 @@ impl RawCompletionRequest {
         };
         let request = EngineRequest {
             input: EngineInput::RawPrompt(self.prompt),
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             sampling: SamplingConfig {
                 temperature: self.temperature,
                 top_k: self.top_k,
@@ -1010,6 +1012,8 @@ fn to_engine_request(
         EngineRequest {
             input,
             sampling,
+            presence_penalty: request.presence_penalty,
+            frequency_penalty: request.frequency_penalty,
             max_new_tokens,
             ignore_stop_tokens: false,
             stop,
@@ -2267,6 +2271,50 @@ mod tests {
         assert!(validate_raw_completion_metrics(&settings, &finished).is_ok());
         finished.finish_reason = FinishReason::Stop;
         assert!(validate_raw_completion_metrics(&settings, &finished).is_err());
+    }
+
+    #[tokio::test]
+    async fn presence_penalty_reaches_the_engine_sampler_and_invalid_values_are_400() {
+        let engine = Arc::new(FakeEngine::healthy(vec![EngineEvent::Finished(metrics(
+            FinishReason::Stop,
+        ))]));
+        let body = json!({"model":"test-model", "messages":[{"role":"user", "content":"hello"}], "temperature":0.0, "presence_penalty":1.5});
+        let response = router(engine.clone())
+            .oneshot(chat_request(&body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let request = engine.last_request.lock().unwrap().take().unwrap();
+        let mut sampler = request.sampler().unwrap();
+        let logits =
+            candle_core::Tensor::from_vec(vec![2.0_f32, 1.0], (1, 2), &candle_core::Device::Cpu)
+                .unwrap();
+        assert_eq!(
+            sampler
+                .sample_with_generated(&logits, &[0], &[], None)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sampler
+                .sample_with_generated(&logits, &[0, 0], &[0], None)
+                .unwrap(),
+            1
+        );
+        for field in ["presence_penalty", "frequency_penalty"] {
+            for value in [-2.01, 2.01] {
+                let mut invalid = body.clone();
+                invalid[field] = json!(value);
+                let response = router(engine.clone())
+                    .oneshot(chat_request(&invalid))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let error = body_json(response).await;
+                assert_eq!(error["error"]["code"], "invalid_value");
+                assert_eq!(error["error"]["param"], field);
+            }
+        }
     }
 
     #[tokio::test]

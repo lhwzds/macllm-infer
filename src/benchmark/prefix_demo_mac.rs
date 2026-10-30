@@ -747,6 +747,8 @@ fn token_request(token_ids: &[u32], max_new_tokens: usize) -> Result<(EngineRequ
     Ok((
         EngineRequest {
             input: EngineInput::TokenIds(input_token_ids),
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             sampling: SamplingConfig {
                 temperature: 0.0,
                 top_k: 0,

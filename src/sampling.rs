@@ -66,6 +66,8 @@ impl Default for SamplingConfig {
 pub struct Sampler {
     config: SamplingConfig,
     rng: ChaCha8Rng,
+    presence_penalty: f32,
+    frequency_penalty: f32,
 }
 
 impl Sampler {
@@ -85,7 +87,26 @@ impl Sampler {
         Ok(Self {
             rng: ChaCha8Rng::seed_from_u64(config.seed),
             config,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
         })
+    }
+
+    /// Set request-local OpenAI penalties, independently of legacy sampling profiles.
+    /// Use [`Self::sample_with_generated`] to supply the generated-only history;
+    /// the legacy sampling methods intentionally supply an empty generated history.
+    pub fn set_penalties(&mut self, presence: f32, frequency: f32) -> Result<()> {
+        ensure!(
+            presence.is_finite() && (-2.0..=2.0).contains(&presence),
+            "invalid presence_penalty"
+        );
+        ensure!(
+            frequency.is_finite() && (-2.0..=2.0).contains(&frequency),
+            "invalid frequency_penalty"
+        );
+        self.presence_penalty = presence;
+        self.frequency_penalty = frequency;
+        Ok(())
     }
 
     pub fn sample(&mut self, logits: &Tensor, history: &[u32]) -> Result<u32> {
@@ -96,6 +117,17 @@ impl Sampler {
         &mut self,
         logits: &Tensor,
         history: &[u32],
+        constraint: Option<&mut (dyn LogitsConstraint + 'static)>,
+    ) -> Result<u32> {
+        self.sample_with_generated(logits, history, &[], constraint)
+    }
+
+    /// Sample using full repetition history and the generated-only suffix separately.
+    pub fn sample_with_generated(
+        &mut self,
+        logits: &Tensor,
+        history: &[u32],
+        generated: &[u32],
         mut constraint: Option<&mut (dyn LogitsConstraint + 'static)>,
     ) -> Result<u32> {
         let (batch, vocab) = logits.dims2()?;
@@ -109,6 +141,12 @@ impl Sampler {
             "logit shape changed while reading values"
         );
         apply_repetition_penalty(&mut values, history, self.config.repetition_penalty);
+        apply_openai_penalties(
+            &mut values,
+            generated,
+            self.presence_penalty,
+            self.frequency_penalty,
+        );
         if let Some(constraint) = constraint.as_deref_mut() {
             if constraint.checks_tokens()
                 && let Some(token) = self.sample_checking_candidates(&values, constraint)?
@@ -382,6 +420,21 @@ fn sample_from_probabilities(probabilities: &[f32], target: f32) -> usize {
     argmax(probabilities)
 }
 
+fn apply_openai_penalties(logits: &mut [f32], generated: &[u32], presence: f32, frequency: f32) {
+    if (presence == 0.0 && frequency == 0.0) || generated.is_empty() {
+        return;
+    }
+    let mut counts = std::collections::HashMap::<u32, usize>::new();
+    for &token in generated {
+        *counts.entry(token).or_default() += 1;
+    }
+    for (token, count) in counts {
+        if let Some(logit) = logits.get_mut(token as usize) {
+            *logit -= frequency * count as f32 + presence;
+        }
+    }
+}
+
 fn apply_repetition_penalty(logits: &mut [f32], history: &[u32], penalty: f32) {
     if penalty <= 0.0 || (penalty - 1.0).abs() < f32::EPSILON {
         return;
@@ -575,11 +628,13 @@ mod tests {
         row: Row,
         allowed: Allowed,
         seed: u64,
+        penalties: (f32, f32),
     ) -> Result<[(Vec<u32>, usize); 2]> {
         let mut results = Vec::new();
         for checks in [true, false] {
             let mut inputs = ChaCha8Rng::seed_from_u64(seed ^ 0x5eed);
             let mut sampler = Sampler::new(SamplingConfig { seed, ..config })?;
+            sampler.set_penalties(penalties.0, penalties.1)?;
             let mut tokens = Vec::new();
             let mut masks = 0;
             for _ in 0..6 {
@@ -590,8 +645,9 @@ mod tests {
                     masks: 0,
                 };
                 let logits = Tensor::from_vec(logits, (1, VOCAB), &Device::Cpu)?;
-                tokens.push(sampler.sample_with_constraint(
+                tokens.push(sampler.sample_with_generated(
                     &logits,
+                    &tokens,
                     &tokens,
                     Some(&mut constraint),
                 )?);
@@ -601,6 +657,24 @@ mod tests {
         }
         let fast = results.remove(0);
         Ok([fast, results.remove(0)])
+    }
+
+    #[test]
+    fn openai_penalties_use_generated_counts_and_follow_repetition() {
+        let mut logits = vec![4.0, -2.0, 3.0, 1.0];
+        apply_repetition_penalty(&mut logits, &[0, 1, 2], 2.0);
+        apply_openai_penalties(&mut logits, &[1, 1, 2, 99], 1.5, 0.5);
+        assert_eq!(logits, vec![2.0, -6.5, -0.5, 1.0]);
+        let original = vec![-0.0_f32, f32::INFINITY, 3.0];
+        let mut unchanged = original.clone();
+        apply_openai_penalties(&mut unchanged, &[0, 1, 1], 0.0, 0.0);
+        assert_eq!(
+            unchanged.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            original.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+        let mut negative = vec![1.0, 2.0];
+        apply_openai_penalties(&mut negative, &[0, 0], -1.0, -0.5);
+        assert_eq!(negative, vec![3.0, 2.0]);
     }
 
     #[test]
@@ -629,27 +703,27 @@ mod tests {
                 repetition_penalty: 1.1,
                 seed: 0,
             };
-            let (mut fast_masks, mut full_masks) = (0, 0);
-            for row in rows {
-                for allowed in [Allowed::Dense, Allowed::Sparse] {
-                    for seed in 0..40 {
-                        let [fast, full] = run_both(config, row, allowed, seed)?;
-                        assert_eq!(
-                            fast.0, full.0,
-                            "T={temperature} k={top_k} p={top_p} {row:?} {allowed:?} seed={seed}"
-                        );
-                        fast_masks += fast.1;
-                        full_masks += full.1;
+            for penalties in [(0.0, 0.0), (1.5, 0.5), (-1.0, -0.75)] {
+                let (mut fast_masks, mut full_masks) = (0, 0);
+                for row in rows {
+                    for allowed in [Allowed::Dense, Allowed::Sparse] {
+                        for seed in 0..40 {
+                            let [fast, full] = run_both(config, row, allowed, seed, penalties)?;
+                            assert_eq!(
+                                fast.0, full.0,
+                                "T={temperature} k={top_k} p={top_p} {row:?} {allowed:?} seed={seed} penalties={penalties:?}"
+                            );
+                            fast_masks += fast.1;
+                            full_masks += full.1;
+                        }
                     }
                 }
+                // Verify that every penalty/setting combination exercises the fast path.
+                assert!(
+                    fast_masks < full_masks,
+                    "T={temperature} k={top_k} p={top_p} penalties={penalties:?}: {fast_masks} of {full_masks} steps masked"
+                );
             }
-            // Every setting must actually take the fast path for part of the
-            // matrix, or this test would compare the full mask with itself.
-            // Tied rows and sparse allowed sets mostly fall back by design.
-            assert!(
-                fast_masks < full_masks,
-                "T={temperature} k={top_k} p={top_p}: {fast_masks} of {full_masks} steps masked"
-            );
         }
         Ok(())
     }
@@ -670,19 +744,26 @@ mod tests {
         // Greedy, and top-k with enough allowed candidates, never mask.
         for config in [greedy, qwen] {
             assert_eq!(
-                run_both(config, Row::Continuous, Allowed::Dense, 3)?[0].1,
+                run_both(config, Row::Continuous, Allowed::Dense, 3, (0.0, 0.0))?[0].1,
                 0
             );
         }
         // A dominant allowed token decides top-p without knowing `K_A`.
         assert_eq!(
-            run_both(qwen, Row::Peaked { top_allowed: true }, Allowed::Sparse, 3)?[0].1,
+            run_both(
+                qwen,
+                Row::Peaked { top_allowed: true },
+                Allowed::Sparse,
+                3,
+                (0.0, 0.0)
+            )?[0]
+                .1,
             0
         );
         // Few allowed tokens and no dominant one: `K_A` is unknowable cheaply.
         let no_top_p = SamplingConfig { top_p: 1.0, ..qwen };
         assert_eq!(
-            run_both(no_top_p, Row::Continuous, Allowed::Sparse, 3)?[0].1,
+            run_both(no_top_p, Row::Continuous, Allowed::Sparse, 3, (0.0, 0.0))?[0].1,
             6
         );
         Ok(())

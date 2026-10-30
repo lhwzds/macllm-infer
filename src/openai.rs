@@ -158,6 +158,14 @@ impl ChatCompletionRequest {
             })
             .transpose()?;
 
+        for (name, value) in [
+            ("presence_penalty", self.presence_penalty),
+            ("frequency_penalty", self.frequency_penalty),
+        ] {
+            if value.is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value)) {
+                return Err(invalid_value(name, "penalty must be finite and in [-2, 2]"));
+            }
+        }
         reject_unsupported_fields(&self)?;
         let stop = normalize_stop_sequences(self.stop)?;
         let include_usage = match self.stream_options {
@@ -217,6 +225,8 @@ impl ChatCompletionRequest {
             max_completion_tokens,
             temperature,
             top_p,
+            presence_penalty: self.presence_penalty.unwrap_or(0.0) as f32,
+            frequency_penalty: self.frequency_penalty.unwrap_or(0.0) as f32,
             seed,
             stop,
             response_format,
@@ -502,6 +512,8 @@ pub struct ValidatedChatCompletionRequest {
     pub temperature: Option<f64>,
     /// `None` when the request omitted it; see `temperature`.
     pub top_p: Option<f64>,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
     pub seed: Option<u64>,
     pub stop: Vec<String>,
     pub response_format: Option<ResponseFormat>,
@@ -547,24 +559,6 @@ fn reject_unsupported_fields(request: &ChatCompletionRequest) -> Result<(), ApiE
     }
     if request.top_logprobs.is_some() {
         return Err(unsupported_field("top_logprobs"));
-    }
-    if request
-        .frequency_penalty
-        .is_some_and(|penalty| penalty != 0.0)
-    {
-        return Err(unsupported_value(
-            "frequency_penalty",
-            "non-zero frequency_penalty is not supported",
-        ));
-    }
-    if request
-        .presence_penalty
-        .is_some_and(|penalty| penalty != 0.0)
-    {
-        return Err(unsupported_value(
-            "presence_penalty",
-            "non-zero presence_penalty is not supported",
-        ));
     }
     Ok(())
 }
@@ -1902,12 +1896,7 @@ mod tests {
 
     #[test]
     fn explicitly_rejects_unsupported_request_features() {
-        let cases = [
-            ("logprobs", json!(true)),
-            ("top_logprobs", json!(2)),
-            ("frequency_penalty", json!(0.5)),
-            ("presence_penalty", json!(-0.5)),
-        ];
+        let cases = [("logprobs", json!(true)), ("top_logprobs", json!(2))];
 
         for (field, value) in cases {
             let mut request = json!({

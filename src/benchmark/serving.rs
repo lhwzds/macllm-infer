@@ -198,6 +198,8 @@ impl ServingRunSpec {
         EngineRequest {
             input: EngineInput::TokenIds(self.prompt_token_ids.clone()),
             sampling: self.sampling,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             max_new_tokens: self.completion_tokens,
             ignore_stop_tokens: self.ignore_stop_tokens,
             stop: Vec::new(),

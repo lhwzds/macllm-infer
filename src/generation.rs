@@ -1216,9 +1216,10 @@ impl GenerationCore {
             };
             return Ok(GenerationStep::advanced(consumed_tokens));
         }
-        let token = sampler.sample_with_constraint(
+        let token = sampler.sample_with_generated(
             &output.logits,
             &self.history,
+            &self.history[self.history.len() - self.generated_tokens..],
             constraint.as_deref_mut(),
         )?;
         if should_cancel() {
@@ -2516,6 +2517,69 @@ mod tests {
             )?;
         }
         assert_eq!(stepped_tokens, expected_tokens);
+        Ok(())
+    }
+
+    #[test]
+    fn generated_penalties_are_sequence_local_across_interleaved_steps() -> Result<()> {
+        let model = FakeModel::with_logits(8, vec![vec![2.0, 1.0, 0.0, -1.0]; 3]);
+        let make_sequence = || -> Result<GenerationSequence> {
+            let mut sampler = Sampler::new(SamplingConfig {
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                ..SamplingConfig::default()
+            })?;
+            sampler.set_penalties(1.5, 0.0)?;
+            GenerationSequence::new(
+                &model,
+                vec![0],
+                sampler,
+                GenerationConfig {
+                    max_new_tokens: 3,
+                    ignore_stop_tokens: true,
+                },
+            )
+        };
+        let mut first = make_sequence()?;
+        let mut second = make_sequence()?;
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        while !first.is_terminal() || !second.is_terminal() {
+            if !first.is_terminal() {
+                first.step(
+                    &model,
+                    || false,
+                    |token| {
+                        a.push(token);
+                        Ok(())
+                    },
+                )?;
+            }
+            if !second.is_terminal() {
+                second.step(
+                    &model,
+                    || false,
+                    |token| {
+                        b.push(token);
+                        Ok(())
+                    },
+                )?;
+            }
+        }
+        assert_eq!(a, vec![0, 1, 0]);
+        assert_eq!(a, b);
+        let mut fresh = make_sequence()?;
+        let mut c = Vec::new();
+        while !fresh.is_terminal() {
+            fresh.step(
+                &model,
+                || false,
+                |token| {
+                    c.push(token);
+                    Ok(())
+                },
+            )?;
+        }
+        assert_eq!(a, c);
         Ok(())
     }
 
