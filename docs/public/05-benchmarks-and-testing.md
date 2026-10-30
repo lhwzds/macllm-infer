@@ -4,6 +4,8 @@ title: Benchmarks, Gates and Contributing
 
 # Benchmarks, Gates and Contributing
 
+<sub>**English** · [中文](zh/05-benchmarks-and-testing.md)</sub>
+
 Claims in this project rest on two kinds of evidence. Checkpoint-pinned reference tests prove token-level correctness against `llama.cpp` or Candle. Manifest-pinned benchmarks under `macllm scoreboard`, `macllm demo` and `macllm bench` measure performance. Every measurement command refuses to run in an unoptimized build (`ensure_optimized_measurement_execution`), so use `--release`.
 
 <sub>Sources: [mod.rs:1](../../src/benchmark/mod.rs#L1) · [gemma_gguf_reference.rs:1-8](../../tests/gemma_gguf_reference.rs#L1-L8) · [main.rs:663-708](../../src/main.rs#L663-L708)</sub>

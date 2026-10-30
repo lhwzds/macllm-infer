@@ -4,6 +4,8 @@ title: Overview and Support Matrix
 
 # Overview and Support Matrix
 
+<sub>**English** · [中文](zh/01-overview.md)</sub>
+
 MacLLM Infer is a single Rust crate (`macllm-infer`, binary `macllm`) that runs text-only decoder LLMs on Apple Silicon through Candle, with Metal and Accelerate as default features. One shared decoder executes every supported family; family code is limited to thin adapters that translate a checkpoint's configuration, weight names and prompt template into a format-neutral spec. The same loaded model serves blocking CLI generation, Qwen3 embedding and reranking, and a long-lived HTTP worker. `llama.cpp` is used as the reference for GGUF parsing, greedy-token correctness and performance, never as a linked dependency.
 
 This page states exactly what the code accepts. See [Command-Line Usage](02-cli.md) for usage, [How It Works](04-how-it-works.md) for the design, and [Code structure](structure.md) for the module map.

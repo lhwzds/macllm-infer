@@ -4,6 +4,8 @@ title: Command-Line Usage
 
 # Command-Line Usage
 
+<sub>**English** · [中文](zh/02-cli.md)</sub>
+
 The `macllm` binary has nine subcommands: `download`, `inspect`, `run`, `embed`, `rerank`, `bench`, `scoreboard`, `demo` and `serve`. All flags below are copied from the clap definitions in `src/main.rs`. There are no runtime environment variables; the `MACLLM_*` variables in the code only point the ignored reference tests at fixture files (see [Benchmarks, Gates and Contributing](05-benchmarks-and-testing.md)). `serve` is covered in [HTTP Server and API Subset](03-http-api.md); `bench`, `scoreboard` and `demo` in [Benchmarks, Gates and Contributing](05-benchmarks-and-testing.md).
 
 <sub>Sources: [main.rs:44-78](../../src/main.rs#L44-L78)</sub>

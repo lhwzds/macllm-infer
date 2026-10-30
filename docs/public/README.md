@@ -4,6 +4,8 @@ title: macllm-infer
 
 # macllm-infer
 
+<sub>**English** · [中文](zh/README.md)</sub>
+
 These docs go one level below the README of MacLLM Infer, a Rust, Apple
 Silicon-first, text-only LLM runtime. They state what the code at this commit
 actually supports (which formats and architectures, which CLI flags and HTTP
@@ -24,4 +26,4 @@ performance claims. They describe current capabilities only.
 
 - [Code structure](structure.md) — generated from the code: areas, dependencies, pages
 
-<sub>Generated from https://github.com/lhwzds/macllm-infer @ `408e302e89`</sub>
+<sub>Generated from https://github.com/lhwzds/macllm-infer @ `15bfbd64e8`</sub>

@@ -4,6 +4,8 @@ title: HTTP Server and API Subset
 
 # HTTP Server and API Subset
 
+<sub>**English** · [中文](zh/03-http-api.md)</sub>
+
 `macllm serve` loads one model on a dedicated worker thread and serves it over HTTP/1 with axum until Ctrl-C. It binds to loopback by default and has no authentication or TLS of its own. Embedding and reranking are not served; use the CLI ([Command-Line Usage](02-cli.md)).
 
 | Flag | Default | Meaning |

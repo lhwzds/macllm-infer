@@ -4,6 +4,8 @@ title: macllm-infer — All pages
 
 # macllm-infer
 
+<sub>**English** · [中文](zh/all.md)</sub>
+
 These docs go one level below the README of MacLLM Infer, a Rust, Apple
 Silicon-first, text-only LLM runtime. They state what the code at this commit
 actually supports (which formats and architectures, which CLI flags and HTTP
@@ -332,7 +334,7 @@ In scope: 96 files, 92,879 lines; excluded `tests/fixtures/**`, `Cargo.lock`, `L
   Explained in: [Overview and Support Matrix](#overview) (1), [How It Works](#how-it-works) (1)
 - `benchmarks/` — 144 lines, 3 files\
   Explained in: [Benchmarks, Gates and Contributing](#benchmarks-and-testing) (2)
-- `scripts/` — 25 lines, 1 files\
+- `scripts/` — 25 lines, 1 file\
   Hub files: `bench-llama-cpp.sh`\
   Explained in: [Benchmarks, Gates and Contributing](#benchmarks-and-testing) (1)
 - `tests/` — 7,137 lines, 23 files\
