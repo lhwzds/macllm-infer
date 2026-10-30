@@ -1,0 +1,33 @@
+<|im_start|>system
+You are a careful coding agent.
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"type": "function", "function": {"name": "shell", "description": "Run a shell command and return its exit code and output.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call><|im_end|>
+<|im_start|>user
+List the files in the current directory.<|im_end|>
+<|im_start|>assistant
+<think>
+I should list the files.
+</think>
+
+Let me check.
+<tool_call>
+{"name": "shell", "arguments": {"command": "ls -la"}}
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+a.txt
+b.txt
+</tool_response><|im_end|>
+<|im_start|>assistant
