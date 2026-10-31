@@ -1,9 +1,9 @@
 ---
 title: macllm-infer
 repo: ..
+out: docs/public
 commit: 15bfbd64e8d588d4ad54c9cc535a623dea5e129b
 remote: https://github.com/lhwzds/macllm-infer
-out: docs/public
 lang: en
 max_pages: 8
 max_page_words: 900

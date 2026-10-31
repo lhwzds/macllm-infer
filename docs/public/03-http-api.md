@@ -48,11 +48,11 @@ Unknown JSON fields are a 400, and known-but-unsupported fields return an OpenAI
 - `temperature` defaults to 1.0 within [0, 2]; `top_p` defaults to 1.0 within (0, 1]; `seed` must be non-negative. The server fixes `top_k` to 0 and repetition penalty to 1.0.
 - `stop` takes a string or up to 4 strings.
 - `stream` with `stream_options.include_usage`; `include_obfuscation=true` is rejected.
-- Roles: `system`, `user`, `assistant`. `developer`, `name`, multimodal content, `logprobs`, `top_logprobs` and non-zero `frequency_penalty`/`presence_penalty` are rejected.
+- Roles: `system`, `user`, `assistant`, and `tool` in tool-call histories (string content and a `tool_call_id` answering the preceding assistant turn's single tool call). `function`, `developer`, `name`, multimodal content, `logprobs`, `top_logprobs` and non-zero `frequency_penalty`/`presence_penalty` are rejected.
 
 `usage.prompt_tokens_details.cached_tokens` reports how many prompt tokens came from the prefix cache.
 
-<sub>Sources: [openai.rs:19-72](../../src/openai.rs#L19-L72) · [openai.rs:90-170](../../src/openai.rs#L90-L170) · [openai.rs:489-515](../../src/openai.rs#L489-L515) · [openai.rs:815-870](../../src/openai.rs#L815-L870) · [server.rs:793-802](../../src/server.rs#L793-L802) · +4</sub>
+<sub>Sources: [openai.rs:19-72](../../src/openai.rs#L19-L72) · [openai.rs:90-170](../../src/openai.rs#L90-L170) · [openai.rs:489-515](../../src/openai.rs#L489-L515) · [openai.rs:815-870](../../src/openai.rs#L815-L870) · [server.rs:793-802](../../src/server.rs#L793-L802) · +5</sub>
 
 ## Structured output and tool calls
 

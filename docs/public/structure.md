@@ -14,7 +14,7 @@ In scope: 96 files, 92,879 lines; excluded `tests/fixtures/**`, `Cargo.lock`, `L
 
 **Repository root**
 
-- (files) — 304 lines, 3 files. An Apple Silicon-first Rust LLM inference runtime\
+- (root files) — 304 lines, 3 files. An Apple Silicon-first Rust LLM inference runtime\
   Hub files: `build.rs`\
   Explained in: [Overview and Support Matrix](01-overview.md) (1), [How It Works](04-how-it-works.md) (1)
 - `benchmarks/` — 144 lines, 3 files\

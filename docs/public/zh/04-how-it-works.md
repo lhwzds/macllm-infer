@@ -36,7 +36,7 @@ flowchart LR
 
 `ModelFiles::weight_source` 通过 Candle 的 `VarBuilder` 对 Safetensors 做内存映射。GGUF 走项目自己的解析器和基于 mmap 的 `GgufWeightSource`，块量化矩阵在模型构建期间始终保持压缩，并以 `QMatMul` 运行。启用 `metal` feature 时，`file_backed_quant` 把每个 GGUF 分片的只读映射包装成一个共享的 Metal buffer，并按文件偏移绑定每个张量。而 Candle 自带的加载器会把每个权重复制到匿名 buffer 中，使整个模型都变成 dirty 的统一内存。
 
-正因如此，模型加载期间不能修改模型文件；加载器因此是 `unsafe` 的。加载完成后，会请求 macOS 归还构建 tokenizer 和元数据时释放的内存页（`malloc_zone_pressure_relief`）。
+因此，由模型文件构建的模型存续期间，文件不得被修改或截断（加载器因此是 `unsafe` 的）；GGUF 保留已打开的文件句柄，解析后替换 GGUF 路径是安全的。加载完成后，会请求 macOS 归还构建 tokenizer 和元数据时释放的内存页（`malloc_zone_pressure_relief`）。
 
 <sub>来源: [weights.rs:240-275](../../../src/weights.rs#L240-L275) · [file_backed_quant.rs:1-6](../../../src/file_backed_quant.rs#L1-L6) · [model_weights.rs:1-40](../../../src/model_weights.rs#L1-L40) · [model_weights.rs:305-306](../../../src/model_weights.rs#L305-L306) · [runtime.rs:113-128](../../../src/runtime.rs#L113-L128)</sub>
 
@@ -46,9 +46,9 @@ flowchart LR
 
 Worker 按轮执行 continuous batching。每轮最多访问 `--max-active-sequences` 个活跃序列。每个序列最多分到 `--prefill-token-quantum` 个输入 token，一轮在达到 `--scheduler-token-budget` 时结束。所有被访问的 lane 作为一次 packed ragged 前向计算执行。Decode lane 只占一个 token，因此长 prompt 会被分块，不会饿死正在进行的生成。客户端在 `--event-send-timeout-seconds` 内一直不消费事件的 lane 会被取消。
 
-循环内的任何错误或 panic 都会让 worker 进入 poisoned 状态（`/healthz` 报告 `poisoned`），而不是带着可能不一致的模型状态继续运行。
+panic，或者从准入、共享的 `drive_once` 步骤中逃逸出来的错误（例如模型前向计算失败），会让 worker 进入 poisoned 状态（`/healthz` 报告 `poisoned`），并使活跃和排队中的请求失败。请求本地的失败（非法采样参数、单个 lane 的 KV cache 耗尽、未完成的 JSON schema 输出）只会让该请求失败（`request_local_preflight_failure_does_not_poison_the_worker`）。
 
-<sub>来源: [runtime.rs:52-55](../../../src/runtime.rs#L52-L55) · [engine.rs:773-822](../../../src/engine.rs#L773-L822) · [engine.rs:1452-1522](../../../src/engine.rs#L1452-L1522) · [engine.rs:1795-1822](../../../src/engine.rs#L1795-L1822) · [engine.rs:1860-1945](../../../src/engine.rs#L1860-L1945) · +2</sub>
+<sub>来源: [runtime.rs:52-55](../../../src/runtime.rs#L52-L55) · [engine.rs:773-822](../../../src/engine.rs#L773-L822) · [engine.rs:1452-1522](../../../src/engine.rs#L1452-L1522) · [engine.rs:1795-1822](../../../src/engine.rs#L1795-L1822) · [engine.rs:1860-1945](../../../src/engine.rs#L1860-L1945) · +6</sub>
 
 ## K/V cache 布局
 

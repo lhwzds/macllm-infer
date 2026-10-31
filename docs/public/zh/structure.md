@@ -14,7 +14,7 @@ title: 代码结构
 
 **仓库根目录**
 
-- （直接文件） — 304 行，3 个文件。An Apple Silicon-first Rust LLM inference runtime\
+- （根目录文件） — 304 行，3 个文件。An Apple Silicon-first Rust LLM inference runtime\
   核心文件：`build.rs`\
   讲解：[概览与支持矩阵](01-overview.md) (1), [工作原理](04-how-it-works.md) (1)
 - `benchmarks/` — 144 行，3 个文件\

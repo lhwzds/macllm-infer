@@ -48,11 +48,11 @@ title: HTTP 服务与 API 子集
 - `temperature` 默认 1.0，范围 [0, 2]；`top_p` 默认 1.0，范围 (0, 1]；`seed` 必须非负。服务端把 `top_k` 固定为 0，重复惩罚固定为 1.0。
 - `stop` 接受一个字符串或最多 4 个字符串。
 - `stream` 支持 `stream_options.include_usage`；`include_obfuscation=true` 会被拒绝。
-- 角色：`system`、`user`、`assistant`。`developer`、`name`、多模态内容、`logprobs`、`top_logprobs` 和非零的 `frequency_penalty`/`presence_penalty` 都会被拒绝。
+- 角色：`system`、`user`、`assistant`，以及工具调用历史中的 `tool`（字符串内容加上一个 `tool_call_id`，回应前一个 assistant 轮次中唯一的工具调用）。`function`、`developer`、`name`、多模态内容、`logprobs`、`top_logprobs` 和非零的 `frequency_penalty`/`presence_penalty` 都会被拒绝。
 
 `usage.prompt_tokens_details.cached_tokens` 报告有多少 prompt token 来自 prefix cache。
 
-<sub>来源: [openai.rs:19-72](../../../src/openai.rs#L19-L72) · [openai.rs:90-170](../../../src/openai.rs#L90-L170) · [openai.rs:489-515](../../../src/openai.rs#L489-L515) · [openai.rs:815-870](../../../src/openai.rs#L815-L870) · [server.rs:793-802](../../../src/server.rs#L793-L802) · +4</sub>
+<sub>来源: [openai.rs:19-72](../../../src/openai.rs#L19-L72) · [openai.rs:90-170](../../../src/openai.rs#L90-L170) · [openai.rs:489-515](../../../src/openai.rs#L489-L515) · [openai.rs:815-870](../../../src/openai.rs#L815-L870) · [server.rs:793-802](../../../src/server.rs#L793-L802) · +5</sub>
 
 ## 结构化输出和 tool call
 

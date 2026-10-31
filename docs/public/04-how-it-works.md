@@ -34,9 +34,9 @@ A `DecoderSpec` is a list of per-layer specs. Each layer picks a `SequenceMixerS
 
 ## Loading weights without copying them
 
-`ModelFiles::weight_source` memory-maps Safetensors through Candle's `VarBuilder`. GGUF goes through the project's own parser and an mmap-backed `GgufWeightSource`, and block-quantized matrices stay compressed through model build and run as `QMatMul`. With the `metal` feature, `file_backed_quant` wraps each GGUF shard's read-only mapping in one shared Metal buffer and binds each tensor at its file offset. Candle's stock loader would instead copy every weight into an anonymous buffer, turning the whole model into dirty unified memory.
+`ModelFiles::weight_source` memory-maps Safetensors through Candle's `VarBuilder`. GGUF goes through the project's own parser and an mmap-backed `GgufWeightSource`, and block-quantized matrices stay compressed through model build and run as `QMatMul`. With the `metal` feature, `file_backed_quant` wraps each GGUF shard's read-only mapping in one shared Metal buffer and binds each tensor at its file offset. Candle's stock loader would copy every weight into an anonymous buffer, making the model dirty unified memory.
 
-Because of this, model files must not be modified while a model is loaded; the loader is `unsafe` for that reason. After loading, macOS is asked to return the pages freed by tokenizer and metadata construction (`malloc_zone_pressure_relief`).
+Model files must therefore stay unmodified and untruncated while a model built from them is alive (the loader is `unsafe`); GGUF keeps its opened handle, so replacing its path after parsing is safe. After loading, macOS is asked to return the pages freed by tokenizer and metadata construction (`malloc_zone_pressure_relief`).
 
 <sub>Sources: [weights.rs:240-275](../../src/weights.rs#L240-L275) · [file_backed_quant.rs:1-6](../../src/file_backed_quant.rs#L1-L6) · [model_weights.rs:1-40](../../src/model_weights.rs#L1-L40) · [model_weights.rs:305-306](../../src/model_weights.rs#L305-L306) · [runtime.rs:113-128](../../src/runtime.rs#L113-L128)</sub>
 
@@ -46,9 +46,9 @@ The runtime does not require models to be `Send`, so `EngineHandle::start` build
 
 The worker runs continuous batching in rounds. In each round it visits up to `--max-active-sequences` active sequences. Each sequence gets at most `--prefill-token-quantum` input tokens, and the round stops at `--scheduler-token-budget`. All visited lanes run as one packed ragged forward. Decode lanes cost one token, so long prompts are chunked and cannot starve running generations. A lane whose client stops draining events for `--event-send-timeout-seconds` is cancelled.
 
-Any error or panic inside the loop poisons the worker (`/healthz` reports `poisoned`) instead of continuing with model state that may be inconsistent.
+A panic, or an error escaping admission or the shared `drive_once` step (a failed forward), poisons the worker (`/healthz` reports `poisoned`) and fails active and queued requests. Request-local failures (invalid sampling, one lane's KV-cache exhaustion, incomplete JSON-schema output) fail only that request (`request_local_preflight_failure_does_not_poison_the_worker`).
 
-<sub>Sources: [runtime.rs:52-55](../../src/runtime.rs#L52-L55) · [engine.rs:773-822](../../src/engine.rs#L773-L822) · [engine.rs:1452-1522](../../src/engine.rs#L1452-L1522) · [engine.rs:1795-1822](../../src/engine.rs#L1795-L1822) · [engine.rs:1860-1945](../../src/engine.rs#L1860-L1945) · +2</sub>
+<sub>Sources: [runtime.rs:52-55](../../src/runtime.rs#L52-L55) · [engine.rs:773-822](../../src/engine.rs#L773-L822) · [engine.rs:1452-1522](../../src/engine.rs#L1452-L1522) · [engine.rs:1795-1822](../../src/engine.rs#L1795-L1822) · [engine.rs:1860-1945](../../src/engine.rs#L1860-L1945) · +6</sub>
 
 ## K/V cache layout
 
