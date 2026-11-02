@@ -44,7 +44,7 @@ use crate::{
         ValidatedChatCompletionRequest, ValidatedMessages,
     },
     sampling::SamplingConfig,
-    tool_call::{SplitEnd, TOOL_CALL_OPEN, ToolCallScan, ToolCallSplitter, scan_tool_call},
+    tool_call::{PromptThinking, TOOL_CALL_CLOSE, TurnSplitter},
 };
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -89,6 +89,30 @@ pub struct ServerOptions {
     pub default_max_completion_tokens: usize,
     /// Sampling values for fields a request omits.
     pub sampling_profile: SamplingProfile,
+    /// How the server reports the thinking text of a model that reasons.
+    pub reasoning_format: ReasoningFormat,
+}
+
+/// How the server reports the thinking text of a model that reasons.
+///
+/// `Deepseek` matches llama.cpp's default and vLLM: the thinking block is
+/// reported separately as `reasoning_content` and never appears in the
+/// answer. `None` keeps the thinking block inside the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningFormat {
+    /// Report the thinking block as `reasoning_content`.
+    #[default]
+    Deepseek,
+    /// Keep the thinking block inside the answer.
+    None,
+}
+
+impl ReasoningFormat {
+    /// Whether the thinking block is split out of the answer.
+    #[must_use]
+    pub const fn splits_reasoning(self) -> bool {
+        matches!(self, Self::Deepseek)
+    }
 }
 
 impl ServerOptions {
@@ -100,6 +124,7 @@ impl Default for ServerOptions {
         Self {
             default_max_completion_tokens: Self::DEFAULT_MAX_COMPLETION_TOKENS,
             sampling_profile: SamplingProfile::default(),
+            reasoning_format: ReasoningFormat::default(),
         }
     }
 }
@@ -123,11 +148,11 @@ pub struct SamplingDefaults {
 /// cannot express.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SamplingProfile {
-    /// The `OpenAI` defaults: temperature 1, top_p 1, no top-k.
+    /// The `OpenAI` defaults: temperature 1, `top_p` 1, no top-k.
     #[default]
     OpenAi,
-    /// The Qwen3 model card's recommendation: temperature 0.6, top_p 0.95,
-    /// top_k 20 when thinking; 0.7, 0.8, 20 when not.
+    /// The Qwen3 model card's recommendation: temperature 0.6, `top_p` 0.95,
+    /// `top_k` 20 when thinking; 0.7, 0.8, 20 when not.
     Qwen3,
     /// Qwen3.5 model card defaults, including presence penalty.
     Qwen35,
@@ -338,6 +363,7 @@ struct RawCompletionRequest {
 }
 
 impl RawCompletionRequest {
+    #[allow(clippy::too_many_lines)]
     fn validate(
         self,
         max_context: usize,
@@ -833,8 +859,9 @@ fn engine_failure_response(kind: EngineFailureKind, message: String) -> Response
     api_error(status, engine_failure_error(kind, message))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Response {
-    let request = match ChatCompletionRequest::from_json(&body) {
+    let mut request = match ChatCompletionRequest::from_json(&body) {
         Ok(request) => request,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
     };
@@ -853,6 +880,33 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
                 Some("invalid_value".to_owned()),
             ),
         );
+    }
+    if !supports_reasoning_history(&metadata.family)
+        && let Some(index) = request.messages.iter().position(|message| {
+            message
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|reasoning| !reasoning.is_empty())
+        })
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            ApiError::invalid_request(
+                format!(
+                    "the `{}` chat template does not render assistant `reasoning_content` history",
+                    metadata.family
+                ),
+                Some(format!("messages.{index}.reasoning_content")),
+                Some("unsupported_value".to_owned()),
+            ),
+        );
+    }
+    if !supports_reasoning_history(&metadata.family) {
+        for message in &mut request.messages {
+            if message.reasoning_content.as_deref() == Some("") {
+                message.reasoning_content = None;
+            }
+        }
     }
     let request = match request.validate(
         &metadata.served_model,
@@ -885,6 +939,13 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         .enable_thinking
         != Some(false);
     let sampling = state.options.sampling_profile.defaults(thinking);
+    // The prompt decides how the turn starts: a template that ends inside
+    // `<think>` makes the model continue the reasoning the prompt started.
+    let prompt_thinking = if thinking && metadata.opens_thinking_block {
+        PromptThinking::Open
+    } else {
+        PromptThinking::Closed
+    };
     let (engine_request, output) = match to_engine_request_with_syntax(
         request,
         identity.default_seed,
@@ -917,11 +978,40 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         return api_error(status, error);
     }
 
+    let prompt_thinking = match ticket.prompt_opens_thinking() {
+        Some(true) => PromptThinking::Open,
+        Some(false) => PromptThinking::Closed,
+        None => prompt_thinking,
+    };
+
     if stream_response {
-        streaming_response(ticket, identity, include_usage, output).into_response()
+        streaming_response(
+            ticket,
+            identity,
+            include_usage,
+            output,
+            state.options.reasoning_format,
+            prompt_thinking,
+        )
+        .into_response()
     } else {
-        non_streaming_response(ticket, identity, output).await
+        non_streaming_response(
+            ticket,
+            identity,
+            output,
+            state.options.reasoning_format,
+            prompt_thinking,
+        )
+        .await
     }
+}
+
+/// Whether the model's chat template renders assistant reasoning history.
+///
+/// The Qwen3 and Qwen3.5 templates read `message.reasoning_content` and
+/// render the turn as if its content carried the thinking block.
+fn supports_reasoning_history(family: &str) -> bool {
+    matches!(family, "qwen3" | "qwen3moe" | "qwen35")
 }
 
 /// How the HTTP layer turns generated text into one assistant message.
@@ -947,6 +1037,7 @@ fn to_engine_request(
     to_engine_request_with_syntax(request, request_default_seed, defaults, false)
 }
 
+#[allow(clippy::too_many_lines)]
 fn to_engine_request_with_syntax(
     request: ValidatedChatCompletionRequest,
     request_default_seed: u64,
@@ -1172,10 +1263,13 @@ impl RequestIdentity {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn non_streaming_response(
     mut ticket: EngineTicket,
     identity: RequestIdentity,
     output: AssistantOutput,
+    format: ReasoningFormat,
+    prompt: PromptThinking,
 ) -> Response {
     let mut content = String::new();
     while let Some(event) = ticket.recv().await {
@@ -1184,16 +1278,6 @@ async fn non_streaming_response(
                 content: fragment, ..
             } => content.push_str(&fragment),
             EngineEvent::Finished(metrics) => {
-                if matches!(output, AssistantOutput::ForcedCall { .. })
-                    && metrics.finish_reason != crate::generation::FinishReason::Stop
-                {
-                    return api_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        ApiError::server_error(
-                            "forced tool generation reached its length limit before a stop token",
-                        ),
-                    );
-                }
                 let Some(finish_reason) = ChatFinishReason::from_generation(metrics.finish_reason)
                 else {
                     return api_error(
@@ -1206,43 +1290,108 @@ async fn non_streaming_response(
                     metrics.generated_tokens,
                     metrics.cached_prompt_tokens,
                 );
-                let call = match &output {
-                    AssistantOutput::Text => Ok(None),
-                    AssistantOutput::ForcedCall { name } => {
-                        validated_arguments(&content).map(|arguments| {
-                            Some((
-                                None,
-                                AssistantFunctionCall {
-                                    name: name.clone(),
-                                    arguments,
-                                },
-                            ))
-                        })
+                // A call that the token budget cut short is never exposed as
+                // a call: the turn simply ends at its length limit.
+                let length_limited = metrics.finish_reason == FinishReason::Length;
+                let response = match &output {
+                    AssistantOutput::Text => {
+                        let (reasoning, answer, _) = split_answer(&content, format, prompt, false);
+                        ChatCompletionResponse::new(
+                            identity.id.clone(),
+                            identity.created,
+                            identity.model.clone(),
+                            answer,
+                            reasoning,
+                            finish_reason,
+                            usage,
+                        )
                     }
-                    AssistantOutput::AutoCall { calls } => split_auto_call(&content, calls),
-                };
-                let response = match call {
-                    Ok(Some((content, function))) => ChatCompletionResponse::tool_call(
-                        identity.id.clone(),
-                        identity.created,
-                        identity.model,
-                        content,
-                        AssistantToolCall {
-                            id: tool_call_id(&identity.id),
-                            kind: FunctionToolKind::Function,
-                            function,
-                        },
-                        usage,
-                    ),
-                    Ok(None) => ChatCompletionResponse::new(
-                        identity.id,
-                        identity.created,
-                        identity.model,
-                        content,
-                        finish_reason,
-                        usage,
-                    ),
-                    Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+                    AssistantOutput::ForcedCall { name } => {
+                        // The arguments are checked first: a call that is
+                        // complete at the length boundary is still a call.
+                        match validated_arguments(&content) {
+                            Ok(arguments) => ChatCompletionResponse::tool_call(
+                                identity.id.clone(),
+                                identity.created,
+                                identity.model.clone(),
+                                None,
+                                None,
+                                AssistantToolCall {
+                                    id: tool_call_id(&identity.id),
+                                    kind: FunctionToolKind::Function,
+                                    function: AssistantFunctionCall {
+                                        name: name.clone(),
+                                        arguments,
+                                    },
+                                },
+                                usage,
+                            ),
+                            Err(error) => {
+                                if length_limited && arguments_are_incomplete(&content) {
+                                    // The token budget cut the arguments
+                                    // short: the turn ends at its length
+                                    // limit and exposes no call.
+                                    ChatCompletionResponse::new(
+                                        identity.id.clone(),
+                                        identity.created,
+                                        identity.model.clone(),
+                                        "",
+                                        None,
+                                        finish_reason,
+                                        usage,
+                                    )
+                                } else {
+                                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+                                }
+                            }
+                        }
+                    }
+                    AssistantOutput::AutoCall { calls } => {
+                        let (reasoning, answer, call) =
+                            split_answer(&content, format, prompt, true);
+                        match call {
+                            None => ChatCompletionResponse::new(
+                                identity.id.clone(),
+                                identity.created,
+                                identity.model.clone(),
+                                answer,
+                                reasoning,
+                                finish_reason,
+                                usage,
+                            ),
+                            Some(after_open) => match auto_call_function(&after_open, calls) {
+                                Ok(function) => ChatCompletionResponse::tool_call(
+                                    identity.id.clone(),
+                                    identity.created,
+                                    identity.model.clone(),
+                                    (!answer.is_empty()).then_some(answer),
+                                    reasoning,
+                                    AssistantToolCall {
+                                        id: tool_call_id(&identity.id),
+                                        kind: FunctionToolKind::Function,
+                                        function,
+                                    },
+                                    usage,
+                                ),
+                                Err(_error)
+                                    if length_limited && call_is_incomplete(&after_open) =>
+                                {
+                                    ChatCompletionResponse::new(
+                                        identity.id.clone(),
+                                        identity.created,
+                                        identity.model.clone(),
+                                        answer,
+                                        reasoning,
+                                        finish_reason,
+                                        usage,
+                                    )
+                                }
+                                Err(error) => {
+                                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+                                }
+                            },
+                        }
+                    }
                 };
                 return (StatusCode::OK, Json(response)).into_response();
             }
@@ -1275,30 +1424,39 @@ async fn non_streaming_response(
     )
 }
 
+/// Split a generated turn into its reasoning and its visible answer.
+///
+/// A turn without reasoning reports none: the key is left out of the
+/// response instead of carrying an empty string.
+fn split_answer(
+    text: &str,
+    format: ReasoningFormat,
+    prompt: PromptThinking,
+    scan_calls: bool,
+) -> (Option<String>, String, Option<String>) {
+    let mut splitter = TurnSplitter::new(format.splits_reasoning(), prompt, scan_calls);
+    let mut chunks = splitter.push(text);
+    let end = splitter.finish();
+    chunks.reasoning.push_str(&end.reasoning);
+    chunks.content.push_str(&end.content);
+    let reasoning = end.has_reasoning.then_some(chunks.reasoning);
+    (reasoning, chunks.content, end.call)
+}
+
+/// Whether a native call was cut short by the token budget.
+///
+/// A call whose closing tag never arrived is incomplete: the model ran out
+/// of tokens inside the envelope. A call that closed but does not parse or
+/// validate is malformed, not truncated, and stays an error.
+fn call_is_incomplete(after_open: &str) -> bool {
+    !after_open.trim_end().ends_with(TOOL_CALL_CLOSE)
+}
+
 fn tool_call_id(request_id: &str) -> String {
     format!(
         "call_{}",
         request_id.strip_prefix("chatcmpl-").unwrap_or(request_id)
     )
-}
-
-/// Separate the visible content of an automatic turn from the one native
-/// call it may end with. Content is the text before the opening tag without
-/// the separating whitespace, or `None` when nothing precedes the call. Any
-/// opened call that fails to parse or validate is a server error: it is never
-/// returned as content, where a client would mistake it for a final answer.
-fn split_auto_call(
-    text: &str,
-    calls: &CompiledToolCalls,
-) -> std::result::Result<Option<(Option<String>, AssistantFunctionCall)>, ApiError> {
-    match scan_tool_call(text) {
-        ToolCallScan::Text { .. } => Ok(None),
-        ToolCallScan::Call { content_end, open } => {
-            let function = auto_call_function(&text[open + TOOL_CALL_OPEN.len()..], calls)?;
-            let content = (content_end > 0).then(|| text[..content_end].to_owned());
-            Ok(Some((content, function)))
-        }
-    }
 }
 
 fn auto_call_function(
@@ -1314,6 +1472,12 @@ fn auto_call_function(
         name: call.name,
         arguments: call.arguments_text,
     })
+}
+
+/// Only unfinished JSON is excused at a token-budget boundary. A complete
+/// but malformed value remains an error, just as it does on EOS.
+fn arguments_are_incomplete(arguments: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(arguments).is_err_and(|error| error.is_eof())
 }
 
 fn validated_arguments(arguments: &str) -> std::result::Result<String, ApiError> {
@@ -1335,17 +1499,23 @@ fn streaming_response(
     identity: RequestIdentity,
     include_usage: bool,
     output: AssistantOutput,
+    format: ReasoningFormat,
+    prompt: PromptThinking,
 ) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
+    // Only a turn that can open a native call looks for one: an answer that
+    // mentions the tag is ordinary content.
+    let scan_calls = matches!(output, AssistantOutput::AutoCall { .. });
     let state = StreamState {
         ticket,
         identity,
         include_usage,
         role_sent: false,
+        reasoning_sent: false,
         terminal: false,
         pending: VecDeque::new(),
         output,
         buffered_tool_arguments: String::new(),
-        splitter: ToolCallSplitter::default(),
+        splitter: TurnSplitter::new(format.splits_reasoning(), prompt, scan_calls),
     };
     Sse::new(stream::unfold(state, next_stream_event)).keep_alive(
         KeepAlive::new()
@@ -1359,14 +1529,16 @@ struct StreamState {
     identity: RequestIdentity,
     include_usage: bool,
     role_sent: bool,
+    reasoning_sent: bool,
     terminal: bool,
     pending: VecDeque<Event>,
     output: AssistantOutput,
     /// Forced calls stream nothing until their arguments are complete.
     buffered_tool_arguments: String,
-    /// Automatic calls stream content and withhold everything from the
-    /// opening tag on until the call has been validated.
-    splitter: ToolCallSplitter,
+    /// The turn's reasoning and visible text are streamed separately, and
+    /// everything from a call's opening tag on is withheld until the call
+    /// has been validated.
+    splitter: TurnSplitter,
 }
 
 impl StreamState {
@@ -1376,6 +1548,28 @@ impl StreamState {
             self.identity.created,
             self.identity.model.clone(),
         ))
+    }
+
+    /// Queue the reasoning of a turn as one `reasoning_content` delta.
+    fn push_reasoning(&mut self, reasoning: &str) {
+        self.reasoning_sent = true;
+        let reasoning = reasoning.to_owned();
+        let chunk = self.chunk_event(|id, created, model| {
+            ChatCompletionChunk::reasoning(id, created, model, reasoning)
+        });
+        self.pending.push_back(chunk);
+    }
+
+    /// Queue visible text of a turn as one `content` delta.
+    fn push_content(&mut self, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+        let content = content.to_owned();
+        let chunk = self.chunk_event(|id, created, model| {
+            ChatCompletionChunk::content(id, created, model, content)
+        });
+        self.pending.push_back(chunk);
     }
 
     /// Queue one validated call as `OpenAI` tool-call deltas: the header with
@@ -1423,80 +1617,114 @@ async fn next_stream_event(
             Some(EngineEvent::Text {
                 content: fragment, ..
             }) => {
-                let fragment = match &state.output {
-                    AssistantOutput::Text => fragment,
-                    AssistantOutput::ForcedCall { .. } => {
-                        state.buffered_tool_arguments.push_str(&fragment);
-                        continue;
-                    }
-                    AssistantOutput::AutoCall { .. } => {
-                        let safe = state.splitter.push(&fragment);
-                        if safe.is_empty() {
-                            continue;
-                        }
-                        safe
-                    }
-                };
-                let chunk = ChatCompletionChunk::content(
-                    state.identity.id.clone(),
-                    state.identity.created,
-                    state.identity.model.clone(),
-                    fragment,
-                );
-                return Some((Ok(json_event(&chunk)), state));
+                if matches!(state.output, AssistantOutput::ForcedCall { .. }) {
+                    // Forced calls stream nothing until their arguments are
+                    // complete.
+                    state.buffered_tool_arguments.push_str(&fragment);
+                    continue;
+                }
+                let chunks = state.splitter.push(&fragment);
+                if !chunks.reasoning.is_empty()
+                    || (state.splitter.has_reasoning() && !state.reasoning_sent)
+                {
+                    state.push_reasoning(&chunks.reasoning);
+                }
+                if !chunks.content.is_empty() {
+                    let content = chunks.content.clone();
+                    let chunk = state.chunk_event(|id, created, model| {
+                        ChatCompletionChunk::content(id, created, model, content)
+                    });
+                    state.pending.push_back(chunk);
+                }
             }
             Some(EngineEvent::Finished(metrics)) => {
                 let reason = ChatFinishReason::from_generation(metrics.finish_reason);
+                // A call that the token budget cut short is never exposed
+                // as a call: the turn simply ends at its length limit.
+                let length_limited = metrics.finish_reason == FinishReason::Length;
                 match std::mem::replace(&mut state.output, AssistantOutput::Text) {
                     AssistantOutput::ForcedCall { name } => {
-                        if metrics.finish_reason == crate::generation::FinishReason::Stop {
-                            match validated_arguments(&state.buffered_tool_arguments) {
-                                Ok(arguments) => {
+                        // The arguments are checked first: a call that is
+                        // complete at the length boundary is still a call.
+                        match validated_arguments(&state.buffered_tool_arguments) {
+                            Ok(arguments) => {
+                                let role = state.chunk_event(ChatCompletionChunk::role);
+                                state.pending.push_back(role);
+                                state.push_tool_call(AssistantFunctionCall { name, arguments });
+                            }
+                            Err(error) => {
+                                if length_limited
+                                    && arguments_are_incomplete(&state.buffered_tool_arguments)
+                                {
+                                    // The token budget cut the arguments
+                                    // short: the turn ends at its length
+                                    // limit and exposes no call.
                                     let role = state.chunk_event(ChatCompletionChunk::role);
                                     state.pending.push_back(role);
-                                    state.push_tool_call(AssistantFunctionCall { name, arguments });
-                                }
-                                Err(error) => {
+                                    let finished = state.chunk_event(|id, created, model| {
+                                        ChatCompletionChunk::finished(
+                                            id,
+                                            created,
+                                            model,
+                                            ChatFinishReason::Length,
+                                        )
+                                    });
+                                    state.pending.push_back(finished);
+                                } else {
                                     state.pending.push_back(json_event(&error.into_response()));
                                 }
                             }
-                        } else {
-                            state.pending.push_back(json_event(
-                                &ApiError::server_error(
-                                    "forced tool generation reached its length limit before a stop token",
-                                )
-                                .into_response(),
-                            ));
                         }
                     }
                     // A cancelled generation exposes neither held text nor a call.
                     AssistantOutput::AutoCall { calls } => {
                         if let Some(reason) = reason {
-                            match std::mem::take(&mut state.splitter).finish() {
-                                SplitEnd::Content(rest) => {
-                                    if !rest.is_empty() {
-                                        let content = state.chunk_event(|id, created, model| {
-                                            ChatCompletionChunk::content(id, created, model, rest)
-                                        });
-                                        state.pending.push_back(content);
-                                    }
+                            let end = std::mem::take(&mut state.splitter).finish();
+                            if !end.reasoning.is_empty()
+                                || (end.has_reasoning && !state.reasoning_sent)
+                            {
+                                state.push_reasoning(&end.reasoning);
+                            }
+                            state.push_content(&end.content);
+                            match end.call {
+                                None => {
                                     let finished = state.chunk_event(|id, created, model| {
                                         ChatCompletionChunk::finished(id, created, model, reason)
                                     });
                                     state.pending.push_back(finished);
                                 }
-                                SplitEnd::Call(after_open) => {
-                                    match auto_call_function(&after_open, &calls) {
-                                        Ok(function) => state.push_tool_call(function),
-                                        Err(error) => state
-                                            .pending
-                                            .push_back(json_event(&error.into_response())),
+                                Some(after_open) => match auto_call_function(&after_open, &calls) {
+                                    Ok(function) => state.push_tool_call(function),
+                                    Err(error) => {
+                                        if length_limited && call_is_incomplete(&after_open) {
+                                            // The token budget cut the call
+                                            // short: the turn ends at its
+                                            // length limit and exposes no
+                                            // call.
+                                            let finished =
+                                                state.chunk_event(|id, created, model| {
+                                                    ChatCompletionChunk::finished(
+                                                        id, created, model, reason,
+                                                    )
+                                                });
+                                            state.pending.push_back(finished);
+                                        } else {
+                                            state
+                                                .pending
+                                                .push_back(json_event(&error.into_response()));
+                                        }
                                     }
-                                }
+                                },
                             }
                         }
                     }
                     AssistantOutput::Text => {
+                        let end = std::mem::take(&mut state.splitter).finish();
+                        if !end.reasoning.is_empty() || (end.has_reasoning && !state.reasoning_sent)
+                        {
+                            state.push_reasoning(&end.reasoning);
+                        }
+                        state.push_content(&end.content);
                         if let Some(reason) = reason {
                             let finished = state.chunk_event(|id, created, model| {
                                 ChatCompletionChunk::finished(id, created, model, reason)
@@ -1600,6 +1828,7 @@ mod tests {
 
     use crate::engine::EnginePreflightError;
     use crate::generation::{FinishReason, GenerationMetrics};
+    use crate::tool_call::TOOL_CALL_OPEN;
 
     use super::*;
 
@@ -1819,6 +2048,7 @@ mod tests {
         events: Mutex<Vec<EngineEvent>>,
         submit_error: Option<SubmitError>,
         preflight_error: Option<EnginePreflightError>,
+        rendered_thinking: Option<bool>,
         last_cancelled: Mutex<Option<Arc<AtomicBool>>>,
         last_request: Mutex<Option<EngineRequest>>,
         last_policy: Mutex<Option<EngineRequestPolicy>>,
@@ -1830,21 +2060,94 @@ mod tests {
             Self {
                 metadata: EngineMetadata {
                     served_model: "test-model".to_owned(),
-                    family: "test".to_owned(),
+                    family: "qwen3".to_owned(),
                     max_context: 128,
                     device: "cpu".to_owned(),
                     dtype: "f32".to_owned(),
                     chat_template_defaults: crate::chat::ChatTemplateOptions::default(),
+                    opens_thinking_block: false,
                 },
                 status: EngineStatus::Ready,
                 events: Mutex::new(events),
                 submit_error: None,
                 preflight_error: None,
+                rendered_thinking: None,
                 last_cancelled: Mutex::new(None),
                 last_request: Mutex::new(None),
                 last_policy: Mutex::new(None),
                 submit_count: AtomicUsize::new(0),
             }
+        }
+
+        /// An engine whose chat template leaves the thinking block open, so
+        /// the model continues the reasoning the prompt started.
+        fn with_open_thinking(mut self) -> Self {
+            self.metadata.opens_thinking_block = true;
+            self
+        }
+    }
+
+    /// An engine that generates its text and waits for the test to end the
+    /// turn, so a test can observe what the server streamed before the turn
+    /// ended.
+    struct GatedEngine {
+        metadata: EngineMetadata,
+        release: Arc<tokio::sync::Notify>,
+        fragments: Vec<&'static str>,
+    }
+
+    impl GatedEngine {
+        fn new() -> Self {
+            Self {
+                metadata: EngineMetadata {
+                    served_model: "test-model".to_owned(),
+                    family: "qwen3".to_owned(),
+                    max_context: 128,
+                    device: "cpu".to_owned(),
+                    dtype: "f32".to_owned(),
+                    chat_template_defaults: crate::chat::ChatTemplateOptions::default(),
+                    opens_thinking_block: false,
+                },
+                release: Arc::new(tokio::sync::Notify::new()),
+                fragments: vec!["Listing."],
+            }
+        }
+
+        /// An engine whose chat template leaves the thinking block open, so
+        /// the model continues the reasoning the prompt started.
+        fn with_open_thinking(mut self) -> Self {
+            self.metadata.opens_thinking_block = true;
+            self
+        }
+    }
+
+    impl InferenceEngine for GatedEngine {
+        fn metadata(&self) -> EngineMetadata {
+            self.metadata.clone()
+        }
+
+        fn status(&self) -> EngineStatus {
+            EngineStatus::Ready
+        }
+
+        fn submit(
+            &self,
+            _request: EngineRequest,
+        ) -> std::result::Result<EngineTicket, SubmitError> {
+            let (sender, _cancelled, ticket) = EngineTicket::channel(4, Ok(()));
+            for (index, fragment) in self.fragments.iter().enumerate() {
+                sender
+                    .try_send(text_event(*fragment, 11, index + 1, 3))
+                    .unwrap();
+            }
+            let release = Arc::clone(&self.release);
+            tokio::spawn(async move {
+                release.notified().await;
+                let _ = sender
+                    .send(EngineEvent::Finished(metrics(FinishReason::Stop)))
+                    .await;
+            });
+            Ok(ticket)
         }
     }
 
@@ -1875,6 +2178,9 @@ mod tests {
             let events = std::mem::take(&mut *self.events.lock().unwrap());
             let preflight = self.preflight_error.clone().map_or(Ok(()), Err);
             let (sender, cancelled, ticket) = EngineTicket::channel(events.len().max(1), preflight);
+            if let Some(open) = self.rendered_thinking {
+                ticket.set_prompt_opens_thinking(open);
+            }
             *self.last_cancelled.lock().unwrap() = Some(cancelled);
             for event in events {
                 sender.try_send(event).unwrap();
@@ -2753,6 +3059,30 @@ mod tests {
         assert!(usage < done);
         assert!(!success.contains("\"content\""));
 
+        // A call the token budget cut short is not an error: the turn ends at
+        // its length limit and exposes no call.
+        let limited = router(Arc::new(FakeEngine::healthy(vec![
+            text_event("{\"symbol\":\"SECRET", 11, 1, 3),
+            EngineEvent::Finished(metrics(FinishReason::Length)),
+        ])))
+        .oneshot(forced_tool_request(true, false))
+        .await
+        .unwrap();
+        let limited = String::from_utf8(
+            limited
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(limited.contains("\"finish_reason\":\"length\""));
+        assert!(!limited.contains("SECRET"));
+        assert!(!limited.contains("tool_calls"));
+
+        // A malformed call the model finished on its own still fails.
         let failed = router(Arc::new(FakeEngine::healthy(vec![
             text_event("{\"symbol\":\"SECRET", 11, 1, 3),
             EngineEvent::Failed {
@@ -2778,8 +3108,10 @@ mod tests {
         assert!(!failed.contains("tool_calls"));
     }
 
+    /// Arguments that are complete at the length boundary are still a call:
+    /// the token budget only decides how the turn ends.
     #[tokio::test]
-    async fn forced_tool_length_boundary_returns_no_tool_call() {
+    async fn a_complete_forced_call_at_the_length_boundary_is_still_a_call() {
         for streaming in [false, true] {
             let response = router(Arc::new(FakeEngine::healthy(vec![
                 text_event("{\"symbol\":\"AAPL\"}", 11, 1, 3),
@@ -2788,6 +3120,7 @@ mod tests {
             .oneshot(forced_tool_request(streaming, false))
             .await
             .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
             if streaming {
                 let body = String::from_utf8(
                     response
@@ -2799,24 +3132,110 @@ mod tests {
                         .to_vec(),
                 )
                 .unwrap();
-                assert!(body.contains("length limit"));
-                assert!(!body.contains("tool_calls"));
-                assert!(!body.contains("AAPL"));
+                assert!(body.contains("\"finish_reason\":\"tool_calls\""));
+                assert!(body.contains("\"name\":\"lookup\""));
+                assert!(body.contains("AAPL"));
             } else {
-                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
                 let body = body_json(response).await;
-                assert!(
-                    body["error"]["message"]
-                        .as_str()
-                        .unwrap()
-                        .contains("length limit")
+                assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+                assert_eq!(
+                    body["choices"][0]["message"]["tool_calls"][0]["function"],
+                    json!({"name": "lookup", "arguments": "{\"symbol\":\"AAPL\"}"})
                 );
-                assert!(body.get("choices").is_none());
             }
         }
     }
 
-    /// RestLoop's only tool: non-strict, with no `additionalProperties`.
+    /// Arguments that the token budget cut short are no call at all: the
+    /// turn ends at its length limit.
+    #[tokio::test]
+    async fn an_incomplete_forced_call_at_the_length_boundary_returns_no_tool_call() {
+        for streaming in [false, true] {
+            let response = router(Arc::new(FakeEngine::healthy(vec![
+                text_event("{\"symbol\":\"SECRET", 11, 1, 3),
+                EngineEvent::Finished(metrics(FinishReason::Length)),
+            ])))
+            .oneshot(forced_tool_request(streaming, false))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if streaming {
+                let body = String::from_utf8(
+                    response
+                        .into_body()
+                        .collect()
+                        .await
+                        .unwrap()
+                        .to_bytes()
+                        .to_vec(),
+                )
+                .unwrap();
+                assert!(body.contains("\"finish_reason\":\"length\""));
+                assert!(!body.contains("tool_calls"));
+                assert!(!body.contains("SECRET"));
+                assert!(!body.contains("length limit"));
+            } else {
+                let body = body_json(response).await;
+                assert_eq!(body["choices"][0]["finish_reason"], "length");
+                assert_eq!(body["choices"][0]["message"]["content"], "");
+                assert!(body["choices"][0]["message"].get("tool_calls").is_none());
+                assert!(!body.to_string().contains("SECRET"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_required_tool_cut_short_by_length_is_not_exposed() {
+        for streaming in [false, true] {
+            let request = chat_request(&json!({
+                "model": "test-model", "messages": [{"role":"user","content":"go"}],
+                "tools": [shell_tool()], "tool_choice": "required", "parallel_tool_calls": false, "stream": streaming
+            }));
+            let response = router(Arc::new(FakeEngine::healthy(vec![
+                text_event("{\"command\":\"ls", 11, 1, 3),
+                EngineEvent::Finished(metrics(FinishReason::Length)),
+            ])))
+            .oneshot(request)
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if streaming {
+                let body = body_text(response).await;
+                assert!(body.contains("\"finish_reason\":\"length\""));
+                assert!(!body.contains("\"tool_calls\""));
+                assert!(!body.contains("\"error\""));
+            } else {
+                let body = body_json(response).await;
+                assert_eq!(body["choices"][0]["finish_reason"], "length");
+                assert_eq!(body["choices"][0]["message"]["content"], "");
+                assert!(body["choices"][0]["message"].get("tool_calls").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_forced_call_is_not_excused_at_length() {
+        for arguments in ["{\"symbol\":}", "[]"] {
+            for streaming in [false, true] {
+                let response = router(Arc::new(FakeEngine::healthy(vec![
+                    text_event(arguments, 11, 1, 3),
+                    EngineEvent::Finished(metrics(FinishReason::Length)),
+                ])))
+                .oneshot(forced_tool_request(streaming, false))
+                .await
+                .unwrap();
+                if streaming {
+                    let body = body_text(response).await;
+                    assert!(body.contains("constrained tool arguments"), "{body}");
+                    assert!(!body.contains("\"finish_reason\":\"length\""));
+                } else {
+                    assert!(!response.status().is_success());
+                }
+            }
+        }
+    }
+
+    /// `RestLoop`'s only tool: non-strict, with no `additionalProperties`.
     fn shell_tool() -> Value {
         json!({"type": "function", "function": {
             "name": "shell",
@@ -2872,6 +3291,14 @@ mod tests {
         events
             .iter()
             .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn streamed_reasoning(events: &[Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| event["choices"][0]["delta"]["reasoning_content"].as_str())
             .map(str::to_owned)
             .collect()
     }
@@ -2948,6 +3375,7 @@ mod tests {
         let options = ServerOptions {
             default_max_completion_tokens: 64,
             sampling_profile: SamplingProfile::OpenAi,
+            reasoning_format: ReasoningFormat::Deepseek,
         };
         let response = router_with_options(engine.clone(), options)
             .oneshot(chat_request(&json!({
@@ -3045,6 +3473,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn qwen35_thinking_precedence_and_sampling_defaults() {
         use crate::chat::{ChatMessage, ChatTemplateOptions};
         use crate::models::ModelAdapter;
@@ -3225,11 +3654,12 @@ mod tests {
         let cases = [
             (
                 format!("{reasoning}{SHELL_CALL}"),
-                json!("<think>\nNeed ls.\n</think>\n\nListing."),
+                json!("Listing."),
+                json!("Need ls."),
             ),
-            (format!("\n{SHELL_CALL}"), Value::Null),
+            (format!("\n{SHELL_CALL}"), Value::Null, Value::Null),
         ];
-        for (text, content) in cases {
+        for (text, content, expected_reasoning) in cases {
             let response = router(Arc::new(FakeEngine::healthy({
                 let mut events = fragments(&text, &[7, 30, 5]);
                 events.push(EngineEvent::Finished(metrics(FinishReason::Stop)));
@@ -3242,6 +3672,11 @@ mod tests {
             let body = body_json(response).await;
             let message = &body["choices"][0]["message"];
             assert_eq!(message["content"], content);
+            if expected_reasoning.is_null() {
+                assert!(message.get("reasoning_content").is_none());
+            } else {
+                assert_eq!(message["reasoning_content"], expected_reasoning);
+            }
             let call = &message["tool_calls"][0];
             assert!(call["id"].as_str().unwrap().starts_with("call_"));
             assert_eq!(call["type"], "function");
@@ -3280,9 +3715,10 @@ mod tests {
         .await
         .unwrap();
         let body = body_json(response).await;
+        assert_eq!(body["choices"][0]["message"]["content"], "A tag. <tool");
         assert_eq!(
-            body["choices"][0]["message"]["content"],
-            "<think>\nWhat is <tool_call>?\n</think>\n\nA tag. <tool"
+            body["choices"][0]["message"]["reasoning_content"],
+            "What is <tool_call>?"
         );
         assert!(body["choices"][0]["message"].get("tool_calls").is_none());
         assert_eq!(body["choices"][0]["finish_reason"], "length");
@@ -3339,7 +3775,8 @@ mod tests {
 
         assert_eq!(events[0]["choices"][0]["delta"]["role"], "assistant");
         let content = streamed_content(&events);
-        assert_eq!(content.concat(), "<think>\nok\n</think>\n\nListing.");
+        assert_eq!(content.concat(), "Listing.");
+        assert_eq!(streamed_reasoning(&events).concat(), "ok");
         assert!(content.iter().all(|delta| !delta.contains("tool")));
 
         let header = events
@@ -3380,7 +3817,7 @@ mod tests {
         .unwrap();
         let body = body_text(response).await;
         let events = sse_json(&body);
-        assert_eq!(streamed_content(&events), ["Done", " \n<tool"]);
+        assert_eq!(streamed_content(&events).concat(), "Done \n<tool");
         assert!(body.contains("\"finish_reason\":\"length\""));
         assert!(!body.contains("tool_calls"));
     }
@@ -3395,12 +3832,13 @@ mod tests {
 
     #[tokio::test]
     async fn qwen35_auto_non_streaming_returns_native_calls_and_visible_prefix() {
-        for (prefix, content) in [
-            ("", Value::Null),
-            ("\n", Value::Null),
+        for (prefix, content, expected_reasoning) in [
+            ("", Value::Null, Value::Null),
+            ("\n", Value::Null, Value::Null),
             (
                 "<think>Use <tool_call> later.</think>\n\nListing.\n",
-                json!("<think>Use <tool_call> later.</think>\n\nListing."),
+                json!("Listing."),
+                json!("Use <tool_call> later."),
             ),
         ] {
             for explicit_auto in [false, true] {
@@ -3421,6 +3859,11 @@ mod tests {
                 let body = body_json(response).await;
                 let message = &body["choices"][0]["message"];
                 assert_eq!(message["content"], content);
+                if expected_reasoning.is_null() {
+                    assert!(message.get("reasoning_content").is_none());
+                } else {
+                    assert_eq!(message["reasoning_content"], expected_reasoning);
+                }
                 let call = &message["tool_calls"][0];
                 assert!(call["id"].as_str().unwrap().starts_with("call_"));
                 assert_eq!(call["type"], "function");
@@ -3461,8 +3904,8 @@ mod tests {
 
     #[tokio::test]
     async fn qwen35_auto_sse_every_split_preserves_content_and_buffers_the_call() {
-        let visible = "<think>Use <tool_call> later.</think>\n\nListing.";
-        let text = format!("{visible}\n{QWEN35_CALL}");
+        let visible = "Listing.";
+        let text = format!("<think>Use <tool_call> later.</think>\n\n{visible}\n{QWEN35_CALL}");
         for cut in 0..=text.len() {
             let engine = qwen35_engine(vec![
                 text_event(&text[..cut], 11, 1, 3),
@@ -3475,6 +3918,11 @@ mod tests {
             let events = sse_json(&body);
             let content = streamed_content(&events);
             assert_eq!(content.concat(), visible, "split at {cut}");
+            assert_eq!(
+                streamed_reasoning(&events).concat(),
+                "Use <tool_call> later.",
+                "split at {cut}"
+            );
             let mut accumulated = String::new();
             for fragment in content {
                 accumulated.push_str(&fragment);
@@ -3628,7 +4076,7 @@ mod tests {
         }
     }
 
-    /// Apply RestLoop's bookkeeping to one reply: keep the assistant message
+    /// Apply `RestLoop`'s bookkeeping to one reply: keep the assistant message
     /// with `content` as a string and any `tool_calls`, then answer each call.
     fn restloop_record(messages: &mut Vec<Value>, reply: &Value, output: &str) -> bool {
         let message = &reply["choices"][0]["message"];
@@ -3697,7 +4145,8 @@ mod tests {
             "<|im_start|>user\nWhat does a.txt say?<|im_end|>\n<|im_start|>assistant\n"
         ));
         assert!(restloop_record(&mut messages, &reply, "exit: 0\na.txt\n"));
-        assert_eq!(messages[2]["content"], "<think>\nList first.\n</think>");
+        assert_eq!(messages[2]["content"], "");
+        assert_eq!(messages[2]["reasoning_content"], "List first.");
 
         // Turn 2: the replayed call reproduces the model's own turn, then a
         // second call with visible text before it.
@@ -3976,5 +4425,943 @@ mod tests {
                 .unwrap()
                 .load(Ordering::Acquire)
         );
+    }
+    /// The ways a thinking turn can reach the server: with the opening tag,
+    /// without it because the prompt ended inside the block, without any
+    /// thinking at all, and cut short by the token budget. The flag says
+    /// whether the rendered prompt left the thinking block open.
+    const REASONING_TURNS: [(&str, bool, Option<&str>, &str); 8] = [
+        (
+            "<think>\nNeed ls.\n</think>\n\nListing.",
+            false,
+            Some("Need ls."),
+            "Listing.",
+        ),
+        (
+            "Need ls.\n</think>\n\nListing.",
+            true,
+            Some("Need ls."),
+            "Listing.",
+        ),
+        ("Listing.", false, None, "Listing."),
+        ("<think>\n</think>Answer", false, Some(""), "Answer"),
+        ("</think>Answer", true, Some(""), "Answer"),
+        ("  \n", false, None, "  \n"),
+        ("<think>\nstill thinking", false, Some("still thinking"), ""),
+        (
+            "Need ls.\n</think>\n\nListing.",
+            false,
+            None,
+            "Need ls.\n</think>\n\nListing.",
+        ),
+    ];
+
+    /// The engine that answers one of the [`REASONING_TURNS`].
+    fn reasoning_engine(text: &str, open_thinking: bool) -> Arc<FakeEngine> {
+        let engine = FakeEngine::healthy(vec![
+            text_event(text, 11, 1, 3),
+            EngineEvent::Finished(metrics(if text == "<think>\nstill thinking" {
+                FinishReason::Length
+            } else {
+                FinishReason::Stop
+            })),
+        ]);
+        if open_thinking {
+            Arc::new(engine.with_open_thinking())
+        } else {
+            Arc::new(engine)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_actual_prompt_overrides_the_template_metadata_probe() {
+        for (actual_open, metadata_open) in [(true, false), (false, true)] {
+            for streaming in [false, true] {
+                let mut engine = FakeEngine::healthy(vec![
+                    text_event("Need ls.", 11, 1, 3),
+                    EngineEvent::Finished(metrics(FinishReason::Stop)),
+                ]);
+                engine.metadata.opens_thinking_block = metadata_open;
+                engine.rendered_thinking = Some(actual_open);
+                let response = router(Arc::new(engine))
+                    .oneshot(request(streaming, false))
+                    .await
+                    .unwrap();
+                let (reasoning, content) = if streaming {
+                    let events = sse_json(&body_text(response).await);
+                    (
+                        streamed_reasoning(&events).concat(),
+                        streamed_content(&events).concat(),
+                    )
+                } else {
+                    let body = body_json(response).await;
+                    let message = &body["choices"][0]["message"];
+                    (
+                        message["reasoning_content"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        message["content"].as_str().unwrap().to_owned(),
+                    )
+                };
+                if actual_open {
+                    assert_eq!((reasoning.as_str(), content.as_str()), ("Need ls.", ""));
+                } else {
+                    assert_eq!((reasoning.as_str(), content.as_str()), ("", "Need ls."));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_answer_reports_the_reasoning_separately() {
+        for (text, open_thinking, reasoning, content) in REASONING_TURNS {
+            let response = router(reasoning_engine(text, open_thinking))
+                .oneshot(request(false, false))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            let message = &body["choices"][0]["message"];
+            if text == "<think>\nstill thinking" {
+                assert_eq!(body["choices"][0]["finish_reason"], "length");
+            }
+            assert_eq!(message["content"], content, "{text:?}");
+            match reasoning {
+                Some(reasoning) => {
+                    assert_eq!(message["reasoning_content"], reasoning, "{text:?}");
+                }
+                None => assert!(message.get("reasoning_content").is_none(), "{text:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_stream_reports_the_reasoning_separately() {
+        for (text, open_thinking, reasoning, content) in REASONING_TURNS {
+            let response = router(reasoning_engine(text, open_thinking))
+                .oneshot(request(true, false))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_text(response).await;
+            let events = sse_json(&body);
+            if text == "<think>\nstill thinking" {
+                assert!(body.contains("\"finish_reason\":\"length\""));
+            }
+            assert_eq!(streamed_content(&events).concat(), content, "{text:?}");
+            assert_eq!(
+                streamed_reasoning(&events).concat(),
+                reasoning.unwrap_or_default(),
+                "{text:?}"
+            );
+            if reasoning.is_some() {
+                assert!(!streamed_reasoning(&events).is_empty(), "{text:?}");
+                assert!(!body.contains("<think>"), "{text:?}");
+                assert!(!body.contains("</think>"), "{text:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_split_closing_tag_never_leaks_into_the_answer() {
+        let response = router(Arc::new(FakeEngine::healthy(vec![
+            text_event("<think>\nNeed ls.\n</thi", 11, 1, 3),
+            text_event("nk>\n\nListing.", 12, 2, 3),
+            EngineEvent::Finished(metrics(FinishReason::Stop)),
+        ])))
+        .oneshot(request(true, false))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let events = sse_json(&body);
+        assert_eq!(streamed_reasoning(&events).concat(), "Need ls.");
+        assert_eq!(streamed_content(&events).concat(), "Listing.");
+        assert!(!body.contains("<think>"));
+        assert!(!body.contains("</think>"));
+    }
+
+    #[tokio::test]
+    async fn the_none_reasoning_format_keeps_the_thinking_block_in_the_answer() {
+        let options = ServerOptions {
+            reasoning_format: ReasoningFormat::None,
+            ..ServerOptions::default()
+        };
+        let text = "<think>\nNeed ls.\n</think>\n\nListing.";
+        let response = router_with_options(
+            Arc::new(FakeEngine::healthy(vec![
+                text_event(text, 11, 1, 3),
+                EngineEvent::Finished(metrics(FinishReason::Stop)),
+            ])),
+            options,
+        )
+        .oneshot(request(false, false))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let message = &body["choices"][0]["message"];
+        assert_eq!(message["content"], text);
+        assert!(message.get("reasoning_content").is_none());
+
+        // The streamed turn keeps the thinking block inside the answer too.
+        let response = router_with_options(
+            Arc::new(FakeEngine::healthy(vec![
+                text_event(text, 11, 1, 3),
+                EngineEvent::Finished(metrics(FinishReason::Stop)),
+            ])),
+            options,
+        )
+        .oneshot(request(true, false))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let events = sse_json(&body);
+        assert_eq!(streamed_content(&events).concat(), text);
+        assert!(streamed_reasoning(&events).is_empty());
+    }
+
+    /// The reasoning of a prompt that left the thinking block open reaches
+    /// the client while the model is still generating it.
+    #[tokio::test]
+    async fn the_reasoning_streams_before_the_turn_ends() {
+        let engine = Arc::new(GatedEngine::new().with_open_thinking());
+        let response = router(engine.clone())
+            .oneshot(request(true, false))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        let mut received = String::new();
+        while !received.contains("\"reasoning_content\":\"Listing.\"") {
+            let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+                .await
+                .expect("the reasoning was held until the turn ended")
+                .unwrap()
+                .unwrap();
+            if let Some(data) = frame.data_ref() {
+                received.push_str(std::str::from_utf8(data).unwrap());
+            }
+        }
+        // The turn has not ended yet: no finish chunk can be there.
+        assert!(!received.contains("\"finish_reason\":\"stop\""));
+
+        // The turn ends and the stream completes.
+        engine.release.notify_one();
+        let mut rest = String::new();
+        while let Some(Ok(frame)) = body.frame().await {
+            if let Some(data) = frame.data_ref() {
+                rest.push_str(std::str::from_utf8(data).unwrap());
+            }
+        }
+        assert!(rest.contains("\"finish_reason\":\"stop\""));
+    }
+
+    /// Confirmed ordinary content reaches the client before generation ends.
+    #[tokio::test]
+    async fn ordinary_content_streams_before_generation_ends() {
+        for tools in [false, true] {
+            let mut gated = GatedEngine::new();
+            gated.fragments = vec!["Hel", "lo ", "world"];
+            let engine = Arc::new(gated);
+            let response = router(engine.clone())
+                .oneshot(if tools {
+                    auto_request(true)
+                } else {
+                    request(true, false)
+                })
+                .await
+                .unwrap();
+            let mut body = response.into_body();
+            let mut received = String::new();
+            while !received.contains("world") {
+                let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+                    .await
+                    .expect("content was held until generation ended")
+                    .unwrap()
+                    .unwrap();
+                if let Some(data) = frame.data_ref() {
+                    received.push_str(std::str::from_utf8(data).unwrap());
+                }
+            }
+            assert_eq!(
+                streamed_content(&sse_json(&received)).concat(),
+                "Hello world"
+            );
+            assert!(!received.contains("\"finish_reason\":\"stop\""));
+            engine.release.notify_one();
+            while let Some(Ok(frame)) = body.frame().await {
+                if let Some(data) = frame.data_ref() {
+                    received.push_str(std::str::from_utf8(data).unwrap());
+                }
+            }
+            assert!(received.contains("\"finish_reason\":\"stop\""));
+        }
+    }
+
+    /// A tool marker inside a prompt-opened reasoning block is never a call.
+    #[tokio::test]
+    async fn tool_marker_in_prompt_opened_reasoning_is_not_a_call() {
+        for streaming in [false, true] {
+            for closed in [false, true] {
+                let mut events = vec![text_event("Consider <tool_call> syntax", 11, 1, 3)];
+                if closed {
+                    events.push(text_event("\n</think>\nAnswer", 12, 2, 3));
+                }
+                events.push(EngineEvent::Finished(metrics(FinishReason::Stop)));
+                let engine = Arc::new(FakeEngine::healthy(events).with_open_thinking());
+                let response = router(engine)
+                    .oneshot(auto_request(streaming))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let content = if closed { "Answer" } else { "" };
+                if streaming {
+                    let body = body_text(response).await;
+                    let events = sse_json(&body);
+                    assert_eq!(
+                        streamed_reasoning(&events).concat(),
+                        "Consider <tool_call> syntax"
+                    );
+                    assert_eq!(streamed_content(&events).concat(), content);
+                    assert!(!body.contains("\"error\""));
+                    assert!(!body.contains("\"tool_calls\""));
+                } else {
+                    let body = body_json(response).await;
+                    let message = &body["choices"][0]["message"];
+                    assert_eq!(message["reasoning_content"], "Consider <tool_call> syntax");
+                    assert_eq!(message["content"], content);
+                    assert!(message.get("tool_calls").is_none());
+                }
+            }
+        }
+    }
+
+    /// A closing think tag in tool arguments cannot reclassify the call.
+    #[tokio::test]
+    async fn a_closing_think_tag_in_call_arguments_remains_a_tool_call() {
+        for (qwen35, text) in [
+            (
+                false,
+                r#"<tool_call>{"name":"shell","arguments":{"command":"</think>"}}</tool_call>"#,
+            ),
+            (
+                true,
+                "<tool_call>\n<function=shell>\n<parameter=command>\n</think>\n</parameter>\n</function>\n</tool_call>",
+            ),
+        ] {
+            for streaming in [false, true] {
+                let mut events = fragments(text, &[3, 4, 5, 12, 12, 8]);
+                events.push(EngineEvent::Finished(metrics(FinishReason::Stop)));
+                let engine = if qwen35 {
+                    qwen35_engine(events)
+                } else {
+                    Arc::new(FakeEngine::healthy(events))
+                };
+                let response = router(engine)
+                    .oneshot(auto_request(streaming))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                if streaming {
+                    let body = body_text(response).await;
+                    let events = sse_json(&body);
+                    assert!(streamed_reasoning(&events).is_empty());
+                    assert!(streamed_content(&events).is_empty());
+                    assert!(body.contains("</think>"));
+                    assert!(body.contains("\"finish_reason\":\"tool_calls\""));
+                    assert!(!body.contains("\"error\""));
+                } else {
+                    let body = body_json(response).await;
+                    let message = &body["choices"][0]["message"];
+                    assert!(message.get("reasoning_content").is_none());
+                    assert_eq!(message["content"], Value::Null);
+                    let args = message["tool_calls"][0]["function"]["arguments"]
+                        .as_str()
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<Value>(args).unwrap(),
+                        json!({"command":"</think>"})
+                    );
+                }
+            }
+        }
+    }
+
+    /// A request without tools never turns the tag into a call: the answer
+    /// keeps it, exactly like the non-streaming response does.
+    #[tokio::test]
+    async fn an_answer_without_tools_keeps_the_call_tag_as_content() {
+        let text = format!("A tag. {TOOL_CALL_OPEN}");
+        for streaming in [false, true] {
+            let response = router(Arc::new(FakeEngine::healthy(vec![
+                text_event(text.clone(), 11, 1, 3),
+                EngineEvent::Finished(metrics(FinishReason::Stop)),
+            ])))
+            .oneshot(request(streaming, false))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if streaming {
+                let body = body_text(response).await;
+                let events = sse_json(&body);
+                assert_eq!(streamed_content(&events).concat(), text);
+                assert!(!body.contains("tool_calls"));
+            } else {
+                let body = body_json(response).await;
+                assert_eq!(body["choices"][0]["message"]["content"], text);
+                assert!(body["choices"][0]["message"].get("tool_calls").is_none());
+            }
+        }
+    }
+
+    /// A closing tag is ordinary answer text unless the prompt or model opened thinking.
+    #[tokio::test]
+    async fn a_closed_prompt_classifies_a_later_closing_tag() {
+        for streaming in [false, true] {
+            let engine = Arc::new(FakeEngine::healthy(vec![
+                text_event("Need ls.", 11, 1, 3),
+                text_event("\n</think>\n\nListing.", 12, 2, 3),
+                EngineEvent::Finished(metrics(FinishReason::Stop)),
+            ]));
+            let response = router(engine)
+                .oneshot(request(streaming, false))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if streaming {
+                let body = body_text(response).await;
+                let events = sse_json(&body);
+                assert!(streamed_reasoning(&events).is_empty());
+                assert_eq!(
+                    streamed_content(&events).concat(),
+                    "Need ls.\n</think>\n\nListing."
+                );
+            } else {
+                let body = body_json(response).await;
+                let message = &body["choices"][0]["message"];
+                assert!(message.get("reasoning_content").is_none());
+                assert_eq!(message["content"], "Need ls.\n</think>\n\nListing.");
+            }
+        }
+    }
+
+    /// A prompt that left the thinking block open strips the opening tag
+    /// the model writes again, exactly like the non-streaming response does.
+    #[tokio::test]
+    async fn an_open_prompt_strips_the_repeated_opening_tag() {
+        for streaming in [false, true] {
+            let engine = Arc::new(
+                FakeEngine::healthy(vec![
+                    text_event("\n<think>Need ls.\n</think>\n\nListing.", 11, 1, 3),
+                    EngineEvent::Finished(metrics(FinishReason::Stop)),
+                ])
+                .with_open_thinking(),
+            );
+            let response = router(engine)
+                .oneshot(request(streaming, false))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if streaming {
+                let body = body_text(response).await;
+                let events = sse_json(&body);
+                assert_eq!(streamed_reasoning(&events).concat(), "Need ls.");
+                assert_eq!(streamed_content(&events).concat(), "Listing.");
+                assert!(!body.contains("<think>"), "{body}");
+            } else {
+                let body = body_json(response).await;
+                let message = &body["choices"][0]["message"];
+                assert_eq!(message["reasoning_content"], "Need ls.");
+                assert_eq!(message["content"], "Listing.");
+            }
+        }
+    }
+
+    /// A turn that the token budget cut short right after the opening tag
+    /// never leaks the tag.
+    #[tokio::test]
+    async fn a_turn_that_ends_after_the_opening_tag_never_leaks_it() {
+        for streaming in [false, true] {
+            let response = router(Arc::new(FakeEngine::healthy(vec![
+                text_event("<think>", 11, 1, 3),
+                EngineEvent::Finished(metrics(FinishReason::Length)),
+            ])))
+            .oneshot(request(streaming, false))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if streaming {
+                let body = body_text(response).await;
+                assert!(!body.contains("<think>"), "{body}");
+                assert!(!body.contains("</think>"), "{body}");
+                let events = sse_json(&body);
+                assert_eq!(streamed_content(&events).concat(), "");
+                assert_eq!(streamed_reasoning(&events).concat(), "");
+            } else {
+                let body = body_json(response).await;
+                assert_eq!(body["choices"][0]["message"]["content"], "");
+                assert_eq!(body["choices"][0]["message"]["reasoning_content"], "");
+            }
+        }
+    }
+
+    /// An answer that only holds whitespace after the closing tag is empty,
+    /// exactly like the non-streaming response reports it.
+    #[tokio::test]
+    async fn whitespace_after_the_closing_tag_is_not_content() {
+        let text = "<think>\nNeed ls.\n</think>\n   ";
+        for streaming in [false, true] {
+            let response = router(Arc::new(FakeEngine::healthy(vec![
+                text_event(text, 11, 1, 3),
+                EngineEvent::Finished(metrics(FinishReason::Stop)),
+            ])))
+            .oneshot(request(streaming, false))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if streaming {
+                let body = body_text(response).await;
+                let events = sse_json(&body);
+                assert_eq!(streamed_content(&events).concat(), "");
+                assert_eq!(streamed_reasoning(&events).concat(), "Need ls.");
+            } else {
+                let body = body_json(response).await;
+                assert_eq!(body["choices"][0]["message"]["content"], "");
+                assert_eq!(
+                    body["choices"][0]["message"]["reasoning_content"],
+                    "Need ls."
+                );
+            }
+        }
+    }
+
+    /// A turn that scans for calls still reports no content when only
+    /// whitespace follows the closing tag, exactly like the non-streaming
+    /// response does.
+    #[tokio::test]
+    async fn whitespace_after_the_closing_tag_is_not_content_when_calls_are_scanned() {
+        let text = "<think>\nNeed ls.\n</think>\n   ";
+        for streaming in [false, true] {
+            let response = router(Arc::new(FakeEngine::healthy(vec![
+                text_event(text, 11, 1, 3),
+                EngineEvent::Finished(metrics(FinishReason::Stop)),
+            ])))
+            .oneshot(auto_request(streaming))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if streaming {
+                let body = body_text(response).await;
+                let events = sse_json(&body);
+                assert_eq!(streamed_content(&events).concat(), "");
+                assert_eq!(streamed_reasoning(&events).concat(), "Need ls.");
+            } else {
+                let body = body_json(response).await;
+                assert_eq!(body["choices"][0]["message"]["content"], "");
+                assert_eq!(
+                    body["choices"][0]["message"]["reasoning_content"],
+                    "Need ls."
+                );
+            }
+        }
+    }
+
+    /// The reasoning of a turn keeps no leading newline, however many tokens
+    /// the newlines arrive in.
+    #[tokio::test]
+    async fn the_reasoning_keeps_no_leading_newline_across_tokens() {
+        let response = router(Arc::new(FakeEngine::healthy(vec![
+            text_event("<think>", 11, 1, 3),
+            text_event("\n", 12, 2, 3),
+            text_event("\n", 13, 3, 3),
+            text_event("Need ls.\n</think>\n\nListing.", 14, 4, 3),
+            EngineEvent::Finished(metrics(FinishReason::Stop)),
+        ])))
+        .oneshot(request(true, false))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let events = sse_json(&body);
+        assert_eq!(streamed_reasoning(&events).concat(), "Need ls.");
+        assert_eq!(streamed_content(&events).concat(), "Listing.");
+    }
+
+    /// A call that closed but does not parse is malformed, not truncated: it
+    /// stays an error even when the token budget ended the turn.
+    #[tokio::test]
+    async fn a_closed_but_malformed_call_at_the_length_boundary_still_fails() {
+        let text =
+            "<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}\n</tool_call>";
+        for streaming in [false, true] {
+            let response = router(Arc::new(FakeEngine::healthy(vec![
+                text_event(text, 11, 1, 3),
+                EngineEvent::Finished(metrics(FinishReason::Length)),
+            ])))
+            .oneshot(auto_request(streaming))
+            .await
+            .unwrap();
+            if streaming {
+                let body = body_text(response).await;
+                assert!(body.contains("invalid native tool call"), "{body}");
+                assert!(!body.contains("tool_calls"), "{body}");
+            } else {
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                let body = body_json(response).await;
+                assert!(body.get("choices").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_after_thinking_reports_the_reasoning() {
+        let text = format!("<think>\nNeed ls.\n</think>\n\n{SHELL_CALL}");
+        for streaming in [false, true] {
+            let mut fragments = fragments(&text, &[3, 5, 7, 4, 8]);
+            fragments.push(EngineEvent::Finished(metrics(FinishReason::Stop)));
+            let response = router(Arc::new(FakeEngine::healthy(fragments)))
+                .oneshot(auto_request(streaming))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if streaming {
+                let body = body_text(response).await;
+                let events = sse_json(&body);
+                assert_eq!(events[0]["choices"][0]["delta"]["role"], "assistant");
+                assert_eq!(streamed_reasoning(&events).concat(), "Need ls.");
+                assert!(streamed_content(&events).is_empty());
+                assert!(body.contains("\"finish_reason\":\"tool_calls\""));
+                assert!(body.contains("\"name\":\"shell\""));
+                assert!(body.trim_end().ends_with("data: [DONE]"));
+            } else {
+                let body = body_json(response).await;
+                let message = &body["choices"][0]["message"];
+                assert_eq!(message["reasoning_content"], "Need ls.");
+                assert_eq!(message["content"], Value::Null);
+                assert_eq!(message["tool_calls"][0]["function"]["name"], "shell");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_length_limited_call_is_never_exposed_as_a_call() {
+        let calls = [
+            (
+                false,
+                "<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\": \"ls",
+            ),
+            (
+                true,
+                "<tool_call>\n<function=shell>\n<parameter=command>\nls",
+            ),
+        ];
+        for (qwen35, call) in calls {
+            for (prefix, visible, reasoning) in [
+                ("Listing.\n", "Listing.", None),
+                ("<think>\nNeed ls.\n</think>\n\n", "", Some("Need ls.")),
+                ("<think>ok</think>\nListing.\n", "Listing.", Some("ok")),
+                ("", "", None),
+            ] {
+                let text = format!("{prefix}{call}");
+                for streaming in [false, true] {
+                    let mut events = fragments(&text, &[2, 3, 7, 9, 4]);
+                    events.push(EngineEvent::Finished(metrics(FinishReason::Length)));
+                    let engine = if qwen35 {
+                        qwen35_engine(events)
+                    } else {
+                        Arc::new(FakeEngine::healthy(events))
+                    };
+                    let response = router(engine)
+                        .oneshot(auto_request(streaming))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::OK, "qwen35={qwen35}");
+                    if streaming {
+                        let body = body_text(response).await;
+                        assert!(body.contains("\"finish_reason\":\"length\""));
+                        assert!(!body.contains("tool_calls"));
+                        assert!(!body.contains("invalid native tool call"));
+                        let events = sse_json(&body);
+                        assert_eq!(streamed_content(&events).concat(), visible);
+                        assert_eq!(
+                            streamed_reasoning(&events).concat(),
+                            reasoning.unwrap_or_default()
+                        );
+                    } else {
+                        let body = body_json(response).await;
+                        assert_eq!(body["choices"][0]["finish_reason"], "length");
+                        let message = &body["choices"][0]["message"];
+                        assert_eq!(message["content"], visible);
+                        assert_eq!(
+                            message.get("reasoning_content").and_then(Value::as_str),
+                            reasoning
+                        );
+                        assert!(message.get("tool_calls").is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_auto_calls_at_stop_remain_errors() {
+        for qwen35 in [false, true] {
+            let call = if qwen35 {
+                "<tool_call>\n<function=shell>\n<parameter=command>\nls"
+            } else {
+                "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"ls"
+            };
+            for streaming in [false, true] {
+                let events = vec![
+                    text_event(call, 11, 1, 3),
+                    EngineEvent::Finished(metrics(FinishReason::Stop)),
+                ];
+                let engine = if qwen35 {
+                    qwen35_engine(events)
+                } else {
+                    Arc::new(FakeEngine::healthy(events))
+                };
+                let response = router(engine)
+                    .oneshot(auto_request(streaming))
+                    .await
+                    .unwrap();
+                if streaming {
+                    let body = body_text(response).await;
+                    assert!(body.contains("invalid native tool call"), "{body}");
+                    assert!(!body.contains("\"tool_calls\""));
+                } else {
+                    assert!(!response.status().is_success());
+                    assert!(
+                        body_text(response)
+                            .await
+                            .contains("invalid native tool call")
+                    );
+                }
+            }
+        }
+    }
+
+    /// Render one fixture case through the server's request lowering.
+    fn render_agent_case(case: &Value) -> EngineRequest {
+        let mut request = case.clone();
+        request["model"] = json!("test-model");
+        request["chat_template_kwargs"] = json!({"enable_thinking": true});
+        let validated = ChatCompletionRequest::from_json(&serde_json::to_vec(&request).unwrap())
+            .unwrap()
+            .validate("test-model", 128)
+            .unwrap();
+        let (engine, _) =
+            to_engine_request(validated, 0, SamplingProfile::OpenAi.defaults(true)).unwrap();
+        engine
+    }
+
+    /// Move the thinking block of the fixture's assistant turn into the
+    /// separate `reasoning_content` field the Qwen templates read.
+    fn split_case_reasoning(case: &Value) -> Value {
+        let mut request = case.clone();
+        for message in request["messages"].as_array_mut().unwrap() {
+            if message["role"] == json!("assistant") {
+                let content = message["content"].as_str().unwrap().to_owned();
+                let (reasoning, visible) = content.split_once("</think>").unwrap();
+                message["content"] = json!(visible.trim_start_matches('\n'));
+                message["reasoning_content"] =
+                    json!(reasoning.trim_start_matches("<think>").trim_matches('\n'));
+            }
+        }
+        request
+    }
+
+    /// The `OpenAI` wire format carries tool arguments as a JSON string.
+    fn string_case_arguments(case: &Value) -> Value {
+        let mut request = case.clone();
+        for message in request["messages"].as_array_mut().unwrap() {
+            if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for call in calls {
+                    let args = &mut call["function"]["arguments"];
+                    if args.is_object() {
+                        *args = Value::String(crate::models::qwen3::python_json(args).unwrap());
+                    }
+                }
+            }
+        }
+        request
+    }
+
+    #[test]
+    fn qwen3_reasoning_history_renders_the_pinned_fixture_bytes() {
+        use crate::agent::AgentTemplateProfile;
+        use crate::models::qwen3::format_qwen3_agent_prompt;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/chat_templates/rendered/qwen3");
+        let cases: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("cases.json")).unwrap()).unwrap();
+        let case = &cases["cases"]["reasoning_and_text_before_call"];
+        for (name, profile) in [
+            ("qwen3-current", AgentTemplateProfile::Qwen3Current),
+            ("qwen3-gguf", AgentTemplateProfile::Qwen3Gguf),
+        ] {
+            let expected = std::fs::read(dir.join(format!(
+                "{name}__reasoning_and_text_before_call__thinking-on.txt"
+            )))
+            .unwrap();
+            for request in [
+                string_case_arguments(&split_case_reasoning(case)),
+                string_case_arguments(case),
+            ] {
+                let engine = render_agent_case(&request);
+                let EngineInput::Agent { prompt, .. } = engine.input else {
+                    panic!("the fixture case uses the native agent renderer");
+                };
+                let rendered =
+                    format_qwen3_agent_prompt(profile, &prompt, engine.chat_template).unwrap();
+                assert_eq!(rendered.as_bytes(), expected, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn qwen35_reasoning_history_renders_the_pinned_fixture_bytes() {
+        use crate::models::ModelAdapter;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/chat_templates/rendered/qwen35");
+        let cases: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("cases.json")).unwrap()).unwrap();
+        let case = &cases["cases"]["reasoning_and_text_before_call"];
+        for (name, template) in [
+            ("qwen35-official", "official"),
+            ("qwen35-unsloth", "unsloth"),
+        ] {
+            let expected = std::fs::read(dir.join(format!(
+                "{name}__reasoning_and_text_before_call__thinking-on.txt"
+            )))
+            .unwrap();
+            let adapter = qwen35_test_adapter(template);
+            for request in [
+                string_case_arguments(&split_case_reasoning(case)),
+                string_case_arguments(case),
+            ] {
+                let engine = render_agent_case(&request);
+                let EngineInput::Agent { prompt, .. } = engine.input else {
+                    panic!("the fixture case uses the native agent renderer");
+                };
+                let rendered = adapter
+                    .format_agent_prompt_with(&prompt, engine.chat_template)
+                    .unwrap();
+                assert_eq!(rendered.as_bytes(), expected, "{name}");
+            }
+        }
+    }
+
+    /// A history that carries its reasoning beside its content renders the
+    /// same bytes as the same history with the thinking block inside the
+    /// content: the Qwen templates read `message.reasoning_content` and
+    /// render the turn exactly as if its content carried the block.
+    #[test]
+    fn reasoning_history_renders_the_same_bytes_as_a_thinking_block() {
+        use crate::models::qwen3::format_qwen3_chat_messages;
+        let split = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "List the files."},
+                {"role": "assistant", "content": "Y", "reasoning_content": "X"},
+                {"role": "user", "content": "Thanks."}
+            ],
+        });
+        let folded = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "List the files."},
+                {"role": "assistant", "content": "<think>\nX\n</think>\n\nY"},
+                {"role": "user", "content": "Thanks."}
+            ],
+        });
+        let render = |request: &Value| {
+            let validated = ChatCompletionRequest::from_json(&serde_json::to_vec(request).unwrap())
+                .unwrap()
+                .validate("test-model", 128)
+                .unwrap();
+            let (engine, _) =
+                to_engine_request(validated, 0, SamplingProfile::OpenAi.defaults(true)).unwrap();
+            let EngineInput::Chat(messages) = engine.input else {
+                panic!("the history uses the plain chat renderer");
+            };
+            format_qwen3_chat_messages(&messages, engine.chat_template).unwrap()
+        };
+        assert_eq!(render(&split), render(&folded));
+        assert!(render(&split).contains("<|im_start|>assistant\nY<|im_end|>"));
+        for template in ["official", "unsloth"] {
+            use crate::models::ModelAdapter;
+            let adapter = qwen35_test_adapter(template);
+            let render_qwen35 = |request: &Value| {
+                let validated =
+                    ChatCompletionRequest::from_json(&serde_json::to_vec(request).unwrap())
+                        .unwrap()
+                        .validate("test-model", 128)
+                        .unwrap();
+                let (engine, _) =
+                    to_engine_request(validated, 0, SamplingProfile::OpenAi.defaults(true))
+                        .unwrap();
+                let EngineInput::Chat(messages) = engine.input else {
+                    panic!("expected chat");
+                };
+                adapter
+                    .format_chat_messages_with(&messages, engine.chat_template)
+                    .unwrap()
+            };
+            assert_eq!(render_qwen35(&split), render_qwen35(&folded), "{template}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_history_is_rejected_for_templates_without_the_branch() {
+        let mut engine =
+            FakeEngine::healthy(vec![EngineEvent::Finished(metrics(FinishReason::Stop))]);
+        engine.metadata.family = "llama".to_owned();
+        let response = router(Arc::new(engine))
+            .oneshot(chat_request(&json!({
+                "model": "test-model",
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi", "reasoning_content": "X"},
+                    {"role": "user", "content": "again"}
+                ]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reasoning_content")
+        );
+    }
+    #[tokio::test]
+    async fn empty_reasoning_is_accepted_without_modifying_unsupported_history() {
+        let mut fake =
+            FakeEngine::healthy(vec![EngineEvent::Finished(metrics(FinishReason::Stop))]);
+        fake.metadata.family = "llama".to_owned();
+        let engine = Arc::new(fake);
+        let response = router(engine.clone())
+            .oneshot(chat_request(&json!({
+                "model": "test-model", "messages": [
+                    {"role":"user", "content":"hello", "reasoning_content":""},
+                    {"role":"assistant", "content":"Y", "reasoning_content":""},
+                    {"role":"user", "content":"next"}
+                ]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let stored = engine.last_request.lock().unwrap();
+        let EngineInput::Chat(messages) = &stored.as_ref().unwrap().input else {
+            panic!("expected chat")
+        };
+        assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[1].content, "Y");
     }
 }

@@ -27,7 +27,7 @@ use macllm_infer::{
     rerank::{RerankScore, rerank_token_batch},
     runtime::{LoadedRuntime, ModelLoadConfig},
     sampling::{Sampler, SamplingConfig},
-    server::{SamplingProfile, ServerConfig, ServerOptions, serve},
+    server::{ReasoningFormat, SamplingProfile, ServerConfig, ServerOptions, serve},
     token_stream::TokenStream,
     weights::{ModelFiles, ModelFormat},
 };
@@ -432,24 +432,46 @@ struct ServeArgs {
     default_max_completion_tokens: NonZeroUsize,
     /// Render chat and tool prompts with `enable_thinking=false` unless a
     /// request sets `chat_template_kwargs.enable_thinking`. Only Qwen3, Qwen3.5 and
-    /// Qwen3MoE templates support it; other models fail to start.
+    /// `Qwen3MoE` templates support it; other models fail to start.
     #[arg(long)]
     disable_thinking: bool,
-    /// Sampling defaults for omitted temperature, top_p and presence_penalty
-    /// (top_k always comes from the profile). `qwen3` and `qwen35` apply their
+    /// Sampling defaults for omitted temperature, `top_p` and `presence_penalty`
+    /// (`top_k` always comes from the profile). `qwen3` and `qwen35` apply their
     /// model card settings for each request's effective thinking mode.
     #[arg(long, value_enum, default_value_t = SamplingProfileArg::Openai)]
     sampling_profile: SamplingProfileArg,
+    /// Report the thinking text of a model that reasons. `deepseek` returns it
+    /// separately as `reasoning_content`, like llama.cpp and vLLM; `none`
+    /// keeps the thinking block inside the answer.
+    #[arg(long, value_enum, default_value_t = ReasoningFormatArg::Deepseek)]
+    reasoning_format: ReasoningFormatArg,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum SamplingProfileArg {
-    /// Temperature 1, top_p 1, no top-k.
+    /// Temperature 1, `top_p` 1, no top-k.
     Openai,
-    /// Thinking 0.6 / top_p 0.95 / top_k 20; non-thinking 0.7 / 0.8 / 20.
+    /// Thinking 0.6 / `top_p` 0.95 / `top_k` 20; non-thinking 0.7 / 0.8 / 20.
     Qwen3,
     /// Qwen3.5 defaults, including non-thinking presence penalty 1.5.
     Qwen35,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ReasoningFormatArg {
+    /// Report the thinking block as `reasoning_content`.
+    Deepseek,
+    /// Keep the thinking block inside the answer.
+    None,
+}
+
+impl From<ReasoningFormatArg> for ReasoningFormat {
+    fn from(arg: ReasoningFormatArg) -> Self {
+        match arg {
+            ReasoningFormatArg::Deepseek => ReasoningFormat::Deepseek,
+            ReasoningFormatArg::None => ReasoningFormat::None,
+        }
+    }
 }
 
 impl From<SamplingProfileArg> for SamplingProfile {
@@ -1310,6 +1332,7 @@ async fn serve_command(args: ServeArgs) -> Result<()> {
         options: ServerOptions {
             default_max_completion_tokens: args.default_max_completion_tokens.get(),
             sampling_profile: args.sampling_profile.into(),
+            reasoning_format: args.reasoning_format.into(),
         },
     })
     .await
@@ -1468,6 +1491,26 @@ mod tests {
         assert_eq!(defaults.default_max_completion_tokens.get(), 128);
         assert!(!defaults.disable_thinking);
         assert_eq!(defaults.sampling_profile, SamplingProfileArg::Openai);
+        assert_eq!(defaults.reasoning_format, ReasoningFormatArg::Deepseek);
+
+        // The thinking block is reported separately unless the server is
+        // told to keep it inside the answer.
+        let legacy = serve_args(
+            Cli::try_parse_from([
+                "macllm",
+                "serve",
+                "--model",
+                "model-dir",
+                "--reasoning-format",
+                "none",
+            ])
+            .unwrap(),
+        );
+        assert_eq!(legacy.reasoning_format, ReasoningFormatArg::None);
+        assert_eq!(
+            ReasoningFormat::from(legacy.reasoning_format),
+            ReasoningFormat::None
+        );
 
         let agent = serve_args(
             Cli::try_parse_from([

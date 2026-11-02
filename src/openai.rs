@@ -267,6 +267,10 @@ pub struct RequestMessage {
     pub refusal: Option<String>,
     #[serde(default)]
     pub audio: Option<Value>,
+    /// The reasoning an assistant turn produced. The Qwen3 and Qwen3.5
+    /// templates render it as the turn's thinking block.
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -913,7 +917,8 @@ fn validate_messages(messages: Vec<RequestMessage>) -> Result<ValidatedMessages,
 
 fn validate_text_messages(messages: Vec<RequestMessage>) -> Result<ValidatedMessages, ApiError> {
     let mut validated = Vec::with_capacity(messages.len());
-    for (index, message) in messages.into_iter().enumerate() {
+    for (index, mut message) in messages.into_iter().enumerate() {
+        let reasoning = message.reasoning_content.take();
         let role_param = format!("messages.{index}.role");
         let role = match message.role.as_str() {
             "system" => ChatRole::System,
@@ -958,11 +963,20 @@ fn validate_text_messages(messages: Vec<RequestMessage>) -> Result<ValidatedMess
             return Err(unsupported_field(format!("messages.{index}.audio")));
         }
 
+        if role != ChatRole::Assistant {
+            reject_reasoning_content(reasoning.as_deref(), index)?;
+        }
         let Some(Value::String(content)) = message.content else {
             return Err(unsupported_value(
                 format!("messages.{index}.content"),
                 "only string message content is supported; multimodal content is not implemented",
             ));
+        };
+        let content = if role == ChatRole::Assistant {
+            assistant_content_with_reasoning(Some(content), reasoning.as_deref())
+                .unwrap_or_default()
+        } else {
+            content
         };
         validated.push(ChatMessage::new(role, content));
     }
@@ -995,11 +1009,13 @@ fn validate_tool_aware_messages(
     let mut pending_tool_calls = HashSet::<String>::new();
     let mut all_tool_call_ids = HashSet::<String>::new();
 
-    for (index, message) in messages.into_iter().enumerate() {
+    for (index, mut message) in messages.into_iter().enumerate() {
+        let reasoning = message.reasoning_content.take();
         reject_common_message_extensions(&message, index)?;
         let role_param = format!("messages.{index}.role");
         match message.role.as_str() {
             "system" => {
+                reject_reasoning_content(reasoning.as_deref(), index)?;
                 if index != 0 || state != ToolConversationState::NeedUser {
                     return Err(invalid_value(
                         role_param,
@@ -1011,6 +1027,7 @@ fn validate_tool_aware_messages(
                 validated.push(AgentMessage::System { content });
             }
             "user" => {
+                reject_reasoning_content(reasoning.as_deref(), index)?;
                 if state != ToolConversationState::NeedUser {
                     return Err(invalid_value(
                         role_param,
@@ -1041,6 +1058,7 @@ fn validate_tool_aware_messages(
                 }
                 let tool_calls_were_present = message.tool_calls.is_some();
                 let content = optional_assistant_content(message.content, index)?;
+                let content = assistant_content_with_reasoning(content, reasoning.as_deref());
                 let tool_calls = message.tool_calls.unwrap_or_default();
                 if tool_calls_were_present && tool_calls.is_empty() {
                     return Err(invalid_value(
@@ -1089,6 +1107,7 @@ fn validate_tool_aware_messages(
                 state = ToolConversationState::NeedToolResponses;
             }
             "tool" => {
+                reject_reasoning_content(reasoning.as_deref(), index)?;
                 if state != ToolConversationState::NeedToolResponses {
                     return Err(invalid_value(
                         role_param,
@@ -1156,6 +1175,35 @@ fn validate_tool_aware_messages(
             "messages must end with a user turn or a complete tool response batch",
         )),
     }
+}
+
+/// Render an assistant turn that carries its reasoning separately.
+///
+/// The Qwen3 and Qwen3.5 templates read `message.reasoning_content` and
+/// render the turn exactly as if its content were the thinking block
+/// followed by the visible answer.
+fn assistant_content_with_reasoning(
+    content: Option<String>,
+    reasoning: Option<&str>,
+) -> Option<String> {
+    match reasoning {
+        Some(reasoning) => Some(format!(
+            "<think>\n{reasoning}\n</think>\n\n{}",
+            content.unwrap_or_default()
+        )),
+        _ => content,
+    }
+}
+
+/// Reject reasoning history on a message that cannot carry it.
+fn reject_reasoning_content(reasoning: Option<&str>, index: usize) -> Result<(), ApiError> {
+    if reasoning.is_some_and(|reasoning| !reasoning.is_empty()) {
+        return Err(invalid_value(
+            format!("messages.{index}.reasoning_content"),
+            "reasoning_content is only valid on assistant messages",
+        ));
+    }
+    Ok(())
 }
 
 fn reject_common_message_extensions(
@@ -1431,6 +1479,7 @@ impl ChatCompletionResponse {
         created: u64,
         model: impl Into<String>,
         content: impl Into<String>,
+        reasoning: Option<String>,
         finish_reason: ChatFinishReason,
         usage: TokenUsage,
     ) -> Self {
@@ -1444,6 +1493,7 @@ impl ChatCompletionResponse {
                 message: ResponseMessage {
                     role: ResponseRole::Assistant,
                     content: Some(content.into()),
+                    reasoning_content: reasoning,
                     tool_calls: None,
                 },
                 logprobs: None,
@@ -1461,6 +1511,7 @@ impl ChatCompletionResponse {
         created: u64,
         model: impl Into<String>,
         content: Option<String>,
+        reasoning: Option<String>,
         call: AssistantToolCall,
         usage: TokenUsage,
     ) -> Self {
@@ -1474,6 +1525,7 @@ impl ChatCompletionResponse {
                 message: ResponseMessage {
                     role: ResponseRole::Assistant,
                     content,
+                    reasoning_content: reasoning,
                     tool_calls: Some(vec![call]),
                 },
                 logprobs: None,
@@ -1496,6 +1548,10 @@ pub struct ChatCompletionChoice {
 pub struct ResponseMessage {
     pub role: ResponseRole,
     pub content: Option<String>,
+    /// The reasoning the model produced before its answer. The key is absent
+    /// when the turn has no reasoning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<AssistantToolCall>>,
 }
@@ -1522,6 +1578,7 @@ impl ChatCompletionChunk {
             ChunkDelta {
                 role: Some(ResponseRole::Assistant),
                 content: None,
+                reasoning_content: None,
                 tool_calls: None,
             },
             None,
@@ -1542,6 +1599,29 @@ impl ChatCompletionChunk {
             ChunkDelta {
                 role: None,
                 content: Some(content.into()),
+                reasoning_content: None,
+                tool_calls: None,
+            },
+            None,
+        )
+    }
+
+    /// A chunk that carries only the model's reasoning.
+    #[must_use]
+    pub fn reasoning(
+        id: impl Into<String>,
+        created: u64,
+        model: impl Into<String>,
+        reasoning: impl Into<String>,
+    ) -> Self {
+        Self::single_choice(
+            id,
+            created,
+            model,
+            ChunkDelta {
+                role: None,
+                content: None,
+                reasoning_content: Some(reasoning.into()),
                 tool_calls: None,
             },
             None,
@@ -1596,6 +1676,7 @@ impl ChatCompletionChunk {
             ChunkDelta {
                 role: None,
                 content: None,
+                reasoning_content: None,
                 tool_calls: Some(vec![ChunkToolCall {
                     index: 0,
                     id: Some(call_id.into()),
@@ -1624,6 +1705,7 @@ impl ChatCompletionChunk {
             ChunkDelta {
                 role: None,
                 content: None,
+                reasoning_content: None,
                 tool_calls: Some(vec![ChunkToolCall {
                     index: 0,
                     id: None,
@@ -1675,6 +1757,10 @@ pub struct ChunkDelta {
     pub role: Option<ResponseRole>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// The reasoning the model produced before its answer. The key is absent
+    /// when the chunk carries no reasoning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChunkToolCall>>,
 }
@@ -2642,6 +2728,7 @@ mod tests {
             123,
             MODEL,
             "hello",
+            None,
             ChatFinishReason::Stop,
             TokenUsage::new(3, 2),
         );
@@ -2683,6 +2770,7 @@ mod tests {
             123,
             MODEL,
             None,
+            None,
             call.clone(),
             TokenUsage::new(3, 2),
         );
@@ -2699,6 +2787,7 @@ mod tests {
             123,
             MODEL,
             Some("Checking.".to_owned()),
+            None,
             call,
             TokenUsage::new(3, 2),
         );

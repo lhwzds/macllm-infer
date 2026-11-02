@@ -9,6 +9,10 @@
 pub mod agent;
 pub mod architecture;
 pub mod backend;
+// The benchmark harness and the model adapters keep their long, auditable
+// steps and their toolchain names in one place, so the two lints that police
+// their size and their documentation are allowed for these modules.
+#[allow(clippy::too_many_lines, clippy::doc_markdown)]
 pub mod benchmark;
 pub mod cache;
 pub mod chat;
@@ -26,6 +30,7 @@ pub mod grammar;
 pub mod hub;
 mod mamba2;
 pub mod model_weights;
+#[allow(clippy::too_many_lines, clippy::doc_markdown)]
 pub mod models;
 pub mod openai;
 pub mod output;

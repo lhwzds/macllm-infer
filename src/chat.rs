@@ -51,7 +51,7 @@ impl ChatMessage {
 }
 
 /// Chat-template keyword options, mirroring the `chat_template_kwargs`
-/// convention of vLLM, SGLang and llama.cpp. `None` keeps the template's own
+/// convention of vLLM, `SGLang` and llama.cpp. `None` keeps the template's own
 /// default. Adapters reject any option they do not implement instead of
 /// silently ignoring it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

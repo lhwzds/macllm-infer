@@ -24,6 +24,16 @@ pub trait LogitsConstraint {
         Ok(())
     }
 
+    /// Validate a generation that ended at the token budget.
+    ///
+    /// A constraint that guards a tool call may be cut short by the budget:
+    /// the serving layer then reports the length limit and never exposes the
+    /// incomplete call. Constraints that must produce a complete value keep
+    /// the default behaviour and reject an incomplete one.
+    fn finish_at_length_boundary(&self) -> Result<()> {
+        self.finish()
+    }
+
     /// Whether [`Self::allows_token`] is implemented. The sampler then checks
     /// the few tokens it could select before paying for a full mask.
     fn checks_tokens(&self) -> bool {
@@ -92,7 +102,7 @@ impl Sampler {
         })
     }
 
-    /// Set request-local OpenAI penalties, independently of legacy sampling profiles.
+    /// Set request-local `OpenAI` penalties, independently of legacy sampling profiles.
     /// Use [`Self::sample_with_generated`] to supply the generated-only history;
     /// the legacy sampling methods intentionally supply an empty generated history.
     pub fn set_penalties(&mut self, presence: f32, frequency: f32) -> Result<()> {

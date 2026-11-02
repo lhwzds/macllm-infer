@@ -45,6 +45,9 @@ pub struct EngineMetadata {
     /// Template options the worker applies to requests that leave them
     /// unset, so protocol defaults can follow the effective template mode.
     pub chat_template_defaults: ChatTemplateOptions,
+    /// Whether the model's chat template leaves the reasoning block open for
+    /// the model to continue when thinking is enabled.
+    pub opens_thinking_block: bool,
 }
 
 /// Worker-owned automatic-prefix-cache diagnostics mirrored for read-only callers.
@@ -184,7 +187,7 @@ impl EngineConstraintSpec {
 pub struct EngineRequest {
     pub input: EngineInput,
     pub sampling: SamplingConfig,
-    /// Kept on EngineRequest rather than SamplingConfig to avoid changing unrelated sampling literals.
+    /// Kept on `EngineRequest` rather than `SamplingConfig` to avoid changing unrelated sampling literals.
     pub presence_penalty: f32,
     pub frequency_penalty: f32,
     pub max_new_tokens: usize,
@@ -745,6 +748,7 @@ struct InferenceJob {
     events: mpsc::Sender<EngineEvent>,
     cancelled: Arc<AtomicBool>,
     preflight: Option<oneshot::Sender<std::result::Result<(), EnginePreflightError>>>,
+    prompt_thinking: Arc<AtomicU8>,
     terminal_failure: Arc<Mutex<Option<EnginePreflightError>>>,
     event_send_timeout: Duration,
     batch_admission: Option<Arc<BatchAdmissionGate>>,
@@ -916,12 +920,14 @@ impl EngineHandle {
         let (preflight, readiness) = oneshot::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let terminal_failure = Arc::new(Mutex::new(None));
+        let prompt_thinking = Arc::new(AtomicU8::new(0));
         let job = InferenceJob {
             request,
             request_policy,
             events,
             cancelled: Arc::clone(&cancelled),
             preflight: Some(preflight),
+            prompt_thinking: Arc::clone(&prompt_thinking),
             terminal_failure: Arc::clone(&terminal_failure),
             event_send_timeout: self.event_send_timeout,
             batch_admission: None,
@@ -932,6 +938,7 @@ impl EngineHandle {
                 receiver,
                 cancelled,
                 preflight: Some(readiness),
+                prompt_thinking,
                 terminal_failure,
             }),
             Err(mpsc::error::TrySendError::Full(_)) => Err(SubmitError::Full),
@@ -993,12 +1000,14 @@ impl EngineHandle {
             let (preflight, readiness) = oneshot::channel();
             let cancelled = Arc::new(AtomicBool::new(false));
             let terminal_failure = Arc::new(Mutex::new(None));
+            let prompt_thinking = Arc::new(AtomicU8::new(0));
             let job = InferenceJob {
                 request,
                 request_policy,
                 events,
                 cancelled: Arc::clone(&cancelled),
                 preflight: Some(preflight),
+                prompt_thinking: Arc::clone(&prompt_thinking),
                 terminal_failure: Arc::clone(&terminal_failure),
                 event_send_timeout: self.event_send_timeout,
                 batch_admission: Some(Arc::clone(&gate)),
@@ -1013,6 +1022,7 @@ impl EngineHandle {
                     receiver,
                     cancelled,
                     preflight: Some(readiness),
+                    prompt_thinking,
                     terminal_failure,
                 }),
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1043,6 +1053,7 @@ pub struct EngineTicket {
     receiver: mpsc::Receiver<EngineEvent>,
     cancelled: Arc<AtomicBool>,
     preflight: Option<oneshot::Receiver<std::result::Result<(), EnginePreflightError>>>,
+    prompt_thinking: Arc<AtomicU8>,
     terminal_failure: Arc<Mutex<Option<EnginePreflightError>>>,
 }
 
@@ -1064,9 +1075,16 @@ impl EngineTicket {
                 receiver,
                 cancelled,
                 preflight: Some(readiness),
+                prompt_thinking: Arc::new(AtomicU8::new(0)),
                 terminal_failure,
             },
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_prompt_opens_thinking(&self, open: bool) {
+        self.prompt_thinking
+            .store(if open { 2 } else { 1 }, Ordering::Release);
     }
 
     /// Wait until the worker has rendered and tokenized the prompt, validated
@@ -1081,6 +1099,17 @@ impl EngineTicket {
                 kind: EngineFailureKind::Fatal,
             })
         })
+    }
+
+    /// Whether the actual rendered prompt ended inside a thinking block.
+    /// Available after successful preflight for templated requests.
+    #[must_use]
+    pub fn prompt_opens_thinking(&self) -> Option<bool> {
+        match self.prompt_thinking.load(Ordering::Acquire) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
     }
 
     pub async fn recv(&mut self) -> Option<EngineEvent> {
@@ -1186,6 +1215,22 @@ fn refresh_prefix_cache_snapshot(
     let _ = sample_prefix_cache_snapshot(model, shared, active_sequences, observation);
 }
 
+/// Whether the model's chat template leaves the reasoning block open.
+///
+/// A template that ends its prompt inside `<think>` makes every token the
+/// model writes reasoning until it closes the block. The probe is rendered
+/// with thinking enabled, because a template that closes the block when
+/// thinking is off never leaves it open.
+fn opens_thinking_block(adapter: &dyn crate::models::ModelAdapter) -> bool {
+    let options = ChatTemplateOptions {
+        enable_thinking: Some(true),
+    };
+    adapter
+        .format_chat_messages_with(&[ChatMessage::user("health check")], options)
+        .is_ok_and(|rendered| rendered.trim_end().ends_with("<think>"))
+}
+
+#[allow(clippy::too_many_lines)]
 fn worker_main(
     model: ModelLoadConfig,
     served_model: String,
@@ -1230,6 +1275,7 @@ fn worker_main(
         chat_template_defaults: scheduler_config
             .chat_template_defaults
             .or(runtime.adapter.chat_template_defaults()),
+        opens_thinking_block: opens_thinking_block(runtime.adapter.as_ref()),
     };
     let rendered = match runtime.adapter.format_serving_chat_probe() {
         Ok(rendered) => rendered,
@@ -2690,18 +2736,61 @@ fn initialize_logits_constraint(
     };
     let tokenizer = Arc::clone(&runtime.tokenizer);
     let stop_token_ids = runtime.model.runtime_spec().stop_token_ids.clone();
-    Ok(Some(match spec.grammar {
-        EngineConstraintGrammar::JsonSchema(schema) => Box::new(JsonSchemaTokenConstraint::new(
-            tokenizer,
-            stop_token_ids,
-            schema,
-        )?),
-        EngineConstraintGrammar::LazyToolCall(calls) => Box::new(LazyToolCallConstraint::new(
-            tokenizer,
-            stop_token_ids,
-            calls,
-        )?),
-    }))
+    let inner: Box<dyn LogitsConstraint> =
+        match spec.grammar {
+            EngineConstraintGrammar::JsonSchema(schema) => Box::new(
+                JsonSchemaTokenConstraint::new(tokenizer, stop_token_ids, schema)?,
+            ),
+            EngineConstraintGrammar::LazyToolCall(calls) => Box::new(LazyToolCallConstraint::new(
+                tokenizer,
+                stop_token_ids,
+                calls,
+            )?),
+        };
+    Ok(Some(Box::new(PurposeConstraint {
+        inner,
+        complete_at_length_boundary: spec.purpose == EngineConstraintPurpose::ResponseFormat,
+    })))
+}
+
+/// A request-local constraint that knows what a length boundary means.
+///
+/// A tool call may be cut short by the token budget: the serving layer then
+/// reports the length limit and never exposes the incomplete call. A
+/// response format must still be a complete JSON value.
+struct PurposeConstraint {
+    inner: Box<dyn LogitsConstraint>,
+    complete_at_length_boundary: bool,
+}
+
+impl LogitsConstraint for PurposeConstraint {
+    fn mask_logits(&mut self, logits: &mut [f32]) -> Result<()> {
+        self.inner.mask_logits(logits)
+    }
+
+    fn commit_token(&mut self, token: u32) -> Result<()> {
+        self.inner.commit_token(token)
+    }
+
+    fn finish(&self) -> Result<()> {
+        self.inner.finish()
+    }
+
+    fn finish_at_length_boundary(&self) -> Result<()> {
+        if self.complete_at_length_boundary {
+            self.inner.finish_at_length_boundary()
+        } else {
+            Ok(())
+        }
+    }
+
+    fn checks_tokens(&self) -> bool {
+        self.inner.checks_tokens()
+    }
+
+    fn allows_token(&self, token: u32) -> Result<bool> {
+        self.inner.allows_token(token)
+    }
 }
 
 fn kv_capacity_rejection(
@@ -2765,6 +2854,14 @@ fn prepare_request(
                     return None;
                 }
             };
+            job.prompt_thinking.store(
+                if rendered.trim_end().ends_with("<think>") {
+                    2
+                } else {
+                    1
+                },
+                Ordering::Release,
+            );
             match runtime.encode(rendered, false) {
                 Ok(tokens) => tokens,
                 Err(error) => {
@@ -2792,6 +2889,14 @@ fn prepare_request(
                     return None;
                 }
             };
+            job.prompt_thinking.store(
+                if rendered.trim_end().ends_with("<think>") {
+                    2
+                } else {
+                    1
+                },
+                Ordering::Release,
+            );
             match runtime.encode(rendered, false) {
                 Ok(tokens) => tokens,
                 Err(error) => {
@@ -2920,6 +3025,41 @@ mod tests {
     };
 
     use super::*;
+
+    struct IncompleteConstraint;
+
+    impl LogitsConstraint for IncompleteConstraint {
+        fn mask_logits(&mut self, _: &mut [f32]) -> Result<()> {
+            Ok(())
+        }
+        fn commit_token(&mut self, _: u32) -> Result<()> {
+            Ok(())
+        }
+        fn finish(&self) -> Result<()> {
+            anyhow::bail!("incomplete tool arguments")
+        }
+    }
+
+    #[test]
+    fn tool_constraints_accept_only_length_boundaries_when_incomplete() {
+        let tool = PurposeConstraint {
+            inner: Box::new(IncompleteConstraint),
+            complete_at_length_boundary: false,
+        };
+        assert!(tool.finish_at_length_boundary().is_ok());
+        assert!(
+            tool.finish()
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete tool arguments")
+        );
+        let response_format = PurposeConstraint {
+            inner: Box::new(IncompleteConstraint),
+            complete_at_length_boundary: true,
+        };
+        assert!(response_format.finish_at_length_boundary().is_err());
+        assert!(response_format.finish().is_err());
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ForwardTrace {
@@ -3513,6 +3653,7 @@ mod tests {
         let (preflight, readiness) = oneshot::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let terminal_failure = Arc::new(Mutex::new(None));
+        let prompt_thinking = Arc::new(AtomicU8::new(0));
         (
             InferenceJob {
                 request: EngineRequest {
@@ -3532,6 +3673,7 @@ mod tests {
                 events,
                 cancelled: Arc::clone(&cancelled),
                 preflight: Some(preflight),
+                prompt_thinking: Arc::clone(&prompt_thinking),
                 terminal_failure: Arc::clone(&terminal_failure),
                 event_send_timeout,
                 batch_admission: None,
@@ -3541,6 +3683,7 @@ mod tests {
                 receiver,
                 cancelled,
                 preflight: Some(readiness),
+                prompt_thinking,
                 terminal_failure,
             },
         )
@@ -3866,6 +4009,19 @@ mod tests {
     }
 
     #[test]
+    fn preflight_reports_the_actual_rendered_prompt_thinking_state() -> Result<()> {
+        let (runtime, _) = fake_runtime()?;
+        for (text, expected) in [("a <think>\n", true), ("a", false)] {
+            let (mut job, ticket) = job(text, 2, 4, Duration::from_secs(1));
+            assert_eq!(ticket.prompt_opens_thinking(), None);
+            prepare_request(&runtime, &mut job, ChatTemplateOptions::default())
+                .context("chat preflight failed")?;
+            assert_eq!(ticket.prompt_opens_thinking(), Some(expected));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn raw_token_input_bypasses_chat_rendering_and_preserves_ids() -> Result<()> {
         let (runtime, _state) = fake_runtime()?;
         let (mut raw_job, _ticket) =
@@ -4049,6 +4205,7 @@ mod tests {
             receiver,
             cancelled: Arc::clone(&cancelled),
             preflight: None,
+            prompt_thinking: Arc::new(AtomicU8::new(0)),
             terminal_failure: Arc::new(Mutex::new(None)),
         };
         drop(ticket);
@@ -4070,6 +4227,7 @@ mod tests {
                 device: "cpu".to_owned(),
                 dtype: "f32".to_owned(),
                 chat_template_defaults: ChatTemplateOptions::default(),
+                opens_thinking_block: false,
             },
             prefix_cache_snapshot: Arc::new(Mutex::new(EnginePrefixCacheSnapshot::default())),
             event_capacity: 1,
@@ -4111,6 +4269,7 @@ mod tests {
                 device: "cpu".to_owned(),
                 dtype: "f32".to_owned(),
                 chat_template_defaults: ChatTemplateOptions::default(),
+                opens_thinking_block: false,
             },
             prefix_cache_snapshot: Arc::new(Mutex::new(EnginePrefixCacheSnapshot::default())),
             event_capacity: 8,
@@ -4196,6 +4355,7 @@ mod tests {
                 device: "cpu".to_owned(),
                 dtype: "f32".to_owned(),
                 chat_template_defaults: ChatTemplateOptions::default(),
+                opens_thinking_block: false,
             },
             prefix_cache_snapshot: Arc::new(Mutex::new(EnginePrefixCacheSnapshot::default())),
             event_capacity: 8,
@@ -4273,6 +4433,7 @@ mod tests {
                 device: "cpu".to_owned(),
                 dtype: "f32".to_owned(),
                 chat_template_defaults: ChatTemplateOptions::default(),
+                opens_thinking_block: false,
             },
             prefix_cache_snapshot: Arc::new(Mutex::new(EnginePrefixCacheSnapshot::default())),
             event_capacity: 1,

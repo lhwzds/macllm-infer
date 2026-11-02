@@ -1235,8 +1235,10 @@ impl GenerationCore {
         if reaches_token_budget {
             // Validate before invoking the caller's visible-token callback so
             // an incomplete structured value cannot escape at a length
-            // boundary and only then turn into an error.
-            finish_constraint(&constraint)?;
+            // boundary and only then turn into an error. A tool call that the
+            // budget cut short is the one exception: the serving layer reports
+            // the length limit and never exposes the incomplete call.
+            finish_constraint_at_length(&constraint)?;
         }
         if self.generated_tokens == 0 {
             self.time_to_first_token = self.total_start.elapsed();
@@ -1343,6 +1345,19 @@ where
 fn finish_constraint(constraint: &Option<&mut (dyn LogitsConstraint + 'static)>) -> Result<()> {
     if let Some(constraint) = constraint.as_deref() {
         constraint.finish()?;
+    }
+    Ok(())
+}
+
+/// Validate a constraint at the token budget boundary.
+///
+/// A tool call that the budget cut short is not an error: the serving layer
+/// reports the length limit and drops the incomplete call.
+fn finish_constraint_at_length(
+    constraint: &Option<&mut (dyn LogitsConstraint + 'static)>,
+) -> Result<()> {
+    if let Some(constraint) = constraint.as_deref() {
+        constraint.finish_at_length_boundary()?;
     }
     Ok(())
 }
@@ -1837,6 +1852,67 @@ mod tests {
         assert!(visible_tokens.is_empty());
         assert_eq!(finish_calls.load(Ordering::Relaxed), 1);
         assert_eq!(sequence.status(), GenerationStatus::Failed);
+        Ok(())
+    }
+
+    /// A constraint whose value the token budget may cut short.
+    struct LengthTolerantConstraint {
+        allowed_token: u32,
+    }
+
+    impl LogitsConstraint for LengthTolerantConstraint {
+        fn mask_logits(&mut self, logits: &mut [f32]) -> Result<()> {
+            for (index, logit) in logits.iter_mut().enumerate() {
+                if index != self.allowed_token as usize {
+                    *logit = f32::NEG_INFINITY;
+                }
+            }
+            Ok(())
+        }
+
+        fn commit_token(&mut self, token: u32) -> Result<()> {
+            ensure!(token == self.allowed_token, "unexpected constrained token");
+            Ok(())
+        }
+
+        fn finish(&self) -> Result<()> {
+            anyhow::bail!("the constrained value is incomplete")
+        }
+
+        fn finish_at_length_boundary(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_value_cut_short_by_the_budget_finishes_at_its_length_limit() -> Result<()> {
+        let model = FakeModel::new(8, vec![1]);
+        let mut sequence = GenerationSequence::new(
+            &model,
+            vec![0],
+            greedy(),
+            GenerationConfig {
+                max_new_tokens: 1,
+                ignore_stop_tokens: true,
+            },
+        )?;
+        sequence.set_logits_constraint(Box::new(LengthTolerantConstraint { allowed_token: 1 }))?;
+        let mut visible_tokens = Vec::new();
+
+        let step = sequence.step(
+            &model,
+            || false,
+            |token| {
+                visible_tokens.push(token);
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(visible_tokens, [1]);
+        assert_eq!(
+            step.metrics().map(|metrics| metrics.finish_reason),
+            Some(FinishReason::Length)
+        );
         Ok(())
     }
 

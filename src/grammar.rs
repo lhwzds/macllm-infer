@@ -103,7 +103,7 @@ impl CompiledJsonSchema {
 /// How object schemas are admitted into the compiled subset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SchemaMode {
-    /// OpenAI strict mode: closed objects whose properties are all required.
+    /// `OpenAI` strict mode: closed objects whose properties are all required.
     Strict,
     /// A non-strict schema narrowed to its declared properties.
     Closed,
