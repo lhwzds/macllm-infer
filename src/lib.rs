@@ -35,6 +35,7 @@ pub mod models;
 pub mod openai;
 pub mod output;
 mod paged_attention;
+pub mod prefill_attention;
 pub mod prefix_cache;
 pub mod rerank;
 pub mod runtime;

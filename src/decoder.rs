@@ -27,6 +27,7 @@ use crate::{
         DenseWeightSource, LinearOp, TokenEmbedding, WeightPath, WeightSource, embedding,
         expert_linears_no_bias, linear_b, linear_no_bias, rms_norm,
     },
+    prefill_attention::{PrefillAttentionMode, sdpa_causal_attention, sdpa_supported},
     prefix_cache::TokenPrefixCache,
 };
 
@@ -889,6 +890,7 @@ impl SelfAttention {
         full_masks: Option<&mut LazyFullCausalMasks<'_>>,
         start_positions: &[usize],
         lane_lengths: &[usize],
+        prefill_attention: PrefillAttentionMode,
     ) -> Result<Tensor> {
         let (container_batch, total_tokens, _) = input.dims3()?;
         if container_batch != 1 {
@@ -962,6 +964,7 @@ impl SelfAttention {
                     full_masks.expect("full-attention mask slots were validated"),
                     start_positions,
                     lane_lengths,
+                    prefill_attention,
                 )?,
             PackedAttentionCache::Sliding(caches) => {
                 let AttentionKind::SlidingCausal { window } = self.kind else {
@@ -1017,6 +1020,7 @@ impl SelfAttention {
         full_masks: &mut LazyFullCausalMasks<'_>,
         start_positions: &[usize],
         lane_lengths: &[usize],
+        prefill_attention: PrefillAttentionMode,
     ) -> Result<Tensor> {
         let lanes = lane_lengths.len();
         let mut lane_queries = Vec::with_capacity(lanes);
@@ -1040,7 +1044,27 @@ impl SelfAttention {
         }
 
         let packed_query = Tensor::cat(&lane_queries, 2)?;
-        if all_native {
+        let fused = prefill_attention.uses_fused_kernel();
+        // The fused kernel serves the multi-row chunks it can express. When no
+        // chunk qualifies, the batch keeps the default path, including its
+        // single dispatch for the whole batch.
+        let fused_serves_chunk = fused
+            && lane_queries.iter().any(|lane_query| {
+                lane_query.dim(2).is_ok_and(|length| length > 1)
+                    && sdpa_supported(lane_query, self.logit_softcap)
+            });
+        // The default path picks one implementation for the whole batch: the
+        // native paged kernel when every lane supports it, and the dense
+        // fallback otherwise. The fused mode may only replace the multi-row
+        // chunks, so the lanes that keep the native path follow that same
+        // batch decision instead of picking an implementation of their own.
+        let batch_uses_native = all_native
+            && crate::paged_attention::metal_batch_attention_supported(&packed_query, lane_lengths);
+        // The native paged kernel serves a whole batch in one dispatch. The
+        // default mode keeps that dispatch for every batch it supports; the
+        // fused mode reserves it for batches without a fused chunk and routes
+        // the multi-row chunks to Candle's fused kernel instead.
+        if all_native && !fused_serves_chunk {
             let native_attention = {
                 let read = reservation
                     .layer_batch_read(layer)
@@ -1063,14 +1087,83 @@ impl SelfAttention {
         let mut offset = 0_usize;
         for (lane, &lane_length) in lane_lengths.iter().enumerate() {
             let lane_query = packed_query.narrow(2, offset, lane_length)?;
-            let mask = full_masks.get_or_build(lane)?;
-            let (key, value) = reservation
-                .materialize_layer(lane, layer)
-                .map_err(paged_kv_error)?;
-            lane_outputs.push(self.attention_values(&lane_query, &key, &value, mask)?);
+            let attention =
+                if fused && lane_length > 1 && sdpa_supported(&lane_query, self.logit_softcap) {
+                    // The fused kernel reads contiguous K/V, so gather this lane's
+                    // history from the paged cache before dispatching it. The
+                    // gathered history ends with the chunk, so the kernel's causal
+                    // diagonal covers exactly the lane's own prefix.
+                    let (key, value) = reservation
+                        .materialize_layer(lane, layer)
+                        .map_err(paged_kv_error)?;
+                    sdpa_causal_attention(&lane_query, &key, &value, self.scale)?
+                } else if fused && batch_uses_native {
+                    // The batch as a whole could have used the native paged
+                    // kernel, so this lane keeps it: single-row decode and the
+                    // geometries the fused kernel cannot express.
+                    self.native_lane_attention(
+                        reservation,
+                        layer,
+                        lane,
+                        &lane_query,
+                        start_positions[lane],
+                        full_masks,
+                    )?
+                } else {
+                    // The batch as a whole cannot use the native paged kernel, so
+                    // every lane keeps the dense fallback of the default path.
+                    let mask = full_masks.get_or_build(lane)?;
+                    self.dense_lane_attention(reservation, layer, lane, &lane_query, mask)?
+                };
+            lane_outputs.push(attention);
             offset += lane_length;
         }
         Tensor::cat(&lane_outputs, 2)
+    }
+
+    /// Native paged attention for one lane, with the dense path as fallback.
+    fn native_lane_attention(
+        &self,
+        reservation: &mut PagedKvBatchReservation,
+        layer: usize,
+        lane: usize,
+        lane_query: &Tensor,
+        start_position: usize,
+        full_masks: &mut LazyFullCausalMasks<'_>,
+    ) -> Result<Tensor> {
+        let native = {
+            let read = reservation
+                .layer_read(lane, layer)
+                .map_err(paged_kv_error)?;
+            crate::paged_attention::paged_attention(
+                lane_query,
+                &read,
+                start_position,
+                self.scale,
+                self.logit_softcap,
+            )?
+        };
+        if let Some(attention) = native {
+            Ok(attention)
+        } else {
+            let mask = full_masks.get_or_build(lane)?;
+            self.dense_lane_attention(reservation, layer, lane, lane_query, mask)
+        }
+    }
+
+    /// Dense full-causal attention for one lane over its materialized history.
+    fn dense_lane_attention(
+        &self,
+        reservation: &PagedKvBatchReservation,
+        layer: usize,
+        lane: usize,
+        lane_query: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (key, value) = reservation
+            .materialize_layer(lane, layer)
+            .map_err(paged_kv_error)?;
+        self.attention_values(lane_query, &key, &value, mask)
     }
 
     fn project_packed_qkv(
@@ -1144,24 +1237,15 @@ impl SelfAttention {
         value: &Tensor,
         mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let key = repeat_kv(key, self.kv_groups)?.contiguous()?;
-        let value = repeat_kv(value, self.kv_groups)?.contiguous()?;
-        let scores = query
-            .matmul(&key.transpose(2, 3)?)?
-            .affine(self.scale, 0.0)?;
-        let scores = match self.logit_softcap {
-            Some(softcap) => tanh_softcap(&scores, softcap)?,
-            None => scores,
-        };
-        let scores = match mask {
-            Some(mask) => scores.broadcast_add(mask)?,
-            None => scores,
-        };
-        // Match reference implementations: reduction in F32, model dtype after.
-        let score_dtype = scores.dtype();
-        let probabilities = candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?
-            .to_dtype(score_dtype)?;
-        probabilities.matmul(&value)
+        dense_causal_attention(
+            query,
+            key,
+            value,
+            self.kv_groups,
+            self.scale,
+            self.logit_softcap,
+            mask,
+        )
     }
 
     fn sliding_attention(
@@ -2595,6 +2679,7 @@ impl DecoderLayer {
         full_masks: Option<&mut LazyFullCausalMasks<'_>>,
         start_positions: &[usize],
         lane_lengths: &[usize],
+        prefill_attention: PrefillAttentionMode,
     ) -> Result<Tensor> {
         let normalized = self.mixer_norm.forward(input)?;
         let SequenceMixer::Attention(attention) = &self.mixer else {
@@ -2606,6 +2691,7 @@ impl DecoderLayer {
             full_masks,
             start_positions,
             lane_lengths,
+            prefill_attention,
         )?;
         self.finish_mixer(input, mixed)
     }
@@ -2638,6 +2724,7 @@ impl DecoderLayer {
         self.finish_mixer(input, mixed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_parallel_attention_mamba2_packed(
         &self,
         cache: PackedAttentionCache<'_, '_>,
@@ -2646,6 +2733,7 @@ impl DecoderLayer {
         full_masks: Option<&mut LazyFullCausalMasks<'_>>,
         start_positions: &[usize],
         lane_lengths: &[usize],
+        prefill_attention: PrefillAttentionMode,
     ) -> Result<Tensor> {
         let normalized = self.mixer_norm.forward(input)?;
         let SequenceMixer::ParallelAttentionMamba2 { attention, mamba2 } = &self.mixer else {
@@ -2657,6 +2745,7 @@ impl DecoderLayer {
             full_masks,
             start_positions,
             lane_lengths,
+            prefill_attention,
         )?;
         let recurrent = mamba2.forward_packed(states, &normalized, lane_lengths)?;
         self.finish_mixer(input, attention.add(&recurrent)?)
@@ -2943,6 +3032,8 @@ pub struct DecoderModel {
     full_layer_indices: Vec<Option<usize>>,
     paged_pool: Option<SharedPagedKvPool>,
     prefix_cache: Option<RefCell<DecoderPrefixCache>>,
+    /// Attention implementation used for multi-row prefill chunks.
+    prefill_attention: PrefillAttentionMode,
 }
 
 impl DecoderModel {
@@ -3079,6 +3170,7 @@ impl DecoderModel {
             full_layer_indices,
             paged_pool,
             prefix_cache: None,
+            prefill_attention: PrefillAttentionMode::default(),
         })
     }
 
@@ -3204,6 +3296,7 @@ impl DecoderModel {
                         Some(masks),
                         start_positions,
                         lane_lengths,
+                        self.prefill_attention,
                     )?;
                 }
                 SequenceMixerSpec::Attention(AttentionSpec {
@@ -3227,6 +3320,7 @@ impl DecoderModel {
                         None,
                         start_positions,
                         lane_lengths,
+                        self.prefill_attention,
                     )?;
                 }
                 SequenceMixerSpec::ShortConvolution(_) => {
@@ -3301,6 +3395,7 @@ impl DecoderModel {
                         Some(masks),
                         start_positions,
                         lane_lengths,
+                        self.prefill_attention,
                     )?;
                 }
             }
@@ -3353,6 +3448,14 @@ impl CausalLm for DecoderModel {
             self.dtype,
             &self.device,
         )?);
+        Ok(())
+    }
+
+    fn configure_prefill_attention(&mut self, mode: PrefillAttentionMode) -> Result<()> {
+        if self.identity.session_created.get() {
+            candle_core::bail!("prefill attention cannot be reconfigured after creating a session");
+        }
+        self.prefill_attention = mode;
         Ok(())
     }
 
@@ -4463,7 +4566,7 @@ fn kv_reservation_error(error: KvCacheReservationError) -> candle_core::Error {
     }
 }
 
-fn attention_mask_for_range(
+pub(crate) fn attention_mask_for_range(
     kind: AttentionKind,
     query_start: usize,
     query_len: usize,
@@ -4505,6 +4608,38 @@ fn attention_mask_for_range(
     }
     let mask = Tensor::from_vec(values, (query_len, key_len), device)?;
     Ok(Some(mask.to_dtype(dtype)?.unsqueeze(0)?.unsqueeze(0)?))
+}
+
+/// Dense full-causal attention over a materialized K/V history.
+///
+/// This is the reference attention path: the K/V heads are expanded for the
+/// matmul, the scores are scaled and optionally softcapped, the additive mask
+/// is applied and the softmax reduces in F32 before the value matmul.
+pub(crate) fn dense_causal_attention(
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+    kv_groups: usize,
+    scale: f64,
+    logit_softcap: Option<f64>,
+    mask: Option<&Tensor>,
+) -> Result<Tensor> {
+    let key = repeat_kv(key, kv_groups)?.contiguous()?;
+    let value = repeat_kv(value, kv_groups)?.contiguous()?;
+    let scores = query.matmul(&key.transpose(2, 3)?)?.affine(scale, 0.0)?;
+    let scores = match logit_softcap {
+        Some(softcap) => tanh_softcap(&scores, softcap)?,
+        None => scores,
+    };
+    let scores = match mask {
+        Some(mask) => scores.broadcast_add(mask)?,
+        None => scores,
+    };
+    // Match reference implementations: reduction in F32, model dtype after.
+    let score_dtype = scores.dtype();
+    let probabilities =
+        candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(score_dtype)?;
+    probabilities.matmul(&value)
 }
 
 /// Expand KV heads for the attention matmul only. The cached representation is
@@ -4566,6 +4701,47 @@ mod tests {
             num_layers,
             num_query_heads: 2,
             num_kv_heads: 1,
+            head_dim,
+            norm_epsilon: 1e-5,
+            layer_specs: vec![DecoderLayerSpec::standard(rope, head_dim); num_layers],
+            embedding_scale: 1.0,
+            final_logit_softcap: None,
+            final_logit_scale: 1.0,
+            projection_bias: ProjectionBias {
+                query: true,
+                key: true,
+                value: true,
+                output: false,
+            },
+            mlp_bias: false,
+            tied_embeddings: true,
+        }
+    }
+
+    /// A decoder geometry whose head dimension Candle's fused SDPA kernel
+    /// instantiates, so the fused prefill path can be compared with the
+    /// native paged path.
+    fn tiny_fused_spec() -> DecoderSpec {
+        let head_dim = 64;
+        let num_layers = 2;
+        let rope = RopeSpec {
+            theta: 10_000.0,
+            layout: RopeLayout::HalfSplit,
+            rotary_dim: head_dim,
+            frequency_factors: None,
+        };
+        DecoderSpec {
+            architecture: "test".into(),
+            runtime: crate::architecture::RuntimeSpec {
+                vocab_size: 32,
+                max_context: 64,
+                stop_token_ids: vec![2],
+            },
+            hidden_size: 4 * head_dim,
+            intermediate_size: 8 * head_dim,
+            num_layers,
+            num_query_heads: 4,
+            num_kv_heads: 2,
             head_dim,
             norm_epsilon: 1e-5,
             layer_specs: vec![DecoderLayerSpec::standard(rope, head_dim); num_layers],
@@ -5854,6 +6030,390 @@ mod tests {
 
     fn max_difference(left: &Tensor, right: &Tensor) -> Result<f32> {
         left.sub(right)?.abs()?.max_all()?.to_scalar::<f32>()
+    }
+
+    /// The fused prefill path must agree with the native paged path on the
+    /// same weights, inputs and cache state.
+    #[test]
+    fn fused_prefill_matches_native_prefill_on_metal() -> Result<()> {
+        let device = match Device::new_metal(0) {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Metal fused-prefill comparison: {error}");
+                return Ok(());
+            }
+        };
+        let spec = tiny_fused_spec();
+        let tensors = patterned_tiny_tensors(&spec, &device)?;
+        let pool = PagedKvPoolConfig::new(16, 4, 64).map_err(paged_kv_error)?;
+
+        let mut native = DecoderModel::load_dense(
+            spec.clone(),
+            VarBuilder::from_tensors(tensors.clone(), DType::F32, &device),
+        )?;
+        native.configure_kv_cache(pool)?;
+        let mut fused = DecoderModel::load_dense(
+            spec.clone(),
+            VarBuilder::from_tensors(tensors, DType::F32, &device),
+        )?;
+        fused.configure_kv_cache(pool)?;
+        fused.configure_prefill_attention(PrefillAttentionMode::Sdpa)?;
+
+        // A chunk that fills whole kernel query tiles uses the in-kernel
+        // causal diagonal; a shorter chunk uses the explicit additive mask.
+        for prompt_len in [17_usize, 32] {
+            let prompt = (0..prompt_len)
+                .map(|token| (token % 29 + 1) as u32)
+                .collect::<Vec<_>>();
+            let mut native_session = new_session(&native)?;
+            let native_logits = native.forward_tokens(native_session.as_mut(), &prompt, 0)?;
+            let mut fused_session = new_session(&fused)?;
+            let fused_logits = fused.forward_tokens(fused_session.as_mut(), &prompt, 0)?;
+            let difference = max_difference(&native_logits, &fused_logits)?;
+            assert!(
+                difference < 1e-4,
+                "fused and native prefill logits differed by {difference} for {prompt_len} tokens"
+            );
+        }
+        Ok(())
+    }
+
+    /// A prefill chunk that is longer than the native paged kernel's
+    /// 128-row limit must still use the fused kernel, and agree with the
+    /// dense fallback of the default path.
+    #[test]
+    fn fused_prefill_serves_chunks_longer_than_the_native_kernel() -> Result<()> {
+        let device = match Device::new_metal(0) {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Metal fused-prefill comparison: {error}");
+                return Ok(());
+            }
+        };
+        let mut spec = tiny_fused_spec();
+        spec.runtime.max_context = 512;
+        let tensors = patterned_tiny_tensors(&spec, &device)?;
+        let pool = PagedKvPoolConfig::new(16, 4, 64).map_err(paged_kv_error)?;
+
+        let mut native = DecoderModel::load_dense(
+            spec.clone(),
+            VarBuilder::from_tensors(tensors.clone(), DType::F32, &device),
+        )?;
+        native.configure_kv_cache(pool)?;
+        let mut fused =
+            DecoderModel::load_dense(spec, VarBuilder::from_tensors(tensors, DType::F32, &device))?;
+        fused.configure_kv_cache(pool)?;
+        fused.configure_prefill_attention(PrefillAttentionMode::Sdpa)?;
+
+        // 300 query rows exceed the native paged kernel's limit, so the
+        // default path serves the chunk with the dense fallback while the
+        // fused mode serves it with Candle's fused kernel.
+        let prompt_len = 300_usize;
+        let prompt = (0..prompt_len)
+            .map(|token| (token % 29 + 1) as u32)
+            .collect::<Vec<_>>();
+        let mut native_session = new_session(&native)?;
+        reset_full_causal_mask_construction_count();
+        let native_logits = native.forward_tokens(native_session.as_mut(), &prompt, 0)?;
+        let native_masks = full_causal_mask_construction_count();
+        let mut fused_session = new_session(&fused)?;
+        reset_full_causal_mask_construction_count();
+        let fused_logits = fused.forward_tokens(fused_session.as_mut(), &prompt, 0)?;
+        let fused_masks = full_causal_mask_construction_count();
+        let difference = max_difference(&native_logits, &fused_logits)?;
+        assert!(
+            difference < 1e-4,
+            "fused and native prefill logits differed by {difference} for {prompt_len} tokens"
+        );
+        // The dense fallback of the default path builds one causal mask for
+        // the chunk, while the fused kernel builds its own mask and never asks
+        // the decoder for one.
+        assert_eq!(
+            native_masks, 1,
+            "the default path builds a causal mask for a chunk the native kernel cannot serve"
+        );
+        assert_eq!(
+            fused_masks, 0,
+            "the fused kernel must serve a chunk longer than the native kernel's limit"
+        );
+        Ok(())
+    }
+
+    /// The fused prefill path must not move a single-row decode lane off the
+    /// attention path the default mode picks for the batch as a whole.
+    ///
+    /// The default path chooses one implementation per batch: the native
+    /// paged kernel when the whole batch supports it, and the dense fallback
+    /// otherwise. The fused mode may only replace the multi-row chunks, so
+    /// every other lane keeps the batch's decision.
+    #[test]
+    fn fused_prefill_keeps_the_decode_lane_on_the_batch_decision() -> Result<()> {
+        let device = Device::Cpu;
+        let spec = tiny_spec();
+        let tensors = patterned_tiny_tensors(&spec, &device)?;
+        let mut native = DecoderModel::load_dense(
+            spec.clone(),
+            VarBuilder::from_tensors(tensors.clone(), DType::F32, &device),
+        )?;
+        configure_multi_session_test_pool(&mut native)?;
+        let mut fused =
+            DecoderModel::load_dense(spec, VarBuilder::from_tensors(tensors, DType::F32, &device))?;
+        configure_multi_session_test_pool(&mut fused)?;
+        fused.configure_prefill_attention(PrefillAttentionMode::Sdpa)?;
+
+        let mut native_first = new_session(&native)?;
+        let mut native_second = new_session(&native)?;
+        let mut fused_first = new_session(&fused)?;
+        let mut fused_second = new_session(&fused)?;
+        let first_tokens = [1_u32, 2, 3];
+        let second_tokens = [4_u32];
+
+        crate::cache::reset_paged_batch_materialization_count();
+        let native_logits = {
+            let mut inputs = [
+                CausalLmBatchInput::new(native_first.as_mut(), &first_tokens, 0),
+                CausalLmBatchInput::new(native_second.as_mut(), &second_tokens, 0),
+            ];
+            native.forward_batch_tokens(&mut inputs)?
+        };
+        let native_materializations = crate::cache::paged_batch_materialization_count();
+
+        crate::cache::reset_paged_batch_materialization_count();
+        let fused_logits = {
+            let mut inputs = [
+                CausalLmBatchInput::new(fused_first.as_mut(), &first_tokens, 0),
+                CausalLmBatchInput::new(fused_second.as_mut(), &second_tokens, 0),
+            ];
+            fused.forward_batch_tokens(&mut inputs)?
+        };
+        let fused_materializations = crate::cache::paged_batch_materialization_count();
+
+        // The CPU backend has no fused kernel, so the mixed batch keeps the
+        // dense fallback of the default path for every lane, including the
+        // single-row decode lane.
+        assert!(
+            native_materializations > 0,
+            "the default path materializes the history of every lane"
+        );
+        assert_eq!(
+            fused_materializations, native_materializations,
+            "the fused path must not move the decode lane off the batch decision"
+        );
+        assert!(max_difference(&native_logits, &fused_logits)? < 1e-5);
+        Ok(())
+    }
+
+    /// A batch that the native paged kernel can serve as a whole must keep
+    /// its single-row decode lane on the native kernel in the fused mode.
+    ///
+    /// The default path serves such a batch with one native batch dispatch.
+    /// The fused mode replaces the multi-row chunk with Candle's fused
+    /// kernel, so the decode lane falls back to the native kernel for its own
+    /// lane. Both must produce the same logits, and the decode lane must not
+    /// materialize the history that the native kernel reads directly.
+    #[test]
+    fn fused_prefill_keeps_the_native_decode_lane_on_the_native_kernel() -> Result<()> {
+        let device = match Device::new_metal(0) {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Metal native-lane comparison: {error}");
+                return Ok(());
+            }
+        };
+        let mut spec = tiny_fused_spec();
+        spec.runtime.max_context = 512;
+        let layers = spec.layer_specs.len();
+        let tensors = patterned_tiny_tensors(&spec, &device)?;
+        let pool = PagedKvPoolConfig::new(16, 4, 64).map_err(paged_kv_error)?;
+
+        let mut native = DecoderModel::load_dense(
+            spec.clone(),
+            VarBuilder::from_tensors(tensors.clone(), DType::F32, &device),
+        )?;
+        native.configure_kv_cache(pool)?;
+        let mut fused =
+            DecoderModel::load_dense(spec, VarBuilder::from_tensors(tensors, DType::F32, &device))?;
+        fused.configure_kv_cache(pool)?;
+        fused.configure_prefill_attention(PrefillAttentionMode::Sdpa)?;
+
+        let mut native_chunk = new_session(&native)?;
+        let mut native_decode = new_session(&native)?;
+        let mut fused_chunk = new_session(&fused)?;
+        let mut fused_decode = new_session(&fused)?;
+
+        // The decode lane keeps a short prefix, so its single row is a real
+        // decode step over a non-empty history.
+        let decode_prefix = [5_u32, 6, 7];
+        native.forward_batch_tokens(&mut [CausalLmBatchInput::new(
+            native_decode.as_mut(),
+            &decode_prefix,
+            0,
+        )])?;
+        fused.forward_batch_tokens(&mut [CausalLmBatchInput::new(
+            fused_decode.as_mut(),
+            &decode_prefix,
+            0,
+        )])?;
+
+        // A chunk of whole kernel query tiles stays eligible for the native
+        // paged kernel, so the batch as a whole keeps the native decision.
+        let chunk_tokens: Vec<u32> = (0_u32..32).map(|token| token % 29 + 1).collect();
+        let decode_tokens = [8_u32];
+        let decode_start = decode_prefix.len();
+
+        crate::cache::reset_paged_batch_materialization_count();
+        let native_logits = {
+            let mut inputs = [
+                CausalLmBatchInput::new(native_chunk.as_mut(), &chunk_tokens, 0),
+                CausalLmBatchInput::new(native_decode.as_mut(), &decode_tokens, decode_start),
+            ];
+            native.forward_batch_tokens(&mut inputs)?
+        };
+        let native_materializations = crate::cache::paged_batch_materialization_count();
+
+        crate::cache::reset_paged_batch_materialization_count();
+        let fused_logits = {
+            let mut inputs = [
+                CausalLmBatchInput::new(fused_chunk.as_mut(), &chunk_tokens, 0),
+                CausalLmBatchInput::new(fused_decode.as_mut(), &decode_tokens, decode_start),
+            ];
+            fused.forward_batch_tokens(&mut inputs)?
+        };
+        let fused_materializations = crate::cache::paged_batch_materialization_count();
+
+        // The default path serves the whole batch with one native dispatch,
+        // which reads the paged cache without materializing the history.
+        assert_eq!(
+            native_materializations, 0,
+            "the native batch dispatch must not materialize the history"
+        );
+        // The fused mode materializes the history of the chunk it serves with
+        // the fused kernel, once per layer, and keeps the decode lane on the
+        // native kernel, which never materializes the history.
+        assert_eq!(
+            fused_materializations, layers,
+            "the fused path must serve the chunk and keep the decode lane native"
+        );
+        assert!(
+            max_difference(&native_logits, &fused_logits)? < 1e-4,
+            "the fused and default batches must agree"
+        );
+        Ok(())
+    }
+
+    /// A Metal batch that mixes a long prefill chunk with a single-row decode
+    /// lane must keep the decode lane on the attention path the default mode
+    /// picks for the batch as a whole.
+    ///
+    /// The long chunk exceeds the native paged kernel's 128-row limit, so the
+    /// default path cannot serve the batch with the native kernel and falls
+    /// back to the dense path for every lane. The fused mode replaces the long
+    /// chunk with Candle's fused kernel, but the decode lane must keep the
+    /// dense fallback of the batch decision instead of moving to the native
+    /// paged kernel.
+    #[test]
+    fn fused_prefill_keeps_the_decode_lane_on_the_batch_decision_on_metal() -> Result<()> {
+        let device = match Device::new_metal(0) {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping Metal mixed-batch comparison: {error}");
+                return Ok(());
+            }
+        };
+        let mut spec = tiny_fused_spec();
+        spec.runtime.max_context = 512;
+        let layers = spec.layer_specs.len();
+        let tensors = patterned_tiny_tensors(&spec, &device)?;
+        let pool = PagedKvPoolConfig::new(16, 4, 64).map_err(paged_kv_error)?;
+
+        let mut native = DecoderModel::load_dense(
+            spec.clone(),
+            VarBuilder::from_tensors(tensors.clone(), DType::F32, &device),
+        )?;
+        native.configure_kv_cache(pool)?;
+        let mut fused =
+            DecoderModel::load_dense(spec, VarBuilder::from_tensors(tensors, DType::F32, &device))?;
+        fused.configure_kv_cache(pool)?;
+        fused.configure_prefill_attention(PrefillAttentionMode::Sdpa)?;
+
+        let mut native_long = new_session(&native)?;
+        let mut native_decode = new_session(&native)?;
+        let mut fused_long = new_session(&fused)?;
+        let mut fused_decode = new_session(&fused)?;
+
+        // The decode lane keeps a short prefix, so its single row is a real
+        // decode step over a non-empty history.
+        let decode_prefix = [5_u32, 6, 7];
+        native.forward_batch_tokens(&mut [CausalLmBatchInput::new(
+            native_decode.as_mut(),
+            &decode_prefix,
+            0,
+        )])?;
+        fused.forward_batch_tokens(&mut [CausalLmBatchInput::new(
+            fused_decode.as_mut(),
+            &decode_prefix,
+            0,
+        )])?;
+
+        // The long lane exceeds the native paged kernel's row limit, so the
+        // batch as a whole cannot use the native kernel.
+        let long_tokens: Vec<u32> = (0_u32..300).map(|token| token % 29 + 1).collect();
+        let decode_tokens = [8_u32];
+        let decode_start = decode_prefix.len();
+
+        crate::cache::reset_paged_batch_materialization_count();
+        reset_full_causal_mask_construction_count();
+        let native_logits = {
+            let mut inputs = [
+                CausalLmBatchInput::new(native_long.as_mut(), &long_tokens, 0),
+                CausalLmBatchInput::new(native_decode.as_mut(), &decode_tokens, decode_start),
+            ];
+            native.forward_batch_tokens(&mut inputs)?
+        };
+        let native_materializations = crate::cache::paged_batch_materialization_count();
+        let native_masks = full_causal_mask_construction_count();
+
+        crate::cache::reset_paged_batch_materialization_count();
+        reset_full_causal_mask_construction_count();
+        let fused_logits = {
+            let mut inputs = [
+                CausalLmBatchInput::new(fused_long.as_mut(), &long_tokens, 0),
+                CausalLmBatchInput::new(fused_decode.as_mut(), &decode_tokens, decode_start),
+            ];
+            fused.forward_batch_tokens(&mut inputs)?
+        };
+        let fused_materializations = crate::cache::paged_batch_materialization_count();
+        let fused_masks = full_causal_mask_construction_count();
+
+        // The default path cannot serve the batch with the native paged
+        // kernel, so it materializes the history of both lanes in every layer.
+        assert_eq!(
+            native_materializations,
+            2 * layers,
+            "the default path materializes every lane of a batch the native kernel cannot serve"
+        );
+        // The fused mode replaces the long chunk with the fused kernel, which
+        // materializes the same history once, and the decode lane keeps the
+        // dense fallback of the batch decision.
+        assert_eq!(
+            fused_materializations, native_materializations,
+            "the fused path must not move the decode lane off the batch decision"
+        );
+        // The long chunk is served by Candle's fused kernel, which builds its
+        // own mask, while the default path asks the decoder for a causal mask.
+        assert_eq!(
+            native_masks, 1,
+            "the default path builds a causal mask for the long chunk"
+        );
+        assert_eq!(
+            fused_masks, 0,
+            "the fused kernel must serve the long chunk of the mixed batch"
+        );
+        assert!(
+            max_difference(&native_logits, &fused_logits)? < 1e-4,
+            "the fused and default batches must agree"
+        );
+        Ok(())
     }
 
     #[test]

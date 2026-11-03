@@ -9,6 +9,7 @@ use crate::{
     backend::{DTypeKind, DeviceKind},
     cache::PagedKvPoolConfig,
     models::ModelAdapter,
+    prefill_attention::PrefillAttentionMode,
     weights::{ModelFiles, ModelFormat},
 };
 
@@ -29,6 +30,8 @@ pub struct ModelLoadConfig {
     /// Maximum resident automatic-prefix snapshot cost in logical tokens.
     /// Zero keeps blocking run/bench commands cold by default.
     pub prefix_cache_capacity_tokens: usize,
+    /// Attention implementation used for multi-row prefill chunks.
+    pub prefill_attention: PrefillAttentionMode,
 }
 
 impl ModelLoadConfig {
@@ -46,6 +49,7 @@ impl ModelLoadConfig {
             kv_cache_slab_blocks: Self::DEFAULT_KV_CACHE_SLAB_BLOCKS,
             kv_cache_capacity_tokens: None,
             prefix_cache_capacity_tokens: 0,
+            prefill_attention: PrefillAttentionMode::default(),
         }
     }
 }
@@ -94,6 +98,7 @@ impl LoadedRuntime {
         drop(files);
         model.configure_kv_cache(cache_config)?;
         model.configure_prefix_cache(config.prefix_cache_capacity_tokens)?;
+        model.configure_prefill_attention(config.prefill_attention)?;
         release_loader_allocator_pages();
         Ok(Self {
             adapter,

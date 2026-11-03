@@ -1049,6 +1049,16 @@ pub trait CausalLm {
         Ok(())
     }
 
+    /// Select the attention implementation used for multi-row prefill chunks.
+    /// Architectures without full attention may ignore it; the default keeps
+    /// the native paged kernel.
+    fn configure_prefill_attention(
+        &mut self,
+        _mode: crate::prefill_attention::PrefillAttentionMode,
+    ) -> candle_core::Result<()> {
+        Ok(())
+    }
+
     /// Configure automatic prompt-prefix snapshots in logical token units.
     /// Zero disables the feature. Stateful runtimes that cannot yet restore a
     /// complete topology must reject a non-zero request rather than reuse only

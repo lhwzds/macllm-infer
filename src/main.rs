@@ -24,6 +24,7 @@ use macllm_infer::{
     generation::{GenerationConfig, GenerationMetrics, generate_with_prefill_token_quantum},
     hub::{DownloadSelection, download_model},
     models::qwen3_tasks::{Qwen3EmbeddingProfile, Qwen3RerankerProfile},
+    prefill_attention::PrefillAttentionMode,
     rerank::{RerankScore, rerank_token_batch},
     runtime::{LoadedRuntime, ModelLoadConfig},
     sampling::{Sampler, SamplingConfig},
@@ -103,6 +104,12 @@ struct RuntimeArgs {
     /// explicit values are rounded up to a whole logical block.
     #[arg(long)]
     kv_cache_capacity_tokens: Option<usize>,
+    /// Attention implementation for multi-row prefill chunks. `native` keeps
+    /// the paged Metal kernel and its dense fallback; `sdpa` routes multi-row
+    /// chunks through Candle's fused SDPA kernel over the materialized K/V
+    /// history. Single-token decode always keeps the native kernel.
+    #[arg(long, value_enum, default_value_t = PrefillAttentionMode::Native)]
+    prefill_attention: PrefillAttentionMode,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1294,6 +1301,7 @@ fn model_load_config(args: &RuntimeArgs) -> ModelLoadConfig {
     config.kv_cache_block_tokens = args.kv_cache_block_tokens;
     config.kv_cache_slab_blocks = args.kv_cache_slab_blocks;
     config.kv_cache_capacity_tokens = args.kv_cache_capacity_tokens;
+    config.prefill_attention = args.prefill_attention;
     config
 }
 
@@ -2310,6 +2318,83 @@ mod tests {
                 run.blocking_prefill.prefill_token_quantum,
             ),
             expected
+        );
+    }
+
+    #[test]
+    fn blocking_and_serving_commands_select_the_prefill_attention_path() {
+        let native = run_args(
+            Cli::try_parse_from(["macllm", "run", "--model", "model-dir", "--prompt", "hello"])
+                .unwrap(),
+        );
+        assert_eq!(
+            native.runtime.prefill_attention,
+            PrefillAttentionMode::Native
+        );
+        assert_eq!(
+            model_load_config(&native.runtime).prefill_attention,
+            PrefillAttentionMode::Native
+        );
+
+        let fused_run = run_args(
+            Cli::try_parse_from([
+                "macllm",
+                "run",
+                "--model",
+                "model-dir",
+                "--prompt",
+                "hello",
+                "--prefill-attention",
+                "sdpa",
+            ])
+            .unwrap(),
+        );
+        assert_eq!(
+            fused_run.runtime.prefill_attention,
+            PrefillAttentionMode::Sdpa
+        );
+        assert_eq!(
+            model_load_config(&fused_run.runtime).prefill_attention,
+            PrefillAttentionMode::Sdpa
+        );
+
+        let fused_bench = bench_generate_args(
+            Cli::try_parse_from([
+                "macllm",
+                "bench",
+                "generate",
+                "--model",
+                "model-dir",
+                "--prompt",
+                "hello",
+                "--prefill-attention",
+                "sdpa",
+            ])
+            .unwrap(),
+        );
+        assert_eq!(
+            fused_bench.runtime.prefill_attention,
+            PrefillAttentionMode::Sdpa
+        );
+
+        let fused_serve = serve_args(
+            Cli::try_parse_from([
+                "macllm",
+                "serve",
+                "--model",
+                "model-dir",
+                "--prefill-attention",
+                "sdpa",
+            ])
+            .unwrap(),
+        );
+        assert_eq!(
+            fused_serve.runtime.prefill_attention,
+            PrefillAttentionMode::Sdpa
+        );
+        assert_eq!(
+            model_load_config(&fused_serve.runtime).prefill_attention,
+            PrefillAttentionMode::Sdpa
         );
     }
 
