@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::{
     chat::{ChatMessage, ChatRole, ChatTemplateOptions, validate_chat_messages},
-    generation::FinishReason as GenerationFinishReason,
+    finish::FinishReason as GenerationFinishReason,
     grammar::CompiledJsonSchema,
     output::MAX_STOP_SEQUENCES,
 };
@@ -20,6 +20,36 @@ use crate::{
 pub const DEFAULT_MAX_COMPLETION_TOKENS: usize = 128;
 pub const DEFAULT_TEMPERATURE: f64 = 1.0;
 pub const DEFAULT_TOP_P: f64 = 1.0;
+
+/// Field names of the raw completion response.
+///
+/// The list belongs to the wire contract, so it lives next to the other
+/// protocol types. The serving layer re-exports it and the benchmark harness
+/// compares both implementations against it.
+pub const RAW_COMPLETION_RESPONSE_FIELDS: [&str; 22] = [
+    "index",
+    "content",
+    "stop",
+    "tokens_predicted",
+    "tokens_evaluated",
+    "truncated",
+    "stop_type",
+    "generation_settings/seed",
+    "generation_settings/temperature",
+    "generation_settings/top_k",
+    "generation_settings/top_p",
+    "generation_settings/repeat_penalty",
+    "generation_settings/ignore_eos",
+    "generation_settings/stream",
+    "generation_settings/max_tokens",
+    "generation_settings/n_predict",
+    "generation_settings/n_keep",
+    "timings/cache_n",
+    "timings/prompt_n",
+    "timings/prompt_ms",
+    "timings/predicted_n",
+    "timings/predicted_ms",
+];
 
 /// JSON request accepted by the Chat Completions endpoint.
 ///

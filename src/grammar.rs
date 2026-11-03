@@ -36,7 +36,7 @@ use serde_json::{Map, Value};
 use tokenizers::{Tokenizer, tokenizer::step_decode_stream};
 
 use crate::{
-    sampling::LogitsConstraint,
+    constraint::LogitsConstraint,
     tool_call::{
         NativeToolCall, TOOL_CALL_OPEN, TOOL_CALL_TAIL, ToolCallScan, parse_tool_call,
         parse_xml_tool_call, scan_tool_call, tool_call_head,

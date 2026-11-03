@@ -7,9 +7,12 @@ use std::{
 
 use crate::{
     architecture::{CausalLm, CausalLmBatchInput, CausalLmKvReservationInput, CausalLmSession},
-    sampling::{LogitsConstraint, Sampler},
+    constraint::LogitsConstraint,
+    sampling::Sampler,
 };
 use anyhow::{Context, Result, ensure};
+
+pub use crate::finish::FinishReason;
 
 #[derive(Debug, Clone, Copy)]
 pub struct GenerationConfig {
@@ -52,17 +55,6 @@ pub struct GenerationMetrics {
     pub decode_time: Duration,
     pub total_time: Duration,
     pub finish_reason: FinishReason,
-}
-
-/// Observable reason why a generation loop stopped producing tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FinishReason {
-    /// The configured output-token budget was exhausted.
-    Length,
-    /// The model emitted one of its configured stop-token IDs.
-    Stop,
-    /// The caller requested cooperative cancellation between model steps.
-    Cancelled,
 }
 
 /// Request-local control returned after observing one sampled token.

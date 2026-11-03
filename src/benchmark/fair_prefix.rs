@@ -24,7 +24,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::server::RAW_COMPLETION_RESPONSE_FIELDS;
+use crate::openai::RAW_COMPLETION_RESPONSE_FIELDS;
 
 use super::{
     BenchmarkCommand, DistributionSummary, FileProvenance, FileProvenanceGuard, ImplementationKind,

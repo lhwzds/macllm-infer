@@ -20,6 +20,7 @@ use crate::{
         KvCacheExhausted, KvCacheReservationError, PrefixCacheDiagnostics,
     },
     chat::{ChatMessage, ChatTemplateOptions},
+    constraint::LogitsConstraint,
     generation::{
         FinishReason, GenerationConfig, GenerationForwardPreview, GenerationMetrics,
         GenerationPreparation, GenerationPreview, GenerationSequence, GenerationStep,
@@ -30,7 +31,7 @@ use crate::{
     },
     output::StopFilter,
     runtime::{LoadedRuntime, ModelLoadConfig},
-    sampling::{LogitsConstraint, Sampler, SamplingConfig},
+    sampling::{Sampler, SamplingConfig},
     token_stream::TokenStream,
 };
 

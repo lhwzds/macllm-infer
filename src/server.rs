@@ -48,30 +48,10 @@ use crate::{
 };
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-pub const RAW_COMPLETION_RESPONSE_FIELDS: [&str; 22] = [
-    "index",
-    "content",
-    "stop",
-    "tokens_predicted",
-    "tokens_evaluated",
-    "truncated",
-    "stop_type",
-    "generation_settings/seed",
-    "generation_settings/temperature",
-    "generation_settings/top_k",
-    "generation_settings/top_p",
-    "generation_settings/repeat_penalty",
-    "generation_settings/ignore_eos",
-    "generation_settings/stream",
-    "generation_settings/max_tokens",
-    "generation_settings/n_predict",
-    "generation_settings/n_keep",
-    "timings/cache_n",
-    "timings/prompt_n",
-    "timings/prompt_ms",
-    "timings/predicted_n",
-    "timings/predicted_ms",
-];
+
+// The raw completion field list belongs to the wire contract, so the OpenAI
+// compatibility layer owns it. The serving layer keeps the historical path.
+pub use crate::openai::RAW_COMPLETION_RESPONSE_FIELDS;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -1835,7 +1815,7 @@ mod tests {
     #[test]
     fn qwen3_official_template_fixtures_through_server_lowering() {
         use crate::agent::AgentTemplateProfile;
-        use crate::models::qwen3::{
+        use crate::chat_templates::qwen3::{
             format_qwen3_agent_prompt, format_qwen3_chat_messages, python_json,
         };
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1932,8 +1912,8 @@ mod tests {
     #[test]
     fn qwen35_template_fixtures_through_server_lowering() {
         use crate::agent::AgentTemplateProfile;
+        use crate::chat_templates::qwen3::python_json;
         use crate::models::ModelAdapter;
-        use crate::models::qwen3::python_json;
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/chat_templates/rendered/qwen35");
         let cases: Value =
@@ -2015,7 +1995,7 @@ mod tests {
     #[test]
     fn qwen3_tool_declaration_preserves_wire_order_fields_and_python_escaping() {
         use crate::agent::AgentTemplateProfile;
-        use crate::models::qwen3::format_qwen3_agent_prompt;
+        use crate::chat_templates::qwen3::format_qwen3_agent_prompt;
         let body = r#"{
           "model":"test-model", "messages":[{"role":"user","content":"go"}],
           "tools":[{"function":{
@@ -4119,7 +4099,7 @@ mod tests {
         };
         assert_eq!(prompt.directive, AgentDirective::Auto);
         assert!(constraint.is_some());
-        let rendered = crate::models::qwen3::format_qwen3_agent_prompt(
+        let rendered = crate::chat_templates::qwen3::format_qwen3_agent_prompt(
             crate::agent::AgentTemplateProfile::Qwen3Current,
             &prompt,
             request.chat_template,
@@ -5182,7 +5162,8 @@ mod tests {
                 for call in calls {
                     let args = &mut call["function"]["arguments"];
                     if args.is_object() {
-                        *args = Value::String(crate::models::qwen3::python_json(args).unwrap());
+                        *args =
+                            Value::String(crate::chat_templates::qwen3::python_json(args).unwrap());
                     }
                 }
             }
@@ -5193,7 +5174,7 @@ mod tests {
     #[test]
     fn qwen3_reasoning_history_renders_the_pinned_fixture_bytes() {
         use crate::agent::AgentTemplateProfile;
-        use crate::models::qwen3::format_qwen3_agent_prompt;
+        use crate::chat_templates::qwen3::format_qwen3_agent_prompt;
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/chat_templates/rendered/qwen3");
         let cases: Value =
@@ -5261,7 +5242,7 @@ mod tests {
     /// render the turn exactly as if its content carried the block.
     #[test]
     fn reasoning_history_renders_the_same_bytes_as_a_thinking_block() {
-        use crate::models::qwen3::format_qwen3_chat_messages;
+        use crate::chat_templates::qwen3::format_qwen3_chat_messages;
         let split = json!({
             "model": "test-model",
             "messages": [

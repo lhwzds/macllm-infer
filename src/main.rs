@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum, builder::TypedValueParser};
 use macllm_infer::{
     backend::{DTypeKind, DeviceKind},
     benchmark::{
@@ -78,14 +78,30 @@ enum Command {
     Serve(ServeArgs),
 }
 
+/// Parse the `--device` selector.
+///
+/// The accepted spellings are listed explicitly so that the command line
+/// keeps the same values and help output, while the parsing itself stays
+/// with the backend types.
+fn device_kind_parser() -> impl TypedValueParser<Value = DeviceKind> {
+    clap::builder::PossibleValuesParser::new(DeviceKind::all())
+        .try_map(|value: String| value.parse::<DeviceKind>())
+}
+
+/// Parse the `--dtype` selector. See [`device_kind_parser`].
+fn dtype_kind_parser() -> impl TypedValueParser<Value = DTypeKind> {
+    clap::builder::PossibleValuesParser::new(DTypeKind::all())
+        .try_map(|value: String| value.parse::<DTypeKind>())
+}
+
 #[derive(Debug, Clone, Args)]
 struct RuntimeArgs {
     #[arg(short, long)]
     model: PathBuf,
-    #[arg(long, value_enum, default_value = "metal")]
+    #[arg(long, value_parser = device_kind_parser(), default_value = "metal")]
     device: DeviceKind,
     /// Activation dtype. Defaults to F32 for CPU or quantized GGUF, F16 otherwise.
-    #[arg(long, value_enum)]
+    #[arg(long, value_parser = dtype_kind_parser())]
     dtype: Option<DTypeKind>,
     /// Tokens per logical full-attention K/V block.
     #[arg(

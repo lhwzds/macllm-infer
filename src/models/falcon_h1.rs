@@ -3,22 +3,14 @@ use anyhow::{Result, bail, ensure};
 use crate::{
     architecture::{DecoderSpec, RuntimeSpec},
     chat::ChatMessage,
-    decoder::{
-        DecoderLayerWeightNames, DecoderModel, DecoderWeightNames, STANDARD_DECODER_WEIGHT_NAMES,
-    },
+    decoder::DecoderModel,
     model_weights::WeightSource,
     models::ModelAdapter,
 };
 
-pub(crate) const FALCON_H1_WEIGHT_NAMES: DecoderWeightNames = DecoderWeightNames {
-    layer: DecoderLayerWeightNames {
-        mixer_norm: "attn_norm",
-        feed_forward_norm: "ffn_norm",
-        parallel_mamba2: Some("mamba"),
-        ..STANDARD_DECODER_WEIGHT_NAMES.layer
-    },
-    ..STANDARD_DECODER_WEIGHT_NAMES
-};
+// The shared decoder and the adapters read the same weight-name table, so it
+// lives in the architecture module and is re-exported here.
+pub(crate) use crate::architecture::FALCON_H1_WEIGHT_NAMES;
 
 /// GGUF-backed Falcon-H1 adapter.
 ///

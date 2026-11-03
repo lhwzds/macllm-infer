@@ -1529,3 +1529,133 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Declarative weight names
+// ---------------------------------------------------------------------------
+
+/// Declarative semantic names requested from a [`WeightSource`].
+///
+/// Architecture adapters may compose a different table without teaching the
+/// shared decoder about a model family. Execution topology remains entirely in
+/// [`DecoderSpec`] and [`DecoderLayerSpec`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecoderWeightNames {
+    pub(crate) model: &'static str,
+    pub(crate) embedding: &'static str,
+    pub(crate) layers: &'static str,
+    pub(crate) final_norm: &'static str,
+    pub(crate) lm_head: &'static str,
+    pub(crate) layer: DecoderLayerWeightNames,
+    pub(crate) attention: AttentionWeightNames,
+    pub(crate) dense_feed_forward: DenseFeedForwardWeightNames,
+    pub(crate) sparse_moe: SparseMoeWeightNames,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecoderLayerWeightNames {
+    pub(crate) mixer_norm: &'static str,
+    pub(crate) feed_forward_norm: &'static str,
+    pub(crate) pre_feed_forward_norm: &'static str,
+    pub(crate) post_attention_norm: &'static str,
+    pub(crate) post_feed_forward_norm: &'static str,
+    pub(crate) attention: &'static str,
+    pub(crate) feed_forward: &'static str,
+    pub(crate) short_convolution: &'static str,
+    pub(crate) gated_delta: Option<&'static str>,
+    pub(crate) parallel_mamba2: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AttentionWeightNames {
+    pub(crate) query: &'static str,
+    pub(crate) key: &'static str,
+    pub(crate) value: &'static str,
+    pub(crate) output: &'static str,
+    pub(crate) query_norm: &'static str,
+    pub(crate) key_norm: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DenseFeedForwardWeightNames {
+    pub(crate) gate: &'static str,
+    pub(crate) up: &'static str,
+    pub(crate) down: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SparseMoeWeightNames {
+    pub(crate) router: &'static str,
+    pub(crate) experts: &'static str,
+    pub(crate) gate: &'static str,
+    pub(crate) up: &'static str,
+    pub(crate) down: &'static str,
+}
+
+pub(crate) const STANDARD_DECODER_WEIGHT_NAMES: DecoderWeightNames = DecoderWeightNames {
+    model: "model",
+    embedding: "embed_tokens",
+    layers: "layers",
+    final_norm: "norm",
+    lm_head: "lm_head",
+    layer: DecoderLayerWeightNames {
+        mixer_norm: "input_layernorm",
+        feed_forward_norm: "post_attention_layernorm",
+        pre_feed_forward_norm: "pre_feedforward_layernorm",
+        post_attention_norm: "post_attention_norm",
+        post_feed_forward_norm: "post_feedforward_layernorm",
+        attention: "self_attn",
+        feed_forward: "mlp",
+        short_convolution: "shortconv",
+        gated_delta: None,
+        parallel_mamba2: None,
+    },
+    attention: AttentionWeightNames {
+        query: "q_proj",
+        key: "k_proj",
+        value: "v_proj",
+        output: "o_proj",
+        query_norm: "q_norm",
+        key_norm: "k_norm",
+    },
+    dense_feed_forward: DenseFeedForwardWeightNames {
+        gate: "gate_proj",
+        up: "up_proj",
+        down: "down_proj",
+    },
+    sparse_moe: SparseMoeWeightNames {
+        router: "router",
+        experts: "experts",
+        gate: "gate_proj",
+        up: "up_proj",
+        down: "down_proj",
+    },
+};
+
+/// Weight names of the Falcon-H1 hybrid attention/Mamba2 trunk.
+///
+/// The table lives here so that the shared decoder and the model adapters
+/// agree on one source of truth without depending on each other.
+pub(crate) const FALCON_H1_WEIGHT_NAMES: DecoderWeightNames = DecoderWeightNames {
+    layer: DecoderLayerWeightNames {
+        mixer_norm: "attn_norm",
+        feed_forward_norm: "ffn_norm",
+        parallel_mamba2: Some("mamba"),
+        ..STANDARD_DECODER_WEIGHT_NAMES.layer
+    },
+    ..STANDARD_DECODER_WEIGHT_NAMES
+};
+
+/// Weight names of the Qwen3.5 gated-delta trunk.
+///
+/// The table lives here so that the shared decoder and the model adapters
+/// agree on one source of truth without depending on each other.
+pub(crate) const QWEN35_WEIGHT_NAMES: DecoderWeightNames = DecoderWeightNames {
+    layer: DecoderLayerWeightNames {
+        mixer_norm: "attn_norm",
+        feed_forward_norm: "attn_post_norm",
+        gated_delta: Some("linear_attn"),
+        ..STANDARD_DECODER_WEIGHT_NAMES.layer
+    },
+    ..STANDARD_DECODER_WEIGHT_NAMES
+};

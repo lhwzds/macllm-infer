@@ -78,7 +78,7 @@ impl ModelFiles {
             input.display()
         );
         let root = input.to_path_buf();
-        crate::hub::ensure_snapshot_complete(&root)?;
+        crate::snapshot::ensure_snapshot_complete(&root)?;
 
         let gguf_files = discover_gguf(&root)?;
         let safetensors = discover_safetensors(&root)?;
