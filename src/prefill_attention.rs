@@ -41,9 +41,9 @@ const MASK_NEGATIVE: f64 = -1.0e30;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum PrefillAttentionMode {
     /// Native paged Metal kernel, with the dense Candle path as its fallback.
-    #[default]
     Native,
     /// Candle's fused SDPA kernel over the materialized K/V history.
+    #[default]
     Sdpa,
 }
 

@@ -6052,6 +6052,7 @@ mod tests {
             VarBuilder::from_tensors(tensors.clone(), DType::F32, &device),
         )?;
         native.configure_kv_cache(pool)?;
+        native.configure_prefill_attention(PrefillAttentionMode::Native)?;
         let mut fused = DecoderModel::load_dense(
             spec.clone(),
             VarBuilder::from_tensors(tensors, DType::F32, &device),
@@ -6100,6 +6101,7 @@ mod tests {
             VarBuilder::from_tensors(tensors.clone(), DType::F32, &device),
         )?;
         native.configure_kv_cache(pool)?;
+        native.configure_prefill_attention(PrefillAttentionMode::Native)?;
         let mut fused =
             DecoderModel::load_dense(spec, VarBuilder::from_tensors(tensors, DType::F32, &device))?;
         fused.configure_kv_cache(pool)?;
@@ -6231,6 +6233,7 @@ mod tests {
             VarBuilder::from_tensors(tensors.clone(), DType::F32, &device),
         )?;
         native.configure_kv_cache(pool)?;
+        native.configure_prefill_attention(PrefillAttentionMode::Native)?;
         let mut fused =
             DecoderModel::load_dense(spec, VarBuilder::from_tensors(tensors, DType::F32, &device))?;
         fused.configure_kv_cache(pool)?;
@@ -6331,6 +6334,7 @@ mod tests {
             VarBuilder::from_tensors(tensors.clone(), DType::F32, &device),
         )?;
         native.configure_kv_cache(pool)?;
+        native.configure_prefill_attention(PrefillAttentionMode::Native)?;
         let mut fused =
             DecoderModel::load_dense(spec, VarBuilder::from_tensors(tensors, DType::F32, &device))?;
         fused.configure_kv_cache(pool)?;

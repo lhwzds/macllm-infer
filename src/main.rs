@@ -108,7 +108,7 @@ struct RuntimeArgs {
     /// the paged Metal kernel and its dense fallback; `sdpa` routes multi-row
     /// chunks through Candle's fused SDPA kernel over the materialized K/V
     /// history. Single-token decode always keeps the native kernel.
-    #[arg(long, value_enum, default_value_t = PrefillAttentionMode::Native)]
+    #[arg(long, value_enum, default_value_t = PrefillAttentionMode::Sdpa)]
     prefill_attention: PrefillAttentionMode,
 }
 
@@ -2327,13 +2327,10 @@ mod tests {
             Cli::try_parse_from(["macllm", "run", "--model", "model-dir", "--prompt", "hello"])
                 .unwrap(),
         );
-        assert_eq!(
-            native.runtime.prefill_attention,
-            PrefillAttentionMode::Native
-        );
+        assert_eq!(native.runtime.prefill_attention, PrefillAttentionMode::Sdpa);
         assert_eq!(
             model_load_config(&native.runtime).prefill_attention,
-            PrefillAttentionMode::Native
+            PrefillAttentionMode::Sdpa
         );
 
         let fused_run = run_args(
