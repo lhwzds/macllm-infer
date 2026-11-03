@@ -9,18 +9,21 @@ use candle_core::{DType, Device, Result, Tensor};
 
 const MIN_ALLOCATION_TOKENS: usize = 16;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-exports"))]
 thread_local! {
     static PAGED_BATCH_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn reset_paged_batch_materialization_count() {
+#[cfg(any(test, feature = "test-exports"))]
+#[doc(hidden)]
+pub fn reset_paged_batch_materialization_count() {
     PAGED_BATCH_MATERIALIZATIONS.set(0);
 }
 
-#[cfg(test)]
-pub(crate) fn paged_batch_materialization_count() -> usize {
+#[cfg(any(test, feature = "test-exports"))]
+#[must_use]
+#[doc(hidden)]
+pub fn paged_batch_materialization_count() -> usize {
     PAGED_BATCH_MATERIALIZATIONS.get()
 }
 
@@ -345,19 +348,22 @@ struct PagedKvSlab {
 /// the Metal resources alive while a custom operation is being encoded,
 /// without exposing allocator mutation through the attention layer.
 #[derive(Debug, Clone)]
-pub(crate) struct PagedKvSlabSnapshot {
+#[doc(hidden)]
+pub struct PagedKvSlabSnapshot {
     key: Tensor,
     value: Tensor,
 }
 
 impl PagedKvSlabSnapshot {
     #[must_use]
-    pub(crate) fn key(&self) -> &Tensor {
+    #[doc(hidden)]
+    pub fn key(&self) -> &Tensor {
         &self.key
     }
 
     #[must_use]
-    pub(crate) fn value(&self) -> &Tensor {
+    #[doc(hidden)]
+    pub fn value(&self) -> &Tensor {
         &self.value
     }
 }
@@ -381,7 +387,8 @@ struct PagedKvAttentionBatch {
 /// Immutable layer/lane view consumed by page-table-aware attention.
 #[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct PagedKvLayerRead<'a> {
+#[doc(hidden)]
+pub struct PagedKvLayerRead<'a> {
     batch: &'a PagedKvAttentionBatch,
     lane: usize,
     layer: usize,
@@ -393,7 +400,8 @@ pub(crate) struct PagedKvLayerRead<'a> {
 /// reservation. Keeping the batch borrowed ensures its slab handles and page
 /// table remain alive for the duration of one packed attention operation.
 #[derive(Debug)]
-pub(crate) struct PagedKvLayerBatchRead<'a> {
+#[doc(hidden)]
+pub struct PagedKvLayerBatchRead<'a> {
     batch: &'a PagedKvAttentionBatch,
     layer: usize,
 }
@@ -401,119 +409,142 @@ pub(crate) struct PagedKvLayerBatchRead<'a> {
 #[cfg_attr(not(test), allow(dead_code))]
 impl PagedKvLayerRead<'_> {
     #[must_use]
-    pub(crate) fn slabs(&self) -> &[PagedKvSlabSnapshot] {
+    #[doc(hidden)]
+    pub fn slabs(&self) -> &[PagedKvSlabSnapshot] {
         &self.batch.slabs
     }
 
     #[must_use]
-    pub(crate) fn page_table(&self) -> &Tensor {
+    #[doc(hidden)]
+    pub fn page_table(&self) -> &Tensor {
         &self.batch.page_table
     }
 
     #[must_use]
-    pub(crate) fn page_offset(&self) -> usize {
+    #[doc(hidden)]
+    pub fn page_offset(&self) -> usize {
         self.batch.lane_page_offsets[self.lane]
     }
 
     #[must_use]
-    pub(crate) fn page_count(&self) -> usize {
+    #[doc(hidden)]
+    pub fn page_count(&self) -> usize {
         self.batch.lane_page_counts[self.lane]
     }
 
     #[must_use]
-    pub(crate) fn logical_len(&self) -> usize {
+    #[doc(hidden)]
+    pub fn logical_len(&self) -> usize {
         self.batch.lane_logical_lens[self.lane]
     }
 
     #[must_use]
-    pub(crate) fn block_tokens(&self) -> usize {
+    #[doc(hidden)]
+    pub fn block_tokens(&self) -> usize {
         self.batch.block_tokens
     }
 
     #[must_use]
-    pub(crate) fn full_layers(&self) -> usize {
+    #[doc(hidden)]
+    pub fn full_layers(&self) -> usize {
         self.batch.full_layers
     }
 
     #[must_use]
-    pub(crate) fn kv_heads(&self) -> usize {
+    #[doc(hidden)]
+    pub fn kv_heads(&self) -> usize {
         self.batch.kv_heads
     }
 
     #[must_use]
-    pub(crate) fn head_dim(&self) -> usize {
+    #[doc(hidden)]
+    pub fn head_dim(&self) -> usize {
         self.batch.head_dim
     }
 
     #[must_use]
-    pub(crate) fn dtype(&self) -> DType {
+    #[doc(hidden)]
+    pub fn dtype(&self) -> DType {
         self.batch.dtype
     }
 
     #[must_use]
-    pub(crate) fn layer(&self) -> usize {
+    #[doc(hidden)]
+    pub fn layer(&self) -> usize {
         self.layer
     }
 }
 
 impl PagedKvLayerBatchRead<'_> {
     #[must_use]
-    pub(crate) fn slabs(&self) -> &[PagedKvSlabSnapshot] {
+    #[doc(hidden)]
+    pub fn slabs(&self) -> &[PagedKvSlabSnapshot] {
         &self.batch.slabs
     }
 
     #[must_use]
-    pub(crate) fn page_table(&self) -> &Tensor {
+    #[doc(hidden)]
+    pub fn page_table(&self) -> &Tensor {
         &self.batch.page_table
     }
 
     #[must_use]
-    pub(crate) fn lane_page_offsets(&self) -> &[usize] {
+    #[doc(hidden)]
+    pub fn lane_page_offsets(&self) -> &[usize] {
         &self.batch.lane_page_offsets
     }
 
     #[must_use]
-    pub(crate) fn lane_page_counts(&self) -> &[usize] {
+    #[doc(hidden)]
+    pub fn lane_page_counts(&self) -> &[usize] {
         &self.batch.lane_page_counts
     }
 
     #[must_use]
-    pub(crate) fn lane_logical_lens(&self) -> &[usize] {
+    #[doc(hidden)]
+    pub fn lane_logical_lens(&self) -> &[usize] {
         &self.batch.lane_logical_lens
     }
 
     #[must_use]
-    pub(crate) fn block_tokens(&self) -> usize {
+    #[doc(hidden)]
+    pub fn block_tokens(&self) -> usize {
         self.batch.block_tokens
     }
 
     #[must_use]
-    pub(crate) fn full_layers(&self) -> usize {
+    #[doc(hidden)]
+    pub fn full_layers(&self) -> usize {
         self.batch.full_layers
     }
 
     #[must_use]
-    pub(crate) fn layer(&self) -> usize {
+    #[doc(hidden)]
+    pub fn layer(&self) -> usize {
         self.layer
     }
 
     #[must_use]
-    pub(crate) fn kv_heads(&self) -> usize {
+    #[doc(hidden)]
+    pub fn kv_heads(&self) -> usize {
         self.batch.kv_heads
     }
 
     #[must_use]
-    pub(crate) fn head_dim(&self) -> usize {
+    #[doc(hidden)]
+    pub fn head_dim(&self) -> usize {
         self.batch.head_dim
     }
 
     #[must_use]
-    pub(crate) fn dtype(&self) -> DType {
+    #[doc(hidden)]
+    pub fn dtype(&self) -> DType {
         self.batch.dtype
     }
 
     #[must_use]
-    pub(crate) fn lane_count(&self) -> usize {
+    #[doc(hidden)]
+    pub fn lane_count(&self) -> usize {
         self.batch.lane_page_offsets.len()
     }
 }
@@ -2590,11 +2621,8 @@ impl PagedKvBatchReservation {
     /// layer. The first call snapshots all lanes and uploads one packed page
     /// table; subsequent layers reuse it without repeating host mapping work.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn layer_read(
-        &mut self,
-        lane: usize,
-        layer: usize,
-    ) -> PagedKvResult<PagedKvLayerRead<'_>> {
+    #[doc(hidden)]
+    pub fn layer_read(&mut self, lane: usize, layer: usize) -> PagedKvResult<PagedKvLayerRead<'_>> {
         let state = self
             .lanes
             .get(lane)
@@ -2626,10 +2654,8 @@ impl PagedKvBatchReservation {
     ///
     /// The first successful lane or batch read builds the compact snapshot;
     /// every later layer view borrows that same page table and slab set.
-    pub(crate) fn layer_batch_read(
-        &mut self,
-        layer: usize,
-    ) -> PagedKvResult<PagedKvLayerBatchRead<'_>> {
+    #[doc(hidden)]
+    pub fn layer_batch_read(&mut self, layer: usize) -> PagedKvResult<PagedKvLayerBatchRead<'_>> {
         for (lane, state) in self.lanes.iter().enumerate() {
             if !state.identity.alive.get()
                 || state.identity.in_flight.get() != Some(self.transaction)
@@ -2801,7 +2827,7 @@ impl PagedKvBatchReservation {
 
     /// Materialize one lane/layer's provisional history in page order.
     pub fn materialize_layer(&self, lane: usize, layer: usize) -> PagedKvResult<(Tensor, Tensor)> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-exports"))]
         PAGED_BATCH_MATERIALIZATIONS.set(PAGED_BATCH_MATERIALIZATIONS.get().saturating_add(1));
         let state = self
             .lanes
@@ -3165,7 +3191,8 @@ pub struct KvCacheStats {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SlidingCacheCheckpoint {
+#[doc(hidden)]
+pub struct SlidingCacheCheckpoint {
     absolute_len: usize,
     resident_len: usize,
     write_cursor: usize,
@@ -3428,7 +3455,9 @@ impl SlidingKvCache {
         self.write_cursor = 0;
     }
 
-    pub(crate) fn checkpoint(&self) -> SlidingCacheCheckpoint {
+    #[must_use]
+    #[doc(hidden)]
+    pub fn checkpoint(&self) -> SlidingCacheCheckpoint {
         SlidingCacheCheckpoint {
             absolute_len: self.absolute_len,
             resident_len: self.resident_len,
@@ -3436,7 +3465,8 @@ impl SlidingKvCache {
         }
     }
 
-    pub(crate) fn restore(&mut self, checkpoint: SlidingCacheCheckpoint) {
+    #[doc(hidden)]
+    pub fn restore(&mut self, checkpoint: SlidingCacheCheckpoint) {
         let SlidingCacheCheckpoint {
             absolute_len,
             resident_len,

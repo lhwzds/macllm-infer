@@ -1,0 +1,48 @@
+[package]
+name = "macllm-kernels"
+version = "0.1.0"
+edition = "2024"
+description = "Paged-attention, gated-delta and Mamba2 kernels for MacLLM Infer"
+license = "MIT"
+repository = "https://github.com/lhwzds/macllm-infer"
+
+[lib]
+name = "macllm_kernels"
+path = "src/lib.rs"
+
+[features]
+default = []
+metal = [
+    "dep:candle-metal-kernels",
+    "dep:objc2-metal",
+    "candle-core/metal",
+    "macllm-kv/metal",
+]
+accelerate = ["candle-core/accelerate", "macllm-kv/accelerate"]
+
+[dependencies]
+candle-core = { workspace = true }
+candle-metal-kernels = { workspace = true, optional = true }
+macllm-kv = { workspace = true }
+objc2-metal = { workspace = true, optional = true }
+
+[dev-dependencies]
+candle-nn = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -2 }
+pedantic = { level = "warn", priority = -1 }
+# Model dimensions are validated and far below integer conversion limits.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+# Public fallible APIs return contextual anyhow/Candle errors; duplicating an
+# Errors section on each small adapter method obscures the instructional docs.
+missing_errors_doc = "allow"
+# VarBuilder is an Arc-backed path cursor. Passing it by value makes weight
+# ownership and prefix derivation explicit at model construction boundaries.
+needless_pass_by_value = "allow"
+# Projection bias is checkpoint metadata, not independent application state.
+struct_excessive_bools = "allow"

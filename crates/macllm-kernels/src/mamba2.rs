@@ -13,7 +13,8 @@ use candle_core::{CpuStorage, CustomOp3, DType, Device, Layout, Result, Shape, S
 /// returns token output `[S, H, P]` plus final state `[H, P, N]` as views into
 /// one allocation. Unsupported devices, dtypes, or layouts return `None` so
 /// the decoder can use its readable tensor fallback.
-pub(crate) fn scan(
+#[doc(hidden)]
+pub fn scan(
     xbc: &Tensor,
     raw_dt: &Tensor,
     dt_bias: &Tensor,

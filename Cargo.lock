@@ -2181,6 +2181,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "macllm-chat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokenizers 0.23.1",
+]
+
+[[package]]
 name = "macllm-infer"
 version = "0.1.0"
 dependencies = [
@@ -2197,6 +2208,9 @@ dependencies = [
  "hf-hub",
  "http-body-util",
  "libc",
+ "macllm-chat",
+ "macllm-kernels",
+ "macllm-kv",
  "memmap2",
  "objc2-metal",
  "rand 0.9.5",
@@ -2208,6 +2222,25 @@ dependencies = [
  "tokenizers 0.23.1",
  "tokio",
  "tower",
+]
+
+[[package]]
+name = "macllm-kernels"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-metal-kernels",
+ "candle-nn",
+ "macllm-kv",
+ "objc2-metal",
+]
+
+[[package]]
+name = "macllm-kv"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "sha2 0.10.9",
 ]
 
 [[package]]

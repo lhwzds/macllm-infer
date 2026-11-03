@@ -1,11 +1,11 @@
 //! Module layering guard.
 //!
-//! The crate is being split into a Cargo workspace. Before the files move
-//! into their crates, the dependency direction between the modules must
-//! already follow the target layering, otherwise the mechanical move would
-//! introduce cycles that the compiler rejects.
+//! The crate is being split into a Cargo workspace. The chat group now lives
+//! in the `macllm-chat` crate, so Cargo itself enforces the boundary between
+//! the chat contracts and the tensor runtime: the guard only has to check
+//! that the crate manifest lists no forbidden dependency.
 //!
-//! The guard is intentionally a simple scan of the source text:
+//! The remaining rules are still a simple scan of the source text:
 //!
 //! * it removes the `#[cfg(test)]` regions, because test-only code may reach
 //!   into modules that the production code must not depend on. The whole
@@ -28,43 +28,31 @@
 //!
 //! The rules are:
 //!
-//! * the chat group (chat, tool calls, grammar, OpenAI wire types, agent
+//! * the chat crate (chat, tool calls, grammar, OpenAI wire types, agent
 //!   prompts, output filters, the logits-constraint and finish-reason
-//!   vocabulary and the chat templates) must not reach into the generation
-//!   runtime, the model adapters, the decoder, the server or `candle`;
+//!   vocabulary and the chat templates) must not depend on the tensor
+//!   runtime, the argument parser, the HTTP server or the root crate;
 //! * the server must not reach into the model adapters;
 //! * the benchmark harness must not reach into the server;
 //! * the backend selectors must not depend on the argument parser.
 
 use std::path::{Path, PathBuf};
 
-/// Files that form the chat group.
-const CHAT_GROUP: [&str; 11] = [
-    "src/agent.rs",
-    "src/chat.rs",
-    "src/chat_templates/mod.rs",
-    "src/chat_templates/qwen3.rs",
-    "src/chat_templates/qwen35.rs",
-    "src/constraint.rs",
-    "src/finish.rs",
-    "src/grammar.rs",
-    "src/openai.rs",
-    "src/output.rs",
-    "src/tool_call.rs",
-];
+/// The manifest of the crate that owns the chat group.
+const CHAT_CRATE_MANIFEST: &str = "crates/macllm-chat/Cargo.toml";
 
-/// Modules the chat group must not depend on.
-const CHAT_GROUP_FORBIDDEN: [&str; 6] = [
-    "engine",
-    "generation",
-    "sampling",
-    "models",
-    "decoder",
-    "server",
+/// Dependencies the chat crate must not list.
+///
+/// The chat group is protocol-independent, so it may not reach the tensor
+/// runtime, the argument parser, the HTTP server or the root crate.
+const CHAT_CRATE_FORBIDDEN: [&str; 6] = [
+    "candle-core",
+    "candle-nn",
+    "axum",
+    "tokio",
+    "clap",
+    "macllm-infer",
 ];
-
-/// The chat group must not depend on the tensor runtime.
-const CHAT_GROUP_FORBIDDEN_CRATE: &str = "candle";
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -606,6 +594,35 @@ fn forbidden_modules(relative: &str, forbidden: &[&str]) -> Vec<String> {
     forbidden_modules_in_source(&source, forbidden)
 }
 
+/// The dependency names a manifest declares in its `[dependencies]` tables.
+///
+/// Only the dependency tables are read: the package metadata and the
+/// repository URL may mention a crate without depending on it.
+fn declared_dependencies(manifest: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut in_dependencies = false;
+    for line in manifest.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_dependencies = line == "[dependencies]" || line.starts_with("[dependencies.");
+            continue;
+        }
+        if !in_dependencies {
+            continue;
+        }
+        if let Some((name, _)) = line.split_once('=') {
+            let name = name.trim().trim_matches('"');
+            if !name.is_empty() {
+                names.push(name.to_owned());
+            }
+        }
+    }
+    names
+}
+
 /// Read a source file and drop every `#[cfg(test)]` region.
 fn non_test_source(relative: &str) -> String {
     let path = repository_root().join(relative);
@@ -615,19 +632,20 @@ fn non_test_source(relative: &str) -> String {
 }
 
 #[test]
-fn chat_group_does_not_depend_on_the_runtime_or_the_tensors() {
+fn chat_crate_does_not_depend_on_the_runtime_or_the_tensors() {
+    let manifest = repository_root().join(CHAT_CRATE_MANIFEST);
+    let source = std::fs::read_to_string(&manifest)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest.display()));
+    let declared = declared_dependencies(&source);
     let mut violations = Vec::new();
-    for file in CHAT_GROUP {
-        for violation in forbidden_modules(file, &CHAT_GROUP_FORBIDDEN) {
-            violations.push(format!("{file} references {violation}"));
-        }
-        if non_test_source(file).contains(CHAT_GROUP_FORBIDDEN_CRATE) {
-            violations.push(format!("{file} references {CHAT_GROUP_FORBIDDEN_CRATE}"));
+    for dependency in CHAT_CRATE_FORBIDDEN {
+        if declared.iter().any(|name| name == dependency) {
+            violations.push(dependency);
         }
     }
     assert!(
         violations.is_empty(),
-        "the chat group must not depend on the generation runtime, the model adapters, the decoder, the server or candle:\n{}",
+        "the chat crate must not depend on the tensor runtime, the argument parser, the server or the root crate:\n{}",
         violations.join("\n")
     );
 }
@@ -681,10 +699,7 @@ fn backend_selectors_do_not_depend_on_the_argument_parser() {
 
 #[test]
 fn every_scanned_file_exists() {
-    for file in CHAT_GROUP {
-        let path: PathBuf = repository_root().join(file);
-        assert!(path.is_file(), "{file} should exist");
-    }
+    assert!(Path::new(&repository_root().join(CHAT_CRATE_MANIFEST)).is_file());
     assert!(Path::new(&repository_root().join("src/server.rs")).is_file());
 }
 

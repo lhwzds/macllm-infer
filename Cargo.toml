@@ -1,3 +1,33 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.dependencies]
+anyhow = "1.0"
+axum = { version = "0.8.9", features = ["http1", "json", "tokio"] }
+block2 = { version = "0.6" }
+bytemuck = "1.24"
+candle-core = { version = "0.11.0", default-features = false }
+candle-metal-kernels = { version = "0.11.0" }
+candle-nn = { version = "0.11.0", default-features = false }
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3.32"
+hf-hub = { version = "1.0.0", features = ["blocking", "rustls-tls"] }
+libc = "0.2"
+macllm-chat = { path = "crates/macllm-chat" }
+macllm-kv = { path = "crates/macllm-kv" }
+macllm-kernels = { path = "crates/macllm-kernels" }
+memmap2 = "0.9"
+objc2-metal = { version = "0.3.2" }
+rand = "0.9"
+rand_chacha = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order", "raw_value"] }
+sha2 = "0.10.9"
+tempfile = "3.20"
+tokenizers = "0.23.1"
+tokio = { version = "1.53", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+
 [package]
 name = "macllm-infer"
 version = "0.1.0"
@@ -18,35 +48,46 @@ metal = [
     "candle-nn/metal",
     "dep:candle-metal-kernels",
     "dep:objc2-metal",
+    "macllm-kernels/metal",
+    "macllm-kv/metal",
 ]
-accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
+accelerate = [
+    "candle-core/accelerate",
+    "candle-nn/accelerate",
+    "macllm-kernels/accelerate",
+    "macllm-kv/accelerate",
+]
 
 [dependencies]
-anyhow = "1.0"
-axum = { version = "0.8.9", features = ["http1", "json", "tokio"] }
-block2 = { version = "0.6", optional = true }
-bytemuck = "1.24"
-candle-core = { version = "0.11.0", default-features = false }
-candle-metal-kernels = { version = "0.11.0", optional = true }
-candle-nn = { version = "0.11.0", default-features = false }
-clap = { version = "4.5", features = ["derive"] }
-futures-util = "0.3.32"
-hf-hub = { version = "1.0.0", features = ["blocking", "rustls-tls"] }
-libc = "0.2"
-memmap2 = "0.9"
-objc2-metal = { version = "0.3.2", optional = true }
-rand = "0.9"
-rand_chacha = "0.9"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["preserve_order", "raw_value"] }
-sha2 = "0.10.9"
-tempfile = "3.20"
-tokenizers = "0.23.1"
-tokio = { version = "1.53", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+anyhow = { workspace = true }
+axum = { workspace = true }
+block2 = { workspace = true, optional = true }
+bytemuck = { workspace = true }
+candle-core = { workspace = true }
+candle-metal-kernels = { workspace = true, optional = true }
+candle-nn = { workspace = true }
+clap = { workspace = true }
+futures-util = { workspace = true }
+hf-hub = { workspace = true }
+libc = { workspace = true }
+macllm-chat = { workspace = true }
+macllm-kv = { workspace = true }
+macllm-kernels = { workspace = true }
+memmap2 = { workspace = true }
+objc2-metal = { workspace = true, optional = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+tokenizers = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 candle-transformers = { version = "0.11.0", default-features = false, features = ["metal", "accelerate"] }
 http-body-util = "0.1.4"
+macllm-kv = { workspace = true, features = ["test-exports"] }
 tower = { version = "0.5.3", features = ["util"] }
 
 [profile.release]

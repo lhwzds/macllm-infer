@@ -9,7 +9,8 @@ use candle_core::{CpuStorage, CustomOp3, DType, Device, Layout, Result, Shape, S
 /// the architecture contract unchanged while giving CPU and Metal a compact
 /// execution boundary. Unsupported layouts return `None` for the readable
 /// tensor fallback.
-pub(crate) fn decay_factors(
+#[doc(hidden)]
+pub fn decay_factors(
     alpha: &Tensor,
     time_bias: &Tensor,
     state_decay: &Tensor,
@@ -134,7 +135,8 @@ impl CustomOp3 for GatedDeltaDecayOp {
 /// decoder's handle-based transaction checkpoints remain valid if a later
 /// layer fails. Query and key are already normalized, query already includes
 /// its scale, and `decay`/`beta` are already transformed controls.
-pub(crate) fn decode_recurrence(
+#[doc(hidden)]
+pub fn decode_recurrence(
     query: &Tensor,
     key: &Tensor,
     value: &Tensor,
@@ -230,7 +232,8 @@ pub(crate) fn decode_recurrence(
 /// evolving state inside one result buffer instead of materializing several
 /// full recurrent-state tensors per token. The input state remains immutable,
 /// preserving the decoder transaction's rollback semantics.
-pub(crate) fn prefill_recurrence(
+#[doc(hidden)]
+pub fn prefill_recurrence(
     query: &Tensor,
     key: &Tensor,
     value: &Tensor,

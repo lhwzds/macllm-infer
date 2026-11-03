@@ -6,7 +6,6 @@
 //! - [`models`]: thin adapters that translate a checkpoint family into a spec.
 //! - [`decoder`]: the shared Transformer execution path.
 
-pub mod agent;
 pub mod architecture;
 pub mod backend;
 // The benchmark harness and the model adapters keep their long, auditable
@@ -14,37 +13,33 @@ pub mod backend;
 // their size and their documentation are allowed for these modules.
 #[allow(clippy::too_many_lines, clippy::doc_markdown)]
 pub mod benchmark;
-pub mod cache;
-pub mod chat;
-pub mod chat_templates;
-pub mod constraint;
 pub mod decoder;
 pub mod embedding;
 pub mod engine;
 #[cfg(feature = "metal")]
 mod file_backed_quant;
-pub mod finish;
-mod gated_delta;
 pub mod generation;
 pub mod gguf;
 pub mod gguf_model;
 pub mod gguf_tokenizer;
-pub mod grammar;
 pub mod hub;
-mod mamba2;
 pub mod model_weights;
 #[allow(clippy::too_many_lines, clippy::doc_markdown)]
 pub mod models;
-pub mod openai;
-pub mod output;
-mod paged_attention;
 pub mod prefill_attention;
-pub mod prefix_cache;
 pub mod rerank;
 pub mod runtime;
 pub mod sampling;
 pub mod server;
 pub(crate) mod snapshot;
 pub mod token_stream;
-pub mod tool_call;
 pub mod weights;
+
+// The chat group, the K/V cache and the custom kernels live in their own
+// crates now. The re-exports keep every existing path working.
+pub use macllm_chat::{
+    agent, chat, chat_templates, constraint, finish, grammar, openai, output, tool_call,
+};
+#[doc(hidden)]
+pub use macllm_kernels::{gated_delta, mamba2, paged_attention};
+pub use macllm_kv::{cache, prefix_cache};

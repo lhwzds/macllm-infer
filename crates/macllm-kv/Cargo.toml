@@ -1,0 +1,41 @@
+[package]
+name = "macllm-kv"
+version = "0.1.0"
+edition = "2024"
+description = "Paged K/V cache and request-prefix index for MacLLM Infer"
+license = "MIT"
+repository = "https://github.com/lhwzds/macllm-infer"
+
+[lib]
+name = "macllm_kv"
+path = "src/lib.rs"
+
+[features]
+default = []
+metal = ["candle-core/metal"]
+accelerate = ["candle-core/accelerate"]
+# Publish the test-only materialization counter so the crates that assert on
+# it can reach it across the crate boundary.
+test-exports = []
+
+[dependencies]
+candle-core = { workspace = true }
+sha2 = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -2 }
+pedantic = { level = "warn", priority = -1 }
+# Model dimensions are validated and far below integer conversion limits.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+# Public fallible APIs return contextual anyhow/Candle errors; duplicating an
+# Errors section on each small adapter method obscures the instructional docs.
+missing_errors_doc = "allow"
+# VarBuilder is an Arc-backed path cursor. Passing it by value makes weight
+# ownership and prefix derivation explicit at model construction boundaries.
+needless_pass_by_value = "allow"
+# Projection bias is checkpoint metadata, not independent application state.
+struct_excessive_bools = "allow"

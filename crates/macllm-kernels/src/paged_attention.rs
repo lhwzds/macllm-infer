@@ -13,7 +13,9 @@ const MAX_METAL_LANES: usize = 128;
 
 /// Cheap native-path preflight that does not allocate or upload a page table.
 #[cfg(feature = "metal")]
-pub(crate) fn metal_attention_supported(query: &Tensor) -> bool {
+#[must_use]
+#[doc(hidden)]
+pub fn metal_attention_supported(query: &Tensor) -> bool {
     let Ok((batch, _, query_len, head_dim)) = query.dims4() else {
         return false;
     };
@@ -31,7 +33,9 @@ pub(crate) fn metal_attention_supported(query: &Tensor) -> bool {
 /// the largest per-lane query chunk, so the packed token count itself is not
 /// subject to `MAX_METAL_QUERY_LEN`.
 #[cfg(feature = "metal")]
-pub(crate) fn metal_batch_attention_supported(query: &Tensor, lane_lengths: &[usize]) -> bool {
+#[must_use]
+#[doc(hidden)]
+pub fn metal_batch_attention_supported(query: &Tensor, lane_lengths: &[usize]) -> bool {
     let Ok((batch, _, _, head_dim)) = query.dims4() else {
         return false;
     };
@@ -50,12 +54,16 @@ pub(crate) fn metal_batch_attention_supported(query: &Tensor, lane_lengths: &[us
 }
 
 #[cfg(not(feature = "metal"))]
-pub(crate) fn metal_batch_attention_supported(_query: &Tensor, _lane_lengths: &[usize]) -> bool {
+#[must_use]
+#[doc(hidden)]
+pub fn metal_batch_attention_supported(_query: &Tensor, _lane_lengths: &[usize]) -> bool {
     false
 }
 
 #[cfg(not(feature = "metal"))]
-pub(crate) fn metal_attention_supported(_query: &Tensor) -> bool {
+#[must_use]
+#[doc(hidden)]
+pub fn metal_attention_supported(_query: &Tensor) -> bool {
     false
 }
 
@@ -68,7 +76,8 @@ pub(crate) fn metal_attention_supported(_query: &Tensor) -> bool {
 /// Unsupported device/dtype/shape combinations return `None` so the decoder
 /// can retain the materialized implementation as a correctness fallback.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn paged_attention(
+#[doc(hidden)]
+pub fn paged_attention(
     query: &Tensor,
     read: &PagedKvLayerRead<'_>,
     query_start: usize,
@@ -120,7 +129,8 @@ pub(crate) fn paged_attention(
 ///
 /// Unsupported device/dtype/shape combinations return `None`, matching the
 /// single-lane API's materialized-attention fallback contract.
-pub(crate) fn paged_attention_batch(
+#[doc(hidden)]
+pub fn paged_attention_batch(
     query: &Tensor,
     read: &PagedKvLayerBatchRead<'_>,
     start_positions: &[usize],
