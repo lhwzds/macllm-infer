@@ -472,6 +472,10 @@ impl ModelAdapter for LlamaAdapter {
         "llama"
     }
 
+    fn has_pinned_chat_template(&self) -> bool {
+        self.chat_template.is_some()
+    }
+
     fn runtime_spec(&self) -> &RuntimeSpec {
         &self.spec.runtime
     }
@@ -519,6 +523,7 @@ fn format_llama3_2_chat_messages(messages: &[ChatMessage]) -> Result<String> {
         Some(ChatMessage {
             role: ChatRole::System,
             content,
+            ..
         }) => (Some(content.as_str()), &messages[1..]),
         _ => (None, messages),
     };

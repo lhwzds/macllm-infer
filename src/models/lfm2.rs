@@ -298,6 +298,10 @@ impl ModelAdapter for Lfm2Adapter {
         "lfm2"
     }
 
+    fn has_pinned_chat_template(&self) -> bool {
+        self.chat_template.is_some()
+    }
+
     fn runtime_spec(&self) -> &RuntimeSpec {
         &self.spec.runtime
     }

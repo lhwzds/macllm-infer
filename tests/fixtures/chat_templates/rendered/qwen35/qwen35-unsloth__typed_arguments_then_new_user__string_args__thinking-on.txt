@@ -1,0 +1,70 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": "shell", "description": "Run a shell command and return its exit code and output.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}
+{"type": "function", "function": {"name": "write_file", "description": "Write a file.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Relative path."}, "content": {"type": "string"}, "mode": {"type": "integer"}, "append": {"type": "boolean"}, "tags": {"type": "array", "items": {"type": "string"}}, "meta": {"type": "object", "properties": {"owner": {"type": "string"}}}}, "required": ["path", "content"]}}}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+You are a careful coding agent.<|im_end|>
+<|im_start|>user
+Save a note.<|im_end|>
+<|im_start|>assistant
+<tool_call>
+<function=write_file>
+<parameter=path>
+notes/todo.md
+</parameter>
+<parameter=content>
+line one
+line two
+</parameter>
+<parameter=mode>
+420
+</parameter>
+<parameter=append>
+False
+</parameter>
+<parameter=tags>
+["a", "b"]
+</parameter>
+<parameter=meta>
+{"owner": "me"}
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+ok
+</tool_response><|im_end|>
+<|im_start|>assistant
+Saved.<|im_end|>
+<|im_start|>user
+Thanks. Now list files.<|im_end|>
+<|im_start|>assistant
+<think>

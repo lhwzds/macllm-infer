@@ -15,6 +15,8 @@ default = []
 
 [dependencies]
 anyhow = { workspace = true }
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

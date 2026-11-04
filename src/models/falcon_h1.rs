@@ -15,9 +15,8 @@ pub(crate) use crate::architecture::FALCON_H1_WEIGHT_NAMES;
 /// GGUF-backed Falcon-H1 adapter.
 ///
 /// Falcon-H1 geometry and hybrid attention/Mamba2 scheduling are lowered into
-/// a validated [`DecoderSpec`] by the GGUF loader. Chat formatting remains
-/// deliberately disabled until an exact embedded template is supported; raw
-/// prompts continue to use the same tokenizer and runtime path.
+/// a validated [`DecoderSpec`] by the GGUF loader. The loader adds generic
+/// Jinja chat rendering when the checkpoint embeds a template.
 #[derive(Debug, Clone)]
 pub struct FalconH1Adapter {
     spec: DecoderSpec,

@@ -146,15 +146,15 @@ fn gemma2_cpu_cache_matches_fresh_full_forward_and_llama_cpp_golden() -> anyhow:
 
 #[test]
 #[ignore = "requires the pinned Gemma 2 2B Q4_K_M GGUF and Apple Metal"]
-fn gemma2_metal_cache_matches_fresh_full_forward_and_llama_cpp_golden() -> anyhow::Result<()> {
+fn gemma2_metal_cache_matches_fresh_full_forward_and_llama_cpp_golden() {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     {
-        assert_backend(Device::new_metal(0)?, "Metal")
+        let device = Device::new_metal(0).expect("Metal device");
+        assert_backend(device, "Metal").expect("Gemma 2 Metal cache parity");
     }
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         eprintln!("skipping Gemma 2 Metal gate outside a Metal-enabled macOS build");
-        Ok(())
     }
 }
 

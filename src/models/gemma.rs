@@ -60,6 +60,10 @@ impl ModelAdapter for GemmaAdapter {
         "gemma"
     }
 
+    fn has_pinned_chat_template(&self) -> bool {
+        self.chat_template.is_some()
+    }
+
     fn runtime_spec(&self) -> &RuntimeSpec {
         &self.spec.runtime
     }
@@ -98,6 +102,7 @@ fn format_gemma_chat_messages(messages: &[ChatMessage]) -> Result<String> {
             ChatRole::User => "user",
             ChatRole::Assistant => "model",
             ChatRole::System => unreachable!("system messages were rejected above"),
+            ChatRole::Tool => unreachable!("chat history validation rejected a tool response"),
         };
         prompt.push_str("<start_of_turn>");
         prompt.push_str(role);
@@ -116,6 +121,84 @@ mod tests {
         Activation, AttentionKind, AttentionSpec, DecoderLayerSpec, FeedForwardKind, NormLayout,
         PositionEncodingSpec, ProjectionBias, RopeLayout, RopeSpec, SequenceMixerSpec,
     };
+
+    #[test]
+    fn unknown_gguf_template_uses_shared_fallback() -> Result<()> {
+        let source = "{{ bos_token }}{{ messages[0].content }}{{ eos_token }}";
+        let adapter = GemmaAdapter::from_decoder_spec(tiny_spec(), Some(source))?;
+        let adapter = crate::models::with_jinja_fallback(
+            Box::new(adapter),
+            crate::models::GgufPromptTokens {
+                chat_template: Some(source),
+                bos_token: Some("<bos>"),
+                eos_token: Some("<eos>"),
+            },
+        );
+        assert_eq!(
+            adapter.format_chat_messages(&[ChatMessage::user("hello")])?,
+            "<bos>hello<eos>"
+        );
+        assert_eq!(
+            adapter.format_chat_messages_with(
+                &[ChatMessage::user("hello")],
+                crate::chat::ChatTemplateOptions {
+                    enable_thinking: Some(false)
+                },
+            )?,
+            "<bos>hello<eos>"
+        );
+        let prompt = crate::agent::AgentPrompt {
+            messages: vec![crate::agent::AgentMessage::User {
+                content: "hello".into(),
+            }],
+            tools: vec![],
+            directive: crate::agent::AgentDirective::TextOnly,
+        };
+        assert!(adapter.agent_template_profile().is_none());
+        assert!(adapter.format_agent_prompt(&prompt).is_err());
+        assert!(
+            adapter
+                .format_agent_prompt_with(&prompt, crate::chat::ChatTemplateOptions::default())
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_jinja_does_not_prevent_adapter_construction() -> Result<()> {
+        let source = "{% for message in messages %}";
+        let adapter = GemmaAdapter::from_decoder_spec(tiny_spec(), Some(source))?;
+        let adapter = crate::models::with_jinja_fallback(
+            Box::new(adapter),
+            crate::models::GgufPromptTokens {
+                chat_template: Some(source),
+                ..Default::default()
+            },
+        );
+        adapter.validate()?;
+        let error = adapter
+            .format_chat_messages(&[ChatMessage::user("hello")])
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("not a valid Jinja program"));
+        Ok(())
+    }
+
+    #[test]
+    fn recognized_template_keeps_its_pinned_renderer() -> Result<()> {
+        let adapter = GemmaAdapter::from_decoder_spec(tiny_spec(), Some(OFFICIAL_CHAT_TEMPLATE))?;
+        let messages = [ChatMessage::user(" hello ")];
+        let expected = adapter.format_chat_messages(&messages)?;
+        let adapter = crate::models::with_jinja_fallback(
+            Box::new(adapter),
+            crate::models::GgufPromptTokens {
+                chat_template: Some(OFFICIAL_CHAT_TEMPLATE),
+                bos_token: Some("different BOS"),
+                eos_token: Some("different EOS"),
+            },
+        );
+        assert_eq!(adapter.format_chat_messages(&messages)?, expected);
+        Ok(())
+    }
 
     fn tiny_spec() -> DecoderSpec {
         DecoderSpec {

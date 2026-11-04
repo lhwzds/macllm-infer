@@ -1,13 +1,16 @@
 use anyhow::{Result, ensure};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Deserializer, ser::Serializer};
 
-/// A text-only role supported by the model chat templates.
+/// A role supported by the model chat templates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatRole {
     System,
     User,
     Assistant,
+    /// A tool response answering the assistant tool call before it. The
+    /// text-chat contract rejects it; chat templates render it.
+    Tool,
 }
 
 impl ChatRole {
@@ -17,16 +20,124 @@ impl ChatRole {
             Self::System => "system",
             Self::User => "user",
             Self::Assistant => "assistant",
+            Self::Tool => "tool",
         }
     }
 }
 
-/// One text message in a validated chat history.
+/// Tool-call arguments retained as JSON text, so a message stays cheap to
+/// clone and comparable. Templates observe an ordered JSON object; see
+/// [`ChatToolArguments::to_template_value`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChatToolArguments(String);
+
+impl ChatToolArguments {
+    /// Retain the JSON text of one call's arguments.
+    #[must_use]
+    pub fn from_json_text(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    /// The retained JSON text.
+    #[must_use]
+    pub fn as_json_text(&self) -> &str {
+        &self.0
+    }
+
+    /// The value a chat template observes: the ordered JSON object encoded by
+    /// the retained text, or the text itself when it is not an object.
+    /// `serde_json` preserves insertion order, so argument order survives.
+    #[must_use]
+    pub fn to_template_value(&self) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(&self.0)
+            .ok()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::Value::String(self.0.clone()))
+    }
+}
+
+impl Serialize for ChatToolArguments {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ChatToolArguments {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // The OpenAI wire format sends a JSON string; Hugging Face
+        // conversations keep the object itself.
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::String(text) => Ok(Self(text)),
+            object @ serde_json::Value::Object(_) => Ok(Self(object.to_string())),
+            other => Err(serde::de::Error::custom(format!(
+                "tool call arguments must be a JSON string or object, got {other}"
+            ))),
+        }
+    }
+}
+
+/// The `function` member of one retained tool call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatToolFunction {
+    pub name: String,
+    pub arguments: ChatToolArguments,
+}
+
+/// One function call retained in an assistant message, shaped the way a
+/// Hugging Face chat template iterates it (`id`, `type`, `function`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatToolCall {
+    pub id: String,
+    #[serde(rename = "type", default = "default_tool_call_type")]
+    pub kind: String,
+    pub function: ChatToolFunction,
+}
+
+fn default_tool_call_type() -> String {
+    "function".to_owned()
+}
+
+impl ChatToolCall {
+    /// Retain one call; every retained call has type `function`.
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: ChatToolArguments,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind: default_tool_call_type(),
+            function: ChatToolFunction {
+                name: name.into(),
+                arguments,
+            },
+        }
+    }
+}
+
+/// One message in a validated chat history. `role` and `content` cover every
+/// text turn; the remaining members carry the tool and reasoning payload that
+/// a generic chat template renders when it is present.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// The participant name supplied by the caller, as in the wire format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Reasoning kept apart from the visible answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    /// The calls an assistant turn made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatToolCall>>,
+    /// The call a tool turn answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -34,6 +145,10 @@ impl ChatMessage {
         Self {
             role,
             content: content.into(),
+            name: None,
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -47,6 +162,22 @@ impl ChatMessage {
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::new(ChatRole::Assistant, content)
+    }
+
+    /// A tool response answering `tool_call_id`.
+    #[must_use]
+    pub fn tool(content: impl Into<String>, tool_call_id: impl Into<String>) -> Self {
+        Self {
+            tool_call_id: Some(tool_call_id.into()),
+            ..Self::new(ChatRole::Tool, content)
+        }
+    }
+
+    /// The calls this assistant turn made, consumed by chat templates.
+    #[must_use]
+    pub fn with_tool_calls(mut self, tool_calls: Vec<ChatToolCall>) -> Self {
+        self.tool_calls = Some(tool_calls);
+        self
     }
 }
 
@@ -130,6 +261,7 @@ pub fn validate_chat_messages(messages: &[ChatMessage]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
 
     #[test]
     fn accepts_one_or_many_complete_user_turns() -> Result<()> {
@@ -169,8 +301,64 @@ mod tests {
         let message: ChatMessage =
             serde_json::from_str(r#"{"role":"assistant","content":"hello"}"#)?;
         assert_eq!(message, ChatMessage::assistant("hello"));
+        assert!(serde_json::from_str::<ChatMessage>(r#"{"role":"tool"}"#).is_err());
         assert!(
-            serde_json::from_str::<ChatMessage>(r#"{"role":"tool","content":"hello"}"#).is_err()
+            serde_json::from_str::<ChatMessage>(r#"{"role":"user","content":"hi","extra":1}"#)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retains_tool_turns_and_both_argument_spellings() -> Result<()> {
+        let call: ChatMessage = serde_json::from_str(
+            r#"{"role":"assistant","content":"","tool_calls":[{"id":"call_1",
+               "type":"function","function":{"name":"shell",
+               "arguments":"{\"command\": \"ls\"}"}}]}"#,
+        )?;
+        let first = call
+            .tool_calls
+            .as_ref()
+            .and_then(|calls| calls.first())
+            .context("one retained call")?;
+        assert_eq!(
+            (first.id.as_str(), first.kind.as_str()),
+            ("call_1", "function")
+        );
+        assert_eq!(first.function.name, "shell");
+        assert_eq!(
+            first.function.arguments.as_json_text(),
+            "{\"command\": \"ls\"}"
+        );
+        assert_eq!(
+            first.function.arguments.to_template_value(),
+            serde_json::json!({"command": "ls"})
+        );
+
+        let typed: ChatMessage = serde_json::from_str(
+            r#"{"role":"assistant","content":"","reasoning_content":"think",
+               "tool_calls":[{"id":"call_2","type":"function",
+               "function":{"name":"shell","arguments":{"command": "ls"}}}]}"#,
+        )?;
+        assert_eq!(
+            typed
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| calls.first())
+                .map(|call| call.function.arguments.to_template_value()),
+            Some(serde_json::json!({"command": "ls"}))
+        );
+        assert_eq!(typed.reasoning_content.as_deref(), Some("think"));
+
+        let response = ChatMessage::tool("ok", "call_1");
+        assert_eq!(response.role.as_str(), "tool");
+        assert_eq!(response.tool_call_id.as_deref(), Some("call_1"));
+        assert!(
+            serde_json::from_str::<ChatMessage>(
+                r#"{"role":"assistant","content":"","tool_calls":[{"id":"c",
+                   "type":"function","function":{"name":"n","arguments":7}}]}"#
+            )
+            .is_err()
         );
         Ok(())
     }

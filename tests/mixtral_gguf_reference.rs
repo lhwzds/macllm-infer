@@ -169,15 +169,15 @@ fn mixtral_cpu_matches_llama_cpp_and_cache_full() -> anyhow::Result<()> {
 
 #[test]
 #[ignore = "requires the pinned TinyMistral GGUF and Apple Metal"]
-fn mixtral_metal_matches_llama_cpp_and_cache_full() -> anyhow::Result<()> {
+fn mixtral_metal_matches_llama_cpp_and_cache_full() {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     {
-        assert_backend(Device::new_metal(0)?, "Metal")
+        let device = Device::new_metal(0).expect("Metal device");
+        assert_backend(device, "Metal").expect("Mixtral Metal cache parity");
     }
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
     {
         eprintln!("skipping Mixtral-compatible Metal gate outside a Metal-enabled macOS build");
-        Ok(())
     }
 }
 

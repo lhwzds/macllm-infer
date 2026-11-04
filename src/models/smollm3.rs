@@ -56,8 +56,7 @@ pub struct SmolLm3Adapter {
 
 impl SmolLm3Adapter {
     /// Construct an adapter from metadata already validated by the GGUF
-    /// loader. Unknown templates leave raw-prompt inference available while
-    /// disabling structured chat rendering.
+    /// loader, which attaches generic Jinja rendering for unknown templates.
     pub fn from_decoder_spec(spec: DecoderSpec, chat_template: Option<&str>) -> Result<Self> {
         ensure!(
             spec.architecture == "smollm3",
@@ -75,6 +74,10 @@ impl SmolLm3Adapter {
 impl ModelAdapter for SmolLm3Adapter {
     fn family(&self) -> &'static str {
         "smollm3"
+    }
+
+    fn has_pinned_chat_template(&self) -> bool {
+        self.chat_template.is_some()
     }
 
     fn runtime_spec(&self) -> &RuntimeSpec {
@@ -116,6 +119,7 @@ fn format_smollm3_chat_messages(messages: &[ChatMessage]) -> Result<String> {
     let Some(ChatMessage {
         role: ChatRole::System,
         content: system_message,
+        ..
     }) = messages.first()
     else {
         bail!(

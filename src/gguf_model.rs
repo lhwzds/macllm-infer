@@ -13,10 +13,10 @@ use crate::{
     gguf::{GgufBackendConfig, GgufFile, GgufMetadata, GgufValue, GgufValueType, LlamaQkConfig},
     gguf_tokenizer::{EmbeddedBpeTokenizer, EmbeddedSentencePieceTokenizer},
     models::{
-        ModelAdapter, falcon_h1::FalconH1Adapter, gemma::GemmaAdapter, gemma2::Gemma2Adapter,
-        gemma3::Gemma3Adapter, lfm2::Lfm2Adapter, llama::LlamaAdapter, qwen2::Qwen2Adapter,
-        qwen3::Qwen3Adapter, qwen3_moe::Qwen3MoeAdapter, qwen35::Qwen35Adapter,
-        smollm3::SmolLm3Adapter,
+        GgufPromptTokens, ModelAdapter, falcon_h1::FalconH1Adapter, gemma::GemmaAdapter,
+        gemma2::Gemma2Adapter, gemma3::Gemma3Adapter, lfm2::Lfm2Adapter, llama::LlamaAdapter,
+        qwen2::Qwen2Adapter, qwen3::Qwen3Adapter, qwen3_moe::Qwen3MoeAdapter,
+        qwen35::Qwen35Adapter, smollm3::SmolLm3Adapter,
     },
 };
 
@@ -265,6 +265,8 @@ pub struct GgufModel {
     spec: DecoderSpec,
     tokenizer: Arc<Tokenizer>,
     chat_template: Option<String>,
+    bos_token: Option<String>,
+    eos_token: Option<String>,
 }
 
 impl GgufModel {
@@ -289,13 +291,20 @@ impl GgufModel {
             ),
         };
         validate_decoder_tensors(&file, &spec)?;
-        let (tokenizer, chat_template) = embedded_tokenizer(file.metadata(), &spec)?;
+        let EmbeddedTokenizer {
+            tokenizer,
+            chat_template,
+            bos_token,
+            eos_token,
+        } = embedded_tokenizer(file.metadata(), &spec)?;
         Ok(Self {
             file,
             architecture,
             spec,
             tokenizer: Arc::new(tokenizer),
             chat_template,
+            bos_token,
+            eos_token,
         })
     }
 
@@ -310,6 +319,27 @@ impl GgufModel {
     }
 
     pub fn adapter(&self) -> Result<Box<dyn ModelAdapter>> {
+        // Prompt tokens ride along so an unpinned template can still render
+        // chat through the generic Jinja renderer.
+        let mut adapter = self.architecture_adapter()?;
+        let tokens = GgufPromptTokens {
+            chat_template: self.chat_template.as_deref(),
+            bos_token: self.bos_token.as_deref(),
+            eos_token: self.eos_token.as_deref(),
+        };
+        if matches!(
+            self.architecture,
+            GgufArchitecture::Qwen3 | GgufArchitecture::Qwen3Moe | GgufArchitecture::Qwen35
+        ) {
+            adapter.attach_prompt_tokens(tokens)?;
+            Ok(adapter)
+        } else {
+            Ok(crate::models::with_jinja_fallback(adapter, tokens))
+        }
+    }
+
+    /// Build the family adapter for this checkpoint's architecture.
+    fn architecture_adapter(&self) -> Result<Box<dyn ModelAdapter>> {
         match self.architecture {
             GgufArchitecture::FalconH1 => Ok(Box::new(FalconH1Adapter::from_decoder_spec(
                 self.spec.clone(),
@@ -3141,10 +3171,14 @@ fn validate_supported_qwen35_metadata(metadata: &GgufMetadata) -> Result<()> {
     Ok(())
 }
 
-fn embedded_tokenizer(
-    metadata: &GgufMetadata,
-    spec: &DecoderSpec,
-) -> Result<(Tokenizer, Option<String>)> {
+struct EmbeddedTokenizer {
+    tokenizer: Tokenizer,
+    chat_template: Option<String>,
+    bos_token: Option<String>,
+    eos_token: Option<String>,
+}
+
+fn embedded_tokenizer(metadata: &GgufMetadata, spec: &DecoderSpec) -> Result<EmbeddedTokenizer> {
     validate_tokenizer_build_budget(metadata)?;
     let tokens = require_string_array(metadata, "tokenizer.ggml.tokens")?;
     ensure!(
@@ -3182,6 +3216,17 @@ fn embedded_tokenizer(
     let eos_policy = optional_bool(metadata, "tokenizer.ggml.add_eos_token")?;
     let bos_token_id = optional_u32(metadata, "tokenizer.ggml.bos_token_id")?;
     let eos_token_id = optional_u32(metadata, "tokenizer.ggml.eos_token_id")?;
+    // A generic chat template may print the special tokens, so capture their
+    // strings before the tokenizer builders take ownership of the vocabulary.
+    let special_token = |token_id: Option<u32>| -> Option<String> {
+        token_id
+            .and_then(|token_id| usize::try_from(token_id).ok())
+            .and_then(|token_id| tokens.get(token_id))
+            .cloned()
+    };
+    let bos_string = special_token(bos_token_id);
+    let eos_string = special_token(eos_token_id);
+
     let tokenizer = match model {
         "gpt2" => EmbeddedBpeTokenizer {
             model: model.to_owned(),
@@ -3213,7 +3258,12 @@ fn embedded_tokenizer(
         unsupported => bail!("unsupported embedded tokenizer model `{unsupported}`"),
     };
     let chat_template = optional_string(metadata, "tokenizer.chat_template")?.map(str::to_owned);
-    Ok((tokenizer, chat_template))
+    Ok(EmbeddedTokenizer {
+        tokenizer,
+        chat_template,
+        bos_token: bos_string,
+        eos_token: eos_string,
+    })
 }
 
 fn validate_tokenizer_build_budget(metadata: &GgufMetadata) -> Result<()> {
@@ -3928,6 +3978,155 @@ mod tests {
     use crate::model_weights::GgufWeightSource;
 
     use super::*;
+
+    #[test]
+    fn invalid_chat_templates_preserve_raw_inference() -> Result<()> {
+        let originals = [
+            synthetic_llama_gguf(None)?,
+            synthetic_qwen3_gguf(
+                None,
+                SyntheticLlamaConfig {
+                    key_length: Some(2),
+                    projection_biases: false,
+                    qk_norm: true,
+                    ..SyntheticLlamaConfig::default()
+                },
+                None,
+            )?,
+            synthetic_qwen3_moe_gguf(SyntheticQwen3MoeConfig::default())?,
+            synthetic_qwen35_gguf(None)?,
+        ];
+        for original in &originals {
+            let original = GgufFile::open(original.path())?;
+            // Exercise both a syntax error and an unsupported Jinja construct.
+            for source in ["{% for m in messages %}", "{% trans %}hi{% endtrans %}"] {
+                let mut metadata: Vec<_> = original
+                    .metadata()
+                    .iter()
+                    .filter(|(key, _)| *key != "tokenizer.chat_template")
+                    .map(|(key, value)| (key, value.clone()))
+                    .collect();
+                metadata.push(("tokenizer.chat_template", GgufValue::String(source.into())));
+                let tensors = original
+                    .tensors()
+                    .iter()
+                    .map(|(name, info)| (name.as_str(), info.shape.iter().rev().copied().collect()))
+                    .collect();
+                let fixture = write_synthetic_gguf(metadata, tensors)?;
+                let model = GgufModel::open(fixture.path())?;
+                let adapter = model.adapter()?;
+                adapter.validate()?;
+                let messages = [crate::chat::ChatMessage::user("Hello")];
+                for error in [
+                    adapter.format_chat_messages(&messages).unwrap_err(),
+                    adapter
+                        .format_chat_messages_with(
+                            &messages,
+                            crate::chat::ChatTemplateOptions {
+                                enable_thinking: Some(false),
+                            },
+                        )
+                        .unwrap_err(),
+                ] {
+                    let error = format!("{error:#}");
+                    assert!(error.contains(adapter.family()), "{error}");
+                    assert!(error.contains("not a valid Jinja program"), "{error}");
+                }
+                let prompt = crate::agent::AgentPrompt {
+                    messages: vec![crate::agent::AgentMessage::User {
+                        content: "Hello".into(),
+                    }],
+                    tools: vec![],
+                    directive: crate::agent::AgentDirective::TextOnly,
+                };
+                assert!(adapter.agent_template_profile().is_none());
+                assert!(adapter.format_agent_prompt(&prompt).is_err());
+                assert!(
+                    adapter
+                        .format_agent_prompt_with(
+                            &prompt,
+                            crate::chat::ChatTemplateOptions::default(),
+                        )
+                        .is_err()
+                );
+                // Raw prompts never render the template. Build the runtime and
+                // run tokens to ensure the cached error cannot block inference.
+                // SAFETY: fixture stays alive and immutable through inference.
+                let backend = unsafe { model.file().backend(model.backend_config()) }?;
+                let weights = GgufWeightSource::new(backend, DType::F32, Device::Cpu);
+                let runtime = adapter.build(&weights)?;
+                let mut session = runtime.new_session()?;
+                let logits = runtime.forward_tokens(session.as_mut(), &[1, 2], 0)?;
+                assert_eq!(logits.dims2()?, (1, model.spec().runtime.vocab_size));
+                assert_eq!(session.cache_len(), 2);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_gguf_templates_render_chat_with_metadata_tokens_but_reject_agents() -> Result<()> {
+        let llama = synthetic_llama_gguf(None)?;
+        let qwen3 = synthetic_qwen3_gguf(
+            None,
+            SyntheticLlamaConfig {
+                key_length: Some(2),
+                projection_biases: false,
+                qk_norm: true,
+                ..SyntheticLlamaConfig::default()
+            },
+            None,
+        )?;
+        for original in [&llama, &qwen3] {
+            let original = GgufFile::open(original.path())?;
+            let mut metadata: Vec<_> = original
+                .metadata()
+                .iter()
+                .map(|(key, value)| (key, value.clone()))
+                .collect();
+            metadata.push(("tokenizer.ggml.bos_token_id", GgufValue::U32(1)));
+            metadata.push(("tokenizer.chat_template", GgufValue::String(
+                "{{ bos_token }}{% for m in messages %}{{ m.role }}:{{ m.content }}{% endfor %}{% if add_generation_prompt %}assistant:{% endif %}{{ 'unset' if enable_thinking is not defined else 'direct' }}{{ eos_token }}".into(),
+            )));
+            let tensors = original
+                .tensors()
+                .iter()
+                .map(|(name, info)| (name.as_str(), info.shape.iter().rev().copied().collect()))
+                .collect();
+            let fixture = write_synthetic_gguf(metadata, tensors)?;
+            let model = GgufModel::open(fixture.path())?;
+            let adapter = model.adapter()?;
+            let messages = [crate::chat::ChatMessage::user("Hello")];
+            assert_eq!(
+                adapter.format_chat_messages(&messages)?,
+                "auser:Helloassistant:unset<|stop|>"
+            );
+            assert_eq!(
+                adapter.format_chat_messages_with(
+                    &messages,
+                    crate::chat::ChatTemplateOptions {
+                        enable_thinking: Some(false)
+                    },
+                )?,
+                "auser:Helloassistant:direct<|stop|>"
+            );
+            let prompt = crate::agent::AgentPrompt {
+                messages: vec![crate::agent::AgentMessage::User {
+                    content: "Hello".into(),
+                }],
+                tools: vec![],
+                directive: crate::agent::AgentDirective::TextOnly,
+            };
+            assert!(adapter.agent_template_profile().is_none());
+            assert!(adapter.format_agent_prompt(&prompt).is_err());
+            assert!(
+                adapter
+                    .format_agent_prompt_with(&prompt, crate::chat::ChatTemplateOptions::default())
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn synthetic_falcon_h1_builds_parallel_attention_mamba2_runtime() -> Result<()> {

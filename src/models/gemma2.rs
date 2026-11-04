@@ -53,6 +53,10 @@ impl ModelAdapter for Gemma2Adapter {
         "gemma2"
     }
 
+    fn has_pinned_chat_template(&self) -> bool {
+        self.chat_template.is_some()
+    }
+
     fn runtime_spec(&self) -> &RuntimeSpec {
         &self.spec.runtime
     }
@@ -91,6 +95,7 @@ fn format_gemma2_chat_messages(messages: &[ChatMessage]) -> Result<String> {
             ChatRole::User => "user",
             ChatRole::Assistant => "model",
             ChatRole::System => unreachable!("system messages were rejected above"),
+            ChatRole::Tool => unreachable!("chat history validation rejected a tool response"),
         };
         prompt.push_str("<start_of_turn>");
         prompt.push_str(role);

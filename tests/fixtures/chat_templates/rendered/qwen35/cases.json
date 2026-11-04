@@ -335,6 +335,326 @@
           }
         }
       ]
+    },
+    "plain__string_args": {
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a careful coding agent."
+        },
+        {
+          "role": "user",
+          "content": "What is 2 + 2?"
+        }
+      ],
+      "tools": null
+    },
+    "tools_first_turn__string_args": {
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a careful coding agent."
+        },
+        {
+          "role": "user",
+          "content": "List the files in the current directory."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "command"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "write_file",
+            "description": "Write a file.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Relative path."
+                },
+                "content": {
+                  "type": "string"
+                },
+                "mode": {
+                  "type": "integer"
+                },
+                "append": {
+                  "type": "boolean"
+                },
+                "tags": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "meta": {
+                  "type": "object",
+                  "properties": {
+                    "owner": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "required": [
+                "path",
+                "content"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "tools_no_system__string_args": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "List the files in the current directory."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "command"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "tool_loop__string_args": {
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a careful coding agent."
+        },
+        {
+          "role": "user",
+          "content": "List the files in the current directory."
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "shell",
+                "arguments": "{\"command\": \"ls -la\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "a.txt\nb.txt"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "command"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "reasoning_and_text_before_call__string_args": {
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a careful coding agent."
+        },
+        {
+          "role": "user",
+          "content": "List the files in the current directory."
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\nI should list the files.\n</think>\n\nLet me check.",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "shell",
+                "arguments": "{\"command\": \"ls -la\"}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "a.txt\nb.txt"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "command"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "typed_arguments_then_new_user__string_args": {
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a careful coding agent."
+        },
+        {
+          "role": "user",
+          "content": "Save a note."
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_2",
+              "type": "function",
+              "function": {
+                "name": "write_file",
+                "arguments": "{\"path\": \"notes/todo.md\", \"content\": \"line one\\nline two\", \"mode\": 420, \"append\": false, \"tags\": [\"a\", \"b\"], \"meta\": {\"owner\": \"me\"}}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_2",
+          "content": "ok"
+        },
+        {
+          "role": "assistant",
+          "content": "Saved."
+        },
+        {
+          "role": "user",
+          "content": "Thanks. Now list files."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "command"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "write_file",
+            "description": "Write a file.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Relative path."
+                },
+                "content": {
+                  "type": "string"
+                },
+                "mode": {
+                  "type": "integer"
+                },
+                "append": {
+                  "type": "boolean"
+                },
+                "tags": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "meta": {
+                  "type": "object",
+                  "properties": {
+                    "owner": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "required": [
+                "path",
+                "content"
+              ]
+            }
+          }
+        }
+      ]
     }
   },
   "thinking": {

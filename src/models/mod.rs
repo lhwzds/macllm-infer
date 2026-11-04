@@ -18,6 +18,8 @@ use anyhow::{Context, Result, bail, ensure};
 use candle_nn::VarBuilder;
 use serde::Deserialize;
 
+use macllm_chat::jinja::JinjaChatTemplate;
+
 use crate::model_weights::{DenseWeightSource, WeightSource};
 use crate::{
     agent::{AgentPrompt, AgentTemplateProfile},
@@ -54,8 +56,8 @@ pub trait ModelAdapter {
     /// Family-specific constructor used by the checked public build path.
     #[doc(hidden)]
     fn build_model(&self, weights: &dyn WeightSource) -> candle_core::Result<Box<dyn CausalLm>>;
-    /// Render a validated chat history, or reject an unknown tokenizer
-    /// template. Callers can bypass this with their raw-prompt path.
+    /// Render a validated chat history through a pinned renderer or the
+    /// checkpoint's generic Jinja fallback.
     fn format_chat_messages(&self, messages: &[ChatMessage]) -> Result<String>;
 
     /// Template defaults relevant to serving and sampling.
@@ -113,6 +115,23 @@ pub trait ModelAdapter {
         self.format_chat_messages(&messages)
     }
 
+    /// Hand the tokenizer prompt tokens a GGUF checkpoint embeds to the
+    /// adapter. The GGUF loader calls this once, right after construction.
+    ///
+    /// Adapters whose template classification is byte-pinned keep rendering
+    /// chat through their own renderer. An adapter that accepts a generic
+    /// template compiles the Jinja fallback here for every other checkpoint
+    /// program. The GGUF loader wraps the remaining adapters with the shared
+    /// fallback instead.
+    fn attach_prompt_tokens(&mut self, _tokens: GgufPromptTokens<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether this adapter has a recognized native chat template.
+    fn has_pinned_chat_template(&self) -> bool {
+        false
+    }
+
     fn validate(&self) -> Result<()> {
         self.runtime_spec().validate()?;
         if let Some(spec) = self.decoder_spec() {
@@ -123,6 +142,153 @@ pub trait ModelAdapter {
             );
         }
         Ok(())
+    }
+}
+
+/// The prompt tokens a GGUF checkpoint embeds for chat rendering: the Jinja
+/// program in `tokenizer.chat_template` plus the special tokens it may print.
+///
+/// The strings are the tokenizer's own; a checkpoint that does not declare a
+/// token leaves it `None`, which the generic renderer passes as empty.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GgufPromptTokens<'a> {
+    pub chat_template: Option<&'a str>,
+    pub bos_token: Option<&'a str>,
+    pub eos_token: Option<&'a str>,
+}
+
+/// A checkpoint's embedded template, compiled for the generic renderer.
+///
+/// Adapters keep this for the templates they cannot verify byte-for-byte, so
+/// those checkpoints still chat instead of failing closed. Compilation errors
+/// are retained for chat requests, allowing raw-prompt inference to load and
+/// build the same adapter without requiring a usable chat template.
+#[derive(Debug, Clone)]
+pub(crate) struct JinjaChatFallback {
+    family: &'static str,
+    template: std::result::Result<JinjaChatTemplate, String>,
+}
+
+impl JinjaChatFallback {
+    /// Render a validated chat history through the embedded template.
+    ///
+    /// Tool-aware prompts stay on the pinned native profiles; the generic
+    /// renderer only serves ordinary text conversations.
+    pub(crate) fn format_chat_messages(
+        &self,
+        messages: &[ChatMessage],
+        options: ChatTemplateOptions,
+    ) -> Result<String> {
+        validate_chat_messages(messages)?;
+        self.template
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .render(messages, None, &options, true)
+            .with_context(|| {
+                format!(
+                    "the {} chat template could not render the conversation",
+                    self.family
+                )
+            })
+    }
+}
+
+/// Resolve the chat prompt path of a checkpoint and compile the generic
+/// renderer when the template is not one of the byte-pinned programs.
+///
+/// Adapters use this directly from [`ModelAdapter::attach_prompt_tokens`] or
+/// through [`with_jinja_fallback`] with the result of their template
+/// classification, so `classify_chat_template` returning `None` no longer
+/// disables chat rendering for a checkpoint that embeds a template. A failed
+/// compilation is cached just like a successful one and reported at render
+/// time; it must never prevent raw-prompt inference.
+pub(crate) fn jinja_chat_fallback(
+    family: &'static str,
+    pinned: bool,
+    tokens: GgufPromptTokens<'_>,
+) -> Option<JinjaChatFallback> {
+    if pinned {
+        log_chat_template_path(family, "pinned");
+        return None;
+    }
+    let Some(source) = tokens.chat_template else {
+        log_chat_template_path(family, "none (structured chat needs a raw prompt)");
+        return None;
+    };
+    let template = JinjaChatTemplate::new(
+        source,
+        tokens.bos_token.unwrap_or_default(),
+        tokens.eos_token.unwrap_or_default(),
+    )
+    .map_err(|error| format!("the {family} chat template is not a valid Jinja program: {error:#}"));
+    log_chat_template_path(family, "jinja");
+    Some(JinjaChatFallback { family, template })
+}
+
+/// One line per loaded model, so an operator can see which prompt path a
+/// checkpoint took.
+fn log_chat_template_path(family: &str, path: &str) {
+    eprintln!("chat template: family={family} path={path}");
+}
+
+/// Add generic chat rendering to adapters with unrecognized GGUF templates.
+pub(crate) fn with_jinja_fallback(
+    adapter: Box<dyn ModelAdapter>,
+    tokens: GgufPromptTokens<'_>,
+) -> Box<dyn ModelAdapter> {
+    let fallback =
+        jinja_chat_fallback(adapter.family(), adapter.has_pinned_chat_template(), tokens);
+    if let Some(fallback) = fallback {
+        Box::new(FallbackAdapter { adapter, fallback })
+    } else {
+        adapter
+    }
+}
+
+struct FallbackAdapter {
+    adapter: Box<dyn ModelAdapter>,
+    fallback: JinjaChatFallback,
+}
+
+impl ModelAdapter for FallbackAdapter {
+    fn family(&self) -> &'static str {
+        self.adapter.family()
+    }
+    fn runtime_spec(&self) -> &RuntimeSpec {
+        self.adapter.runtime_spec()
+    }
+    fn decoder_spec(&self) -> Option<&DecoderSpec> {
+        self.adapter.decoder_spec()
+    }
+    fn build_model(&self, weights: &dyn WeightSource) -> candle_core::Result<Box<dyn CausalLm>> {
+        self.adapter.build_model(weights)
+    }
+    fn format_chat_messages(&self, messages: &[ChatMessage]) -> Result<String> {
+        self.fallback
+            .format_chat_messages(messages, self.chat_template_defaults())
+    }
+    fn format_chat_messages_with(
+        &self,
+        messages: &[ChatMessage],
+        options: ChatTemplateOptions,
+    ) -> Result<String> {
+        self.fallback.format_chat_messages(messages, options)
+    }
+    fn chat_template_defaults(&self) -> ChatTemplateOptions {
+        self.adapter.chat_template_defaults()
+    }
+    fn agent_template_profile(&self) -> Option<AgentTemplateProfile> {
+        self.adapter.agent_template_profile()
+    }
+    fn format_agent_prompt(&self, prompt: &AgentPrompt) -> Result<String> {
+        self.adapter.format_agent_prompt(prompt)
+    }
+    fn format_agent_prompt_with(
+        &self,
+        prompt: &AgentPrompt,
+        options: ChatTemplateOptions,
+    ) -> Result<String> {
+        self.adapter.format_agent_prompt_with(prompt, options)
     }
 }
 
@@ -210,6 +376,7 @@ pub(crate) fn format_chatml_messages(
         Some(ChatMessage {
             role: ChatRole::System,
             content,
+            ..
         }) => (Some(content.as_str()), &messages[1..]),
         _ => (None, messages),
     };

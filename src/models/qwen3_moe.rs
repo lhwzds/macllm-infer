@@ -7,7 +7,7 @@ use crate::{
     decoder::DecoderModel,
     model_weights::WeightSource,
     models::{
-        ModelAdapter,
+        GgufPromptTokens, JinjaChatFallback, ModelAdapter, jinja_chat_fallback,
         qwen3::{
             Qwen3ChatTemplate, classify_chat_template, format_qwen3_agent_prompt,
             format_qwen3_chat_messages,
@@ -25,12 +25,15 @@ use crate::{
 pub struct Qwen3MoeAdapter {
     spec: DecoderSpec,
     chat_template: Option<Qwen3ChatTemplate>,
+    /// The embedded template of a checkpoint that is not one of the pinned
+    /// programs, compiled for the generic Jinja renderer.
+    jinja: Option<JinjaChatFallback>,
 }
 
 impl Qwen3MoeAdapter {
     /// Construct an adapter from an already validated GGUF decoder spec.
-    /// Unknown templates deliberately leave raw-prompt inference available
-    /// while disabling structured chat rendering.
+    /// The GGUF loader attaches generic Jinja rendering for unknown templates
+    /// after construction; native agent prompts still require a pinned profile.
     pub fn from_decoder_spec(spec: DecoderSpec, chat_template: Option<&str>) -> Result<Self> {
         ensure!(
             spec.architecture == "qwen3moe",
@@ -41,6 +44,7 @@ impl Qwen3MoeAdapter {
         Ok(Self {
             spec,
             chat_template: classify_chat_template(chat_template),
+            jinja: None,
         })
     }
 }
@@ -48,6 +52,10 @@ impl Qwen3MoeAdapter {
 impl ModelAdapter for Qwen3MoeAdapter {
     fn family(&self) -> &'static str {
         "qwen3moe"
+    }
+
+    fn has_pinned_chat_template(&self) -> bool {
+        self.chat_template.is_some()
     }
 
     fn runtime_spec(&self) -> &RuntimeSpec {
@@ -65,6 +73,11 @@ impl ModelAdapter for Qwen3MoeAdapter {
         Ok(Box::new(DecoderModel::load(self.spec.clone(), weights)?))
     }
 
+    fn attach_prompt_tokens(&mut self, tokens: GgufPromptTokens<'_>) -> Result<()> {
+        self.jinja = jinja_chat_fallback(self.family(), self.chat_template.is_some(), tokens);
+        Ok(())
+    }
+
     fn format_chat_messages(&self, messages: &[ChatMessage]) -> Result<String> {
         self.format_chat_messages_with(messages, ChatTemplateOptions::default())
     }
@@ -78,9 +91,12 @@ impl ModelAdapter for Qwen3MoeAdapter {
             Some(Qwen3ChatTemplate::Current | Qwen3ChatTemplate::Gguf) => {
                 format_qwen3_chat_messages(messages, options)
             }
-            None => bail!(
-                "unsupported or missing Qwen3MoE chat template; pass --raw-prompt or use the pinned official Qwen3 template"
-            ),
+            None => match &self.jinja {
+                Some(jinja) => jinja.format_chat_messages(messages, options),
+                None => bail!(
+                    "unsupported or missing Qwen3MoE chat template; pass --raw-prompt or use the pinned official Qwen3 template"
+                ),
+            },
         }
     }
 

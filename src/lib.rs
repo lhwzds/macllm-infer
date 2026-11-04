@@ -38,7 +38,7 @@ pub mod weights;
 // The chat group, the K/V cache and the custom kernels live in their own
 // crates now. The re-exports keep every existing path working.
 pub use macllm_chat::{
-    agent, chat, chat_templates, constraint, finish, grammar, openai, output, tool_call,
+    agent, chat, chat_templates, constraint, finish, grammar, jinja, openai, output, tool_call,
 };
 #[doc(hidden)]
 pub use macllm_kernels::{gated_delta, mamba2, paged_attention};

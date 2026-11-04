@@ -6,7 +6,7 @@ use crate::{
     chat::{ChatMessage, ChatTemplateOptions},
     decoder::DecoderModel,
     model_weights::WeightSource,
-    models::ModelAdapter,
+    models::{GgufPromptTokens, JinjaChatFallback, ModelAdapter, jinja_chat_fallback},
 };
 
 // The prompt renderers live in the chat group so that the serving and
@@ -33,6 +33,9 @@ pub(crate) use crate::architecture::QWEN35_WEIGHT_NAMES;
 pub struct Qwen35Adapter {
     spec: DecoderSpec,
     chat_template: Option<Qwen35ChatTemplate>,
+    /// The embedded template of a checkpoint that is not one of the pinned
+    /// programs, compiled for the generic Jinja renderer.
+    jinja: Option<JinjaChatFallback>,
 }
 
 impl Qwen35Adapter {
@@ -48,6 +51,7 @@ impl Qwen35Adapter {
         Ok(Self {
             spec,
             chat_template: classify_chat_template(chat_template),
+            jinja: None,
         })
     }
 }
@@ -55,6 +59,10 @@ impl Qwen35Adapter {
 impl ModelAdapter for Qwen35Adapter {
     fn family(&self) -> &'static str {
         "qwen35"
+    }
+
+    fn has_pinned_chat_template(&self) -> bool {
+        self.chat_template.is_some()
     }
 
     fn runtime_spec(&self) -> &RuntimeSpec {
@@ -76,6 +84,11 @@ impl ModelAdapter for Qwen35Adapter {
         )?))
     }
 
+    fn attach_prompt_tokens(&mut self, tokens: GgufPromptTokens<'_>) -> Result<()> {
+        self.jinja = jinja_chat_fallback(self.family(), self.chat_template.is_some(), tokens);
+        Ok(())
+    }
+
     fn format_chat_messages(&self, messages: &[ChatMessage]) -> Result<String> {
         self.format_chat_messages_with(messages, ChatTemplateOptions::default())
     }
@@ -93,9 +106,12 @@ impl ModelAdapter for Qwen35Adapter {
             Some(template @ (Qwen35ChatTemplate::Official | Qwen35ChatTemplate::Unsloth)) => {
                 format_qwen35_plain(messages, template == Qwen35ChatTemplate::Official, options)
             }
-            None => bail!(
-                "unsupported or missing Qwen3.5 chat template; use `run --raw-prompt` or a pinned Qwen3.5 template"
-            ),
+            None => match &self.jinja {
+                Some(jinja) => jinja.format_chat_messages(messages, options),
+                None => bail!(
+                    "unsupported or missing Qwen3.5 chat template; use `run --raw-prompt` or a pinned Qwen3.5 template"
+                ),
+            },
         }
     }
 

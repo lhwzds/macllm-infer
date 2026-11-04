@@ -11,7 +11,10 @@ use crate::{
     chat::{ChatMessage, ChatTemplateOptions},
     decoder::DecoderModel,
     model_weights::WeightSource,
-    models::{ModelAdapter, load_stop_token_ids, resolve_default_rope_theta},
+    models::{
+        GgufPromptTokens, JinjaChatFallback, ModelAdapter, jinja_chat_fallback,
+        load_stop_token_ids, resolve_default_rope_theta,
+    },
 };
 
 // The prompt renderers live in the chat group so that the serving and
@@ -163,6 +166,9 @@ fn load_chat_template(config_path: &Path) -> Result<Option<Qwen3ChatTemplate>> {
 pub struct Qwen3Adapter {
     spec: DecoderSpec,
     chat_template: Option<Qwen3ChatTemplate>,
+    /// The embedded template of a checkpoint that is not one of the pinned
+    /// programs, compiled for the generic Jinja renderer.
+    jinja: Option<JinjaChatFallback>,
 }
 
 impl Qwen3Adapter {
@@ -173,12 +179,15 @@ impl Qwen3Adapter {
         Ok(Self {
             spec: config.to_spec_with_stop_tokens(stop_token_ids)?,
             chat_template: load_chat_template(path)?,
+            jinja: None,
         })
     }
 
     /// Construct a Qwen3 adapter from validated GGUF decoder metadata.
-    /// Unknown templates keep raw-prompt inference available but disable chat
-    /// rendering so a checkpoint cannot silently receive incompatible tokens.
+    ///
+    /// A template that is not one of the pinned programs no longer disables
+    /// chat rendering: the GGUF loader attaches it as a generic Jinja template
+    /// afterwards, while raw-prompt inference keeps working either way.
     pub fn from_decoder_spec(spec: DecoderSpec, chat_template: Option<&str>) -> Result<Self> {
         ensure!(
             spec.architecture == "qwen3",
@@ -189,6 +198,7 @@ impl Qwen3Adapter {
         Ok(Self {
             spec,
             chat_template: classify_chat_template(chat_template),
+            jinja: None,
         })
     }
 }
@@ -196,6 +206,10 @@ impl Qwen3Adapter {
 impl ModelAdapter for Qwen3Adapter {
     fn family(&self) -> &'static str {
         "qwen3"
+    }
+
+    fn has_pinned_chat_template(&self) -> bool {
+        self.chat_template.is_some()
     }
 
     fn runtime_spec(&self) -> &RuntimeSpec {
@@ -213,6 +227,11 @@ impl ModelAdapter for Qwen3Adapter {
         Ok(Box::new(DecoderModel::load(self.spec.clone(), weights)?))
     }
 
+    fn attach_prompt_tokens(&mut self, tokens: GgufPromptTokens<'_>) -> Result<()> {
+        self.jinja = jinja_chat_fallback(self.family(), self.chat_template.is_some(), tokens);
+        Ok(())
+    }
+
     fn format_chat_messages(&self, messages: &[ChatMessage]) -> Result<String> {
         self.format_chat_messages_with(messages, ChatTemplateOptions::default())
     }
@@ -226,9 +245,12 @@ impl ModelAdapter for Qwen3Adapter {
             Some(Qwen3ChatTemplate::Current | Qwen3ChatTemplate::Gguf) => {
                 format_qwen3_chat_messages(messages, options)
             }
-            None => bail!(
-                "unsupported or missing Qwen3 chat template; pass --raw-prompt or use the pinned official Qwen3 template"
-            ),
+            None => match &self.jinja {
+                Some(jinja) => jinja.format_chat_messages(messages, options),
+                None => bail!(
+                    "unsupported or missing Qwen3 chat template; pass --raw-prompt or use the pinned official Qwen3 template"
+                ),
+            },
         }
     }
 
@@ -655,6 +677,7 @@ mod tests {
             let adapter = Qwen3Adapter {
                 spec: official_config().to_spec()?,
                 chat_template: Some(template),
+                jinja: None,
             };
             // Official tail: `<|im_start|>assistant\n` plus, only for
             // `enable_thinking=false`, `<think>\n\n</think>\n\n`.
@@ -730,6 +753,65 @@ mod tests {
 
         let adapter = Qwen3Adapter::from_decoder_spec(official_config().to_spec()?, Some("other"))?;
         assert!(adapter.format_chat(None, "Hello").is_err());
+        Ok(())
+    }
+
+    /// A checkpoint whose template is not one of the pinned programs still
+    /// chats through the generic Jinja renderer, while its agent prompts stay
+    /// fail-closed because no native profile has been verified for it.
+    #[test]
+    fn an_unrecognised_template_chats_through_the_generic_jinja_renderer() -> Result<()> {
+        // A deliberately foreign template, so the render cannot be confused
+        // with the byte-pinned Qwen3 programs.
+        const FOREIGN_TEMPLATE: &str = concat!(
+            "{{ bos_token }}",
+            "{%- for message in messages %}",
+            "<{{ message.role }}>{{ message.content }}",
+            "{%- endfor %}",
+            "<assistant>",
+            "{% if enable_thinking is defined and not enable_thinking %}",
+            "<direct>",
+            "{% endif %}",
+            "{{ eos_token }}"
+        );
+        let mut adapter =
+            Qwen3Adapter::from_decoder_spec(official_config().to_spec()?, Some(FOREIGN_TEMPLATE))?;
+        assert_eq!(adapter.chat_template, None);
+        assert!(adapter.jinja.is_none());
+        // Without the GGUF prompt tokens nothing has been compiled yet.
+        assert!(adapter.format_chat(None, "Hello").is_err());
+
+        adapter.attach_prompt_tokens(GgufPromptTokens {
+            chat_template: Some(FOREIGN_TEMPLATE),
+            bos_token: Some("<bos>"),
+            eos_token: Some("<eos>"),
+        })?;
+        assert!(adapter.jinja.is_some());
+        assert_eq!(
+            adapter.format_chat_messages(&[ChatMessage::user("Hello")])?,
+            "<bos><user>Hello<assistant><eos>"
+        );
+        assert_eq!(
+            adapter.format_chat_messages_with(
+                &[ChatMessage::user("Hello")],
+                ChatTemplateOptions {
+                    enable_thinking: Some(false)
+                }
+            )?,
+            "<bos><user>Hello<assistant><direct><eos>"
+        );
+
+        let prompt = AgentPrompt {
+            messages: vec![AgentMessage::User {
+                content: "Find AAPL.".to_owned(),
+            }],
+            tools: vec![lookup_tool()],
+            directive: AgentDirective::ForcedSingle {
+                name: "lookup".to_owned(),
+            },
+        };
+        assert!(adapter.agent_template_profile().is_none());
+        assert!(adapter.format_agent_prompt(&prompt).is_err());
         Ok(())
     }
 }

@@ -1,5 +1,5 @@
-"""Render Qwen3.5 chat-template fixtures the way transformers' apply_chat_template does."""
-import json, pathlib, sys
+"""Render every chat-template case with Hugging Face's Jinja environment."""
+import copy, json, pathlib, sys
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from jinja2.exceptions import TemplateError
 
@@ -52,23 +52,47 @@ THINKING = {"default": {}, "off": {"enable_thinking": False}, "on": {"enable_thi
 out.mkdir(parents=True, exist_ok=True)
 FAMILIES = {"qwen35": ("qwen35-official", "qwen35-unsloth"), "qwen3": ("qwen3-current", "qwen3-gguf")}
 family = sys.argv[3] if len(sys.argv) > 3 else "qwen35"
-if family == "qwen3":
-    import copy
-    for name in list(CASES):
-        case = copy.deepcopy(CASES[name])
-        for m in case["messages"]:
-            for c in m.get("tool_calls", []):
-                c["function"]["arguments"] = json.dumps(c["function"]["arguments"], ensure_ascii=False)
-        CASES[name + "__string_args"] = case
+
+# The OpenAI wire format sends tool-call arguments as a JSON string instead of
+# an object. Keep both input spellings for every template, including those
+# that require Hugging Face's object form at the rendering boundary.
+STRING_ARGS = {}
+for name in list(CASES):
+    case = copy.deepcopy(CASES[name])
+    for m in case["messages"]:
+        for c in m.get("tool_calls", []):
+            c["function"]["arguments"] = json.dumps(c["function"]["arguments"], ensure_ascii=False)
+    STRING_ARGS[name + "__string_args"] = case
+ALL_CASES = dict(CASES)
+ALL_CASES.update(STRING_ARGS)
+
+# The repository-wide manifest: every case input plus which templates and
+# cases belong to which rendered family. It is family independent, so both
+# invocations write the same bytes.
+(pathlib.Path(__file__).resolve().parent / "cases.json").write_text(json.dumps(
+    {"cases": ALL_CASES, "thinking": THINKING,
+     "render": "transformers semantics: ImmutableSandboxedEnvironment(trim_blocks, lstrip_blocks, loopcontrols); tojson(ensure_ascii=False, sort_keys=False); add_generation_prompt=True, bos_token=\"\", eos_token=\"<|im_end|>\"",
+     "families": {name: {"templates": list(templates), "cases": list(ALL_CASES)} for name, templates in FAMILIES.items()}},
+    ensure_ascii=False, indent=2))
+
 for tname in FAMILIES[family]:
     tmpl = env.from_string((src / f"{tname}.jinja").read_text())
-    for cname, case in CASES.items():
+    for cname, case in ALL_CASES.items():
+        # ChatMessage normalizes JSON-string arguments to ordered objects.
+        # Apply the same contract to every reference template. Qwen3.5 in
+        # particular requires mappings rather than wire-format strings.
+        messages = copy.deepcopy(case["messages"])
+        for message in messages:
+            for call in message.get("tool_calls", []):
+                args = call["function"]["arguments"]
+                if isinstance(args, str):
+                    call["function"]["arguments"] = json.loads(args)
         for th, kw in THINKING.items():
-            kwargs = dict(messages=case["messages"], add_generation_prompt=True, bos_token="", eos_token="<|im_end|>", **kw)
+            kwargs = dict(messages=messages, add_generation_prompt=True, bos_token="", eos_token="<|im_end|>", **kw)
             if case["tools"] is not None:
                 kwargs["tools"] = case["tools"]
             (out / f"{tname}__{cname}__thinking-{th}.txt").write_text(tmpl.render(**kwargs))
-(out / "cases.json").write_text(json.dumps({"cases": CASES, "thinking": THINKING,
+(out / "cases.json").write_text(json.dumps({"cases": ALL_CASES, "thinking": THINKING,
     "render": "transformers semantics: ImmutableSandboxedEnvironment(trim_blocks, lstrip_blocks, loopcontrols); tojson(ensure_ascii=False, sort_keys=False); add_generation_prompt=True"},
     ensure_ascii=False, indent=2))
 print(len(list(out.glob("*.txt"))), "renders")

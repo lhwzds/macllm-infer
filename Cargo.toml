@@ -14,6 +14,8 @@ clap = { version = "4.5", features = ["derive"] }
 futures-util = "0.3.32"
 hf-hub = { version = "1.0.0", features = ["blocking", "rustls-tls"] }
 libc = "0.2"
+minijinja = { version = "2.24.0", features = ["preserve_order", "loop_controls", "fuel"] }
+minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
 macllm-chat = { path = "crates/macllm-chat" }
 macllm-kv = { path = "crates/macllm-kv" }
 macllm-kernels = { path = "crates/macllm-kernels" }
@@ -50,12 +52,14 @@ metal = [
     "dep:objc2-metal",
     "macllm-kernels/metal",
     "macllm-kv/metal",
+    "candle-transformers/metal",
 ]
 accelerate = [
     "candle-core/accelerate",
     "candle-nn/accelerate",
     "macllm-kernels/accelerate",
     "macllm-kv/accelerate",
+    "candle-transformers/accelerate",
 ]
 
 [dependencies]
@@ -85,7 +89,7 @@ tokenizers = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-candle-transformers = { version = "0.11.0", default-features = false, features = ["metal", "accelerate"] }
+candle-transformers = { version = "0.11.0", default-features = false }
 http-body-util = "0.1.4"
 macllm-kv = { workspace = true, features = ["test-exports"] }
 tower = { version = "0.5.3", features = ["util"] }
@@ -96,6 +100,11 @@ codegen-units = 1
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+# src/benchmark imports anyhow's `ensure` for the macOS `proc_pid_rusage`
+# implementation; the non-macOS fallback in the same file does not use it, so
+# the Linux check build would flag the shared import as unused under
+# -D warnings.
+unused_imports = "allow"
 
 [lints.clippy]
 all = { level = "warn", priority = -2 }

@@ -1177,6 +1177,11 @@ fn lower_agent_messages(
                     content: Some(message.content),
                     tool_call: None,
                 },
+                // `validate_chat_messages` keeps tool responses out of the
+                // text history, so they reach only the tool-aware branch.
+                ChatRole::Tool => {
+                    unreachable!("a tool response is never part of the text history")
+                }
             })
             .collect()),
         ValidatedMessages::ToolAware(messages) => messages
@@ -1926,23 +1931,23 @@ mod tests {
             }
             count += 1;
             let name = path.file_stem().unwrap().to_str().unwrap();
-            let mut parts = name.split("__");
-            let (profile, template_name) = match parts.next().unwrap() {
+            let (template_case, thinking) = name.rsplit_once("__thinking-").unwrap();
+            let (template, case) = template_case.split_once("__").unwrap();
+            let (profile, template_name) = match template {
                 "qwen35-official" => (AgentTemplateProfile::Qwen35Official, "official"),
                 "qwen35-unsloth" => (AgentTemplateProfile::Qwen35Unsloth, "unsloth"),
                 other => panic!("unknown template {other}"),
             };
             let adapter = qwen35_test_adapter(template_name);
             assert_eq!(adapter.agent_template_profile(), Some(profile));
-            let case = parts.next().unwrap();
-            let thinking = parts.next().unwrap().strip_prefix("thinking-").unwrap();
-            assert!(parts.next().is_none());
             let mut request = cases["cases"][case].clone();
             for message in request["messages"].as_array_mut().unwrap() {
                 if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
                     for call in calls {
                         let args = &mut call["function"]["arguments"];
-                        *args = Value::String(python_json(args).unwrap());
+                        if !args.is_string() {
+                            *args = Value::String(python_json(args).unwrap());
+                        }
                     }
                 }
             }
@@ -1971,7 +1976,9 @@ mod tests {
                 "fixture {name}"
             );
         }
-        assert_eq!(count, 36);
+        // Two templates × twelve cases × three thinking variants, including
+        // wire-format argument strings through the full request lowering path.
+        assert_eq!(count, 72);
     }
 
     #[test]

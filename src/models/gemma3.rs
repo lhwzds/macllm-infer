@@ -64,6 +64,10 @@ impl ModelAdapter for Gemma3Adapter {
         "gemma3"
     }
 
+    fn has_pinned_chat_template(&self) -> bool {
+        self.chat_template.is_some()
+    }
+
     fn runtime_spec(&self) -> &RuntimeSpec {
         &self.spec.runtime
     }
@@ -104,6 +108,7 @@ fn format_gemma3_chat_messages(messages: &[ChatMessage]) -> Result<String> {
         Some(ChatMessage {
             role: ChatRole::System,
             content,
+            ..
         }) => (Some(content.as_str()), &messages[1..]),
         _ => (None, messages),
     };
@@ -117,6 +122,7 @@ fn format_gemma3_chat_messages(messages: &[ChatMessage]) -> Result<String> {
             ChatRole::User => "user",
             ChatRole::Assistant => "model",
             ChatRole::System => unreachable!("chat history validation rejected an inline system"),
+            ChatRole::Tool => unreachable!("chat history validation rejected a tool response"),
         };
         prompt.push_str("<start_of_turn>");
         prompt.push_str(role);
