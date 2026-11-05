@@ -213,6 +213,26 @@ mod tests {
         }
     }
 
+    /// The pinned template source still classifies to its variant.
+    ///
+    /// The variant is pinned by digest, so the fixture file must hold the
+    /// exact bytes the classifier recognises.
+    #[test]
+    fn the_pinned_template_source_still_classifies_to_its_variant() {
+        let text = crate::models::template_parity::pinned_text(
+            "smollm3-official-system-override-text-subset.jinja",
+        );
+        assert_eq!(text.len(), OFFICIAL_GGUF_CHAT_TEMPLATE_LEN);
+        assert_eq!(
+            crate::models::template_parity::digest(text.as_bytes()),
+            OFFICIAL_GGUF_CHAT_TEMPLATE_SHA256,
+        );
+        assert_eq!(
+            classify_chat_template(Some(&text)),
+            Some(SmolLm3ChatTemplate::OfficialSystemOverrideTextSubset),
+        );
+    }
+
     #[test]
     fn exposes_smollm3_shared_decoder_boundary_and_rejects_wrong_family() -> Result<()> {
         let adapter = SmolLm3Adapter::from_decoder_spec(tiny_spec(), None)?;

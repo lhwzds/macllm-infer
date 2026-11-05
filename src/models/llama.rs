@@ -562,6 +562,38 @@ mod tests {
       "attention_bias":false,"mlp_bias":false,"eos_token_id":2
     }"#;
 
+    /// The pinned template source still classifies to its variant.
+    ///
+    /// The fixture file holds the exact source of the pinned variant, and the
+    /// classifier recognises it by string equality.
+    #[test]
+    fn the_pinned_template_source_still_classifies_to_its_variant() {
+        let text = crate::models::template_parity::pinned_text("llama-smollm2-chatml.jinja");
+        assert_eq!(text, SMOLLM2_CHAT_TEMPLATE);
+        assert_eq!(
+            classify_chat_template(Some(&text)),
+            Some(LlamaChatTemplate::SmolLm2ChatMl),
+        );
+    }
+
+    /// The pinned Llama 3.2 source still classifies to its variant.
+    ///
+    /// The variant is pinned by digest, so the fixture file must hold
+    /// the exact bytes the classifier recognises.
+    #[test]
+    fn the_pinned_llama3_2_source_still_classifies_to_its_variant() {
+        let text = crate::models::template_parity::pinned_text("llama-llama3-2-instruct.jinja");
+        assert_eq!(text.len(), LLAMA3_2_CHAT_TEMPLATE_LEN);
+        assert_eq!(
+            crate::models::template_parity::digest(text.as_bytes()),
+            LLAMA3_2_CHAT_TEMPLATE_SHA256,
+        );
+        assert_eq!(
+            classify_chat_template(Some(&text)),
+            Some(LlamaChatTemplate::Llama3_2Instruct),
+        );
+    }
+
     #[test]
     fn maps_official_smollm2_geometry() -> Result<()> {
         let config: LlamaConfig = serde_json::from_str(SMOL_CONFIG)?;

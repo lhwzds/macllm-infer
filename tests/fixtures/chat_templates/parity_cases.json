@@ -1,0 +1,751 @@
+{
+  "cases": {
+    "user_only": {
+      "messages": [
+        { "role": "user", "content": "Hello" }
+      ]
+    },
+    "system_and_user": {
+      "messages": [
+        { "role": "system", "content": "You are a helpful assistant." },
+        { "role": "user", "content": "Hello" }
+      ]
+    },
+    "multi_turn": {
+      "messages": [
+        { "role": "user", "content": "First question." },
+        { "role": "assistant", "content": "First answer." },
+        { "role": "user", "content": "Follow-up question." }
+      ]
+    },
+    "multi_turn_with_system": {
+      "messages": [
+        { "role": "system", "content": "You are a helpful assistant." },
+        { "role": "user", "content": "First question." },
+        { "role": "assistant", "content": "First answer." },
+        { "role": "user", "content": "Follow-up question." }
+      ]
+    },
+    "non_ascii": {
+      "messages": [
+        { "role": "user", "content": "Café — naïve 日本語 🎉" }
+      ]
+    },
+    "padded_content": {
+      "messages": [
+        { "role": "user", "content": "  Hello  " }
+      ]
+    },
+    "plain": {
+      "messages": [
+        { "role": "system", "content": "You are a careful coding agent." },
+        { "role": "user", "content": "What is 2 + 2?" }
+      ]
+    },
+    "tools_first_turn": {
+      "messages": [
+        { "role": "system", "content": "You are a careful coding agent." },
+        { "role": "user", "content": "List the files in the current directory." }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": { "type": "string" }
+              },
+              "required": ["command"]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "write_file",
+            "description": "Write a file.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": { "type": "string", "description": "Relative path." },
+                "content": { "type": "string" },
+                "mode": { "type": "integer" },
+                "append": { "type": "boolean" },
+                "tags": { "type": "array", "items": { "type": "string" } },
+                "meta": { "type": "object", "properties": { "owner": { "type": "string" } } }
+              },
+              "required": ["path", "content"]
+            }
+          }
+        }
+      ]
+    },
+    "tools_no_system": {
+      "messages": [
+        { "role": "user", "content": "List the files in the current directory." }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": { "type": "string" }
+              },
+              "required": ["command"]
+            }
+          }
+        }
+      ]
+    },
+    "tool_loop": {
+      "messages": [
+        { "role": "system", "content": "You are a careful coding agent." },
+        { "role": "user", "content": "List the files in the current directory." },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": { "name": "shell", "arguments": "{\"command\": \"ls -la\"}" }
+            }
+          ]
+        },
+        { "role": "tool", "tool_call_id": "call_1", "content": "a.txt\nb.txt" }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": { "type": "string" }
+              },
+              "required": ["command"]
+            }
+          }
+        }
+      ]
+    },
+    "reasoning_and_text_before_call": {
+      "messages": [
+        { "role": "system", "content": "You are a careful coding agent." },
+        { "role": "user", "content": "List the files in the current directory." },
+        {
+          "role": "assistant",
+          "content": "<think>\nI should list the files.\n</think>\n\nLet me check.",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": { "name": "shell", "arguments": "{\"command\": \"ls -la\"}" }
+            }
+          ]
+        },
+        { "role": "tool", "tool_call_id": "call_1", "content": "a.txt\nb.txt" }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": { "type": "string" }
+              },
+              "required": ["command"]
+            }
+          }
+        }
+      ]
+    },
+    "typed_arguments_then_new_user": {
+      "messages": [
+        { "role": "system", "content": "You are a careful coding agent." },
+        { "role": "user", "content": "Save a note." },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_2",
+              "type": "function",
+              "function": {
+                "name": "write_file",
+                "arguments": "{\"path\": \"notes/todo.md\", \"content\": \"line one\\nline two\", \"mode\": 420, \"append\": false, \"tags\": [\"a\", \"b\"], \"meta\": {\"owner\": \"me\"}}"
+              }
+            }
+          ]
+        },
+        { "role": "tool", "tool_call_id": "call_2", "content": "ok" },
+        { "role": "assistant", "content": "Saved." },
+        { "role": "user", "content": "Thanks. Now list files." }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": { "type": "string" }
+              },
+              "required": ["command"]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "write_file",
+            "description": "Write a file.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": { "type": "string", "description": "Relative path." },
+                "content": { "type": "string" },
+                "mode": { "type": "integer" },
+                "append": { "type": "boolean" },
+                "tags": { "type": "array", "items": { "type": "string" } },
+                "meta": { "type": "object", "properties": { "owner": { "type": "string" } } }
+              },
+              "required": ["path", "content"]
+            }
+          }
+        }
+      ]
+    },
+    "compact_arguments": {
+      "messages": [
+        { "role": "user", "content": "Run ls." },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": { "name": "shell", "arguments": "{\"command\":\"ls\"}" }
+            }
+          ]
+        },
+        { "role": "tool", "tool_call_id": "call_1", "content": "a.txt" }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": { "type": "string" }
+              },
+              "required": ["command"]
+            }
+          }
+        }
+      ]
+    },
+    "float_arguments": {
+      "messages": [
+        { "role": "user", "content": "Use a tight tolerance." },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": { "name": "solve", "arguments": "{\"tol\":0.00001}" }
+            }
+          ]
+        },
+        { "role": "tool", "tool_call_id": "call_1", "content": "ok" }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "solve",
+            "description": "Solve an equation within a tolerance.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "tol": { "type": "number" }
+              },
+              "required": ["tol"]
+            }
+          }
+        }
+      ]
+    },
+    "reasoning_content_echo": {
+      "messages": [
+        { "role": "user", "content": "What is 2 + 2?" },
+        {
+          "role": "assistant",
+          "content": "4",
+          "reasoning_content": "The user asks for a sum."
+        },
+        { "role": "user", "content": "And 3 + 3?" }
+      ]
+    },
+    "think_history": {
+      "messages": [
+        { "role": "user", "content": "Explain that." },
+        { "role": "assistant", "content": "<think>this</think>" },
+        { "role": "user", "content": "Thanks." }
+      ]
+    },
+    "repeated_think_close": {
+      "messages": [
+        { "role": "user", "content": "Think twice." },
+        { "role": "assistant", "content": "<think>a</think>b</think>c" }
+      ]
+    },
+    "repeated_think_close_history": {
+      "messages": [
+        { "role": "user", "content": "Think twice." },
+        { "role": "assistant", "content": "<think>a</think>b</think>c" },
+        { "role": "user", "content": "And now?" }
+      ]
+    },
+    "tool_response_user_turn": {
+      "messages": [
+        { "role": "user", "content": "Continue." },
+        { "role": "assistant", "content": "<think>r</think>a" },
+        { "role": "user", "content": "<tool_response>x</tool_response>" }
+      ]
+    },
+    "empty_user_text": {
+      "messages": [
+        { "role": "user", "content": "" }
+      ]
+    },
+    "empty_assistant_text": {
+      "messages": [
+        { "role": "user", "content": "Say nothing." },
+        { "role": "assistant", "content": "" },
+        { "role": "user", "content": "Anything?" }
+      ]
+    },
+    "padded_assistant_content": {
+      "messages": [
+        { "role": "user", "content": "Answer." },
+        { "role": "assistant", "content": "  padded answer  " },
+        { "role": "user", "content": "Thanks." }
+      ]
+    },
+    "padded_system_content": {
+      "messages": [
+        { "role": "system", "content": "  Be brief.  " },
+        { "role": "user", "content": "Hi." }
+      ]
+    },
+    "empty_system_message": {
+      "messages": [
+        { "role": "system", "content": "" },
+        { "role": "user", "content": "Hi." }
+      ]
+    },
+    "tool_history_without_tools": {
+      "messages": [
+        { "role": "user", "content": "List the files." },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": { "name": "shell", "arguments": "{\"command\": \"ls -la\"}" }
+            }
+          ]
+        },
+        { "role": "tool", "tool_call_id": "call_1", "content": "a.txt" }
+      ]
+    },
+    "tool_without_description": {
+      "messages": [
+        { "role": "user", "content": "Ping." }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "ping",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "host": { "type": "string" }
+              },
+              "required": ["host"]
+            }
+          }
+        }
+      ]
+    },
+    "tool_strict": {
+      "messages": [
+        { "role": "user", "content": "Ping." }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "ping",
+            "description": "Ping a host.",
+            "strict": true,
+            "parameters": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "host": { "type": "string" }
+              },
+              "required": ["host"]
+            }
+          }
+        }
+      ]
+    },
+    "tool_parameters_unordered": {
+      "messages": [
+        { "role": "user", "content": "Ping." }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "ping",
+            "description": "Ping a host.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "zeta": { "type": "string" },
+                "alpha": { "type": "integer" },
+                "middle": { "type": "boolean" }
+              },
+              "required": ["zeta", "alpha", "middle"]
+            }
+          }
+        }
+      ]
+    },
+    "smollm3_system_override": {
+      "messages": [
+        { "role": "system", "content": "Be concise./system_override" },
+        { "role": "user", "content": "Hello" }
+      ]
+    },
+    "smollm3_system_override_history": {
+      "messages": [
+        { "role": "system", "content": "Be concise./system_override" },
+        { "role": "user", "content": "First question." },
+        { "role": "assistant", "content": "First answer." },
+        { "role": "user", "content": "Follow-up question." }
+      ]
+    },
+    "assistant_text_before_call": {
+      "messages": [
+        { "role": "user", "content": "List the files in the current directory." },
+        {
+          "role": "assistant",
+          "content": "Let me check the directory first.",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": { "name": "shell", "arguments": "{\"command\": \"ls -la\"}" }
+            }
+          ]
+        },
+        { "role": "tool", "tool_call_id": "call_1", "content": "a.txt\nb.txt" }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": { "type": "string" }
+              },
+              "required": ["command"]
+            }
+          }
+        }
+      ]
+    },
+    "two_assistant_calls": {
+      "messages": [
+        { "role": "user", "content": "List the files, then read the first one." },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": { "name": "shell", "arguments": "{\"command\": \"ls -la\"}" }
+            }
+          ]
+        },
+        { "role": "tool", "tool_call_id": "call_1", "content": "a.txt\nb.txt" },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_2",
+              "type": "function",
+              "function": { "name": "shell", "arguments": "{\"command\": \"cat a.txt\"}" }
+            }
+          ]
+        },
+        { "role": "tool", "tool_call_id": "call_2", "content": "a.txt" }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": { "type": "string" }
+              },
+              "required": ["command"]
+            }
+          }
+        }
+      ]
+    },
+    "parallel_tool_calls": {
+      "messages": [
+        { "role": "user", "content": "List the files and read the first one." },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": { "name": "shell", "arguments": "{\"command\": \"ls -la\"}" }
+            },
+            {
+              "id": "call_2",
+              "type": "function",
+              "function": { "name": "shell", "arguments": "{\"command\": \"cat a.txt\"}" }
+            }
+          ]
+        },
+        { "role": "tool", "tool_call_id": "call_1", "content": "a.txt\nb.txt" },
+        { "role": "tool", "tool_call_id": "call_2", "content": "a.txt" }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": { "type": "string" }
+              },
+              "required": ["command"]
+            }
+          }
+        }
+      ]
+    },
+    "tool_output_with_think": {
+      "messages": [
+        { "role": "user", "content": "Run the command." },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": { "name": "shell", "arguments": "{\"command\": \"ls -la\"}" }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "<think>\nthe tool thought about it\n</think>\na.txt"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "shell",
+            "description": "Run a shell command and return its exit code and output.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": { "type": "string" }
+              },
+              "required": ["command"]
+            }
+          }
+        }
+      ]
+    },
+    "tool_choice_required": {
+      "messages": [
+        { "role": "user", "content": "What is the weather in Tokyo?" }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Get the current weather in a city.",
+            "parameters": {
+              "type": "object",
+              "properties": { "city": { "type": "string" } },
+              "required": ["city"]
+            }
+          }
+        }
+      ],
+      "tool_choice": "required",
+      "parallel_tool_calls": false
+    },
+    "tool_choice_named": {
+      "messages": [
+        { "role": "user", "content": "What is the weather in Tokyo?" }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Get the current weather in a city.",
+            "parameters": {
+              "type": "object",
+              "properties": { "city": { "type": "string" } },
+              "required": ["city"]
+            }
+          }
+        }
+      ],
+      "tool_choice": { "type": "function", "function": { "name": "weather" } },
+      "parallel_tool_calls": false
+    },
+    "tool_choice_none": {
+      "messages": [
+        { "role": "user", "content": "What is the weather in Tokyo?" }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Get the current weather in a city.",
+            "parameters": {
+              "type": "object",
+              "properties": { "city": { "type": "string" } },
+              "required": ["city"]
+            }
+          }
+        }
+      ],
+      "tool_choice": "none"
+    },
+    "automatic_tool_call": {
+      "messages": [
+        { "role": "user", "content": "What is the weather in Tokyo?" }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Get the current weather in a city.",
+            "parameters": {
+              "type": "object",
+              "properties": { "city": { "type": "string" } },
+              "required": ["city"]
+            }
+          }
+        }
+      ],
+      "tool_choice": "auto"
+    },
+    "forced_tool_call": {
+      "messages": [
+        { "role": "user", "content": "What is the weather in Tokyo?" }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Get the current weather in a city.",
+            "parameters": {
+              "type": "object",
+              "properties": { "city": { "type": "string" } },
+              "required": ["city"]
+            }
+          }
+        }
+      ],
+      "tool_choice": { "type": "function", "function": { "name": "weather" } },
+      "parallel_tool_calls": false
+    },
+    "multi_part_content": {
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            { "type": "text", "text": "Hello" },
+            { "type": "text", "text": "world" }
+          ]
+        }
+      ]
+    },
+    "system_only": {
+      "messages": [
+        { "role": "system", "content": "You are a helpful assistant." }
+      ]
+    },
+    "explicit_thinking_off": {
+      "messages": [
+        { "role": "user", "content": "Hello" }
+      ],
+      "chat_template_kwargs": { "enable_thinking": false }
+    },
+    "explicit_thinking_on": {
+      "messages": [
+        { "role": "user", "content": "Hello" }
+      ],
+      "chat_template_kwargs": { "enable_thinking": true }
+    }
+  }
+}

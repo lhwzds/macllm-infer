@@ -305,6 +305,44 @@ Finally, after the response is written, include a numbered list of sentences fro
         }
     }
 
+    /// The pinned template sources still classify to their variants.
+    ///
+    /// Both Granite 3.1 templates are pinned by digest, so the fixtures hold
+    /// the exact bytes whose length and SHA-256 the classifier checks.
+    #[test]
+    fn the_pinned_template_sources_still_classify_to_their_variants() {
+        for (fixture, source, len, digest, variant) in [
+            (
+                "granite_moe-legacy-granite3-1-instruct.jinja",
+                LEGACY_OFFICIAL_CHAT_TEMPLATE,
+                LEGACY_GRANITE_3_1_CHAT_TEMPLATE_LEN,
+                LEGACY_GRANITE_3_1_CHAT_TEMPLATE_SHA256,
+                GraniteMoeChatTemplate::LegacyGranite3_1Instruct,
+            ),
+            (
+                "granite_moe-current-granite3-1-instruct.jinja",
+                CURRENT_OFFICIAL_CHAT_TEMPLATE,
+                CURRENT_GRANITE_3_1_CHAT_TEMPLATE_LEN,
+                CURRENT_GRANITE_3_1_CHAT_TEMPLATE_SHA256,
+                GraniteMoeChatTemplate::CurrentGranite3_1Instruct,
+            ),
+        ] {
+            let text = crate::models::template_parity::pinned_text(fixture);
+            assert_eq!(text, source, "{fixture}");
+            assert_eq!(text.len(), len, "{fixture}");
+            assert_eq!(
+                <[u8; 32]>::from(Sha256::digest(text.as_bytes())),
+                digest,
+                "{fixture}",
+            );
+            assert_eq!(
+                classify_chat_template(Some(&text)),
+                Some(variant),
+                "{fixture}",
+            );
+        }
+    }
+
     #[test]
     fn accepts_both_confirmed_gguf_template_identities() -> Result<()> {
         assert_eq!(

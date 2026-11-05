@@ -122,6 +122,26 @@ mod tests {
         PositionEncodingSpec, ProjectionBias, RopeLayout, RopeSpec, SequenceMixerSpec,
     };
 
+    /// The pinned template sources still classify to their variant.
+    ///
+    /// The fixture files hold the exact sources of the pinned variants, and
+    /// the classifier recognises them by string equality.
+    #[test]
+    fn the_pinned_template_sources_still_classify_to_their_variant() {
+        for (fixture, source) in [
+            ("gemma-official.jinja", OFFICIAL_CHAT_TEMPLATE),
+            ("gemma-legacy.jinja", OFFICIAL_LEGACY_CHAT_TEMPLATE),
+        ] {
+            let text = crate::models::template_parity::pinned_text(fixture);
+            assert_eq!(text, source, "{fixture}");
+            assert_eq!(
+                classify_chat_template(Some(&text)),
+                Some(GemmaChatTemplate::Official),
+                "{fixture}",
+            );
+        }
+    }
+
     #[test]
     fn unknown_gguf_template_uses_shared_fallback() -> Result<()> {
         let source = "{{ bos_token }}{{ messages[0].content }}{{ eos_token }}";

@@ -247,6 +247,25 @@ mod tests {
         }
     }
 
+    /// The pinned template source still classifies to its variant.
+    ///
+    /// The Gemma 3 template is pinned by digest, so the fixture holds the
+    /// exact bytes whose length and SHA-256 the classifier checks.
+    #[test]
+    fn the_pinned_template_source_still_classifies_to_its_variant() {
+        let text = crate::models::template_parity::pinned_text("gemma3-official.jinja");
+        assert_eq!(text, OFFICIAL_CHAT_TEMPLATE);
+        assert_eq!(text.len(), GEMMA3_CHAT_TEMPLATE_LEN);
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(text.as_bytes())),
+            GEMMA3_CHAT_TEMPLATE_SHA256,
+        );
+        assert_eq!(
+            classify_chat_template(Some(&text)),
+            Some(Gemma3ChatTemplate::Official),
+        );
+    }
+
     #[test]
     fn accepts_only_the_pinned_official_template_identity() -> Result<()> {
         assert_eq!(OFFICIAL_CHAT_TEMPLATE.len(), GEMMA3_CHAT_TEMPLATE_LEN);

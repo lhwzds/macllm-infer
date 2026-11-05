@@ -352,6 +352,20 @@ mod tests {
       "full_attn_idxs":[2,5,8,10,12,14],"eos_token_id":7
     }"#;
 
+    /// The pinned template source still classifies to its variant.
+    ///
+    /// The fixture file holds the exact source of the pinned variant, and the
+    /// classifier recognises it by string equality.
+    #[test]
+    fn the_pinned_template_source_still_classifies_to_its_variant() {
+        let text = crate::models::template_parity::pinned_text("lfm2-official-gguf.jinja");
+        assert_eq!(text, OFFICIAL_GGUF_CHAT_TEMPLATE);
+        assert_eq!(
+            classify_chat_template(Some(&text)),
+            Some(Lfm2ChatTemplate::OfficialGguf),
+        );
+    }
+
     #[test]
     fn maps_official_hybrid_geometry() -> Result<()> {
         let config: Lfm2Config = serde_json::from_str(OFFICIAL_CONFIG)?;

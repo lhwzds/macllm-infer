@@ -1,0 +1,1068 @@
+# The golden outcomes of the parity measurement.
+#
+# One line per variant, case and thinking mode:
+#
+#   <variant> <case> <thinking> <pinned-route>/<generic-route> <outcome>  # optional reason
+#
+# The two arms are the production paths: the pinned arm renders through the
+# family's own renderer, the generic arm through the shared Jinja engine that
+# compiles the very same source. Both arms run the server's own routing, so a
+# refusal is the refusal a client would see.
+#
+# The claim: for the cases in `parity_cases.json` and the routes they take,
+# the table compares the prompt bytes of both arms for the BOS, EOS and token
+# lists listed in `parity_variants.json`. It does not cover constraints,
+# sampling or parsing.
+# `parity_variants.json` marks each family's token list as `measured from GGUF`
+# (qwen3, qwen35) or `read from code` (all others).
+# No case sets `response_format`, so the `constrained` route is not measured.
+#
+# The route is the path the request took: `chat`, `agent`, or `refused` when
+# the arm refused the request.
+#
+# The outcome is one of:
+#
+#   =            the two renders are byte-identical
+#   ! <offset> <pinned-sha256-16> <generic-sha256-16>
+#                the two renders differ; the offset is the first differing byte
+#                and the digests cover the whole render
+#   x-both       both arms refuse the request
+#   x-pinned <generic-sha256-16>   only the pinned arm refuses the request
+#   x-generic <pinned-sha256-16>   only the generic arm refuses the request
+#
+# A `!`, an `x-pinned` and an `x-generic` line names the side that looks
+# right, unless its reason marks the case undecided. The dates a
+# clock-dependent template prints are masked in the generic render alone, so
+# the digests do not change with the calendar date.
+gemma/Official user_only default chat/chat =
+gemma/Official system_and_user default refused/refused x-both
+gemma/Official multi_turn default chat/chat =
+gemma/Official multi_turn_with_system default refused/refused x-both
+gemma/Official non_ascii default chat/chat =
+gemma/Official padded_content default chat/chat =
+gemma/Official plain default refused/refused x-both
+gemma/Official tools_first_turn default refused/refused x-both
+gemma/Official tools_no_system default refused/refused x-both
+gemma/Official tool_loop default refused/refused x-both
+gemma/Official reasoning_and_text_before_call default refused/refused x-both
+gemma/Official typed_arguments_then_new_user default refused/refused x-both
+gemma/Official compact_arguments default refused/refused x-both
+gemma/Official float_arguments default refused/refused x-both
+gemma/Official reasoning_content_echo default refused/refused x-both
+gemma/Official think_history default chat/chat =
+gemma/Official repeated_think_close default refused/refused x-both
+gemma/Official repeated_think_close_history default chat/chat =
+gemma/Official tool_response_user_turn default chat/chat =
+gemma/Official empty_user_text default chat/chat =
+gemma/Official empty_assistant_text default chat/chat =
+gemma/Official padded_assistant_content default chat/chat =
+gemma/Official padded_system_content default refused/refused x-both
+gemma/Official empty_system_message default refused/refused x-both
+gemma/Official tool_history_without_tools default refused/refused x-both
+gemma/Official tool_without_description default refused/refused x-both
+gemma/Official tool_strict default refused/refused x-both
+gemma/Official tool_parameters_unordered default refused/refused x-both
+gemma/Official smollm3_system_override default refused/refused x-both
+gemma/Official smollm3_system_override_history default refused/refused x-both
+gemma/Official assistant_text_before_call default refused/refused x-both
+gemma/Official two_assistant_calls default refused/refused x-both
+gemma/Official parallel_tool_calls default refused/refused x-both
+gemma/Official tool_output_with_think default refused/refused x-both
+gemma/Official tool_choice_required default refused/refused x-both
+gemma/Official tool_choice_named default refused/refused x-both
+gemma/Official tool_choice_none default chat/chat =
+gemma/Official automatic_tool_call default refused/refused x-both
+gemma/Official forced_tool_call default refused/refused x-both
+gemma/Official multi_part_content default refused/refused x-both
+gemma/Official system_only default refused/refused x-both
+gemma/Official explicit_thinking_off default refused/chat x-pinned bf12b6d99b589347  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+gemma/Official explicit_thinking_on default refused/chat x-pinned bf12b6d99b589347  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+gemma/Legacy user_only default chat/chat ! 1 bf12b6d99b589347 2b508c223c1185da  # the pinned side looks right: the legacy template never prints `bos_token`, and MacLLM tokenizes without inserting special tokens
+gemma/Legacy system_and_user default refused/refused x-both
+gemma/Legacy multi_turn default chat/chat ! 1 093b8ef20c31035b c424e091ce1b8b03  # the pinned side looks right: the legacy template never prints `bos_token`, and MacLLM tokenizes without inserting special tokens
+gemma/Legacy multi_turn_with_system default refused/refused x-both
+gemma/Legacy non_ascii default chat/chat ! 1 ab4ede354e4b92ae cf47219db73c6340  # the pinned side looks right: the legacy template never prints `bos_token`, and MacLLM tokenizes without inserting special tokens
+gemma/Legacy padded_content default chat/chat ! 1 bf12b6d99b589347 2b508c223c1185da  # the pinned side looks right: the legacy template never prints `bos_token`, and MacLLM tokenizes without inserting special tokens
+gemma/Legacy plain default refused/refused x-both
+gemma/Legacy tools_first_turn default refused/refused x-both
+gemma/Legacy tools_no_system default refused/refused x-both
+gemma/Legacy tool_loop default refused/refused x-both
+gemma/Legacy reasoning_and_text_before_call default refused/refused x-both
+gemma/Legacy typed_arguments_then_new_user default refused/refused x-both
+gemma/Legacy compact_arguments default refused/refused x-both
+gemma/Legacy float_arguments default refused/refused x-both
+gemma/Legacy reasoning_content_echo default refused/refused x-both
+gemma/Legacy think_history default chat/chat ! 1 d48776fa8d7948d0 780e6b07e34e62c7  # the pinned side looks right: the legacy template never prints `bos_token`, and MacLLM tokenizes without inserting special tokens
+gemma/Legacy repeated_think_close default refused/refused x-both
+gemma/Legacy repeated_think_close_history default chat/chat ! 1 b1fe02631f8f9d13 32b586cd9fcc235e  # the pinned side looks right: the legacy template never prints `bos_token`, and MacLLM tokenizes without inserting special tokens
+gemma/Legacy tool_response_user_turn default chat/chat ! 1 46109311df8fcdce 9b6c5a68db9a3510  # the pinned side looks right: the legacy template never prints `bos_token`, and MacLLM tokenizes without inserting special tokens
+gemma/Legacy empty_user_text default chat/chat ! 1 dec670342bb084af 8333bd3d0a82bcde  # the pinned side looks right: the legacy template never prints `bos_token`, and MacLLM tokenizes without inserting special tokens
+gemma/Legacy empty_assistant_text default chat/chat ! 1 b51cb5c57801068b 9f918dc15c3e121c  # the pinned side looks right: the legacy template never prints `bos_token`, and MacLLM tokenizes without inserting special tokens
+gemma/Legacy padded_assistant_content default chat/chat ! 1 836081fe41f62117 97303a1a11e061c1  # the pinned side looks right: the legacy template never prints `bos_token`, and MacLLM tokenizes without inserting special tokens
+gemma/Legacy padded_system_content default refused/refused x-both
+gemma/Legacy empty_system_message default refused/refused x-both
+gemma/Legacy tool_history_without_tools default refused/refused x-both
+gemma/Legacy tool_without_description default refused/refused x-both
+gemma/Legacy tool_strict default refused/refused x-both
+gemma/Legacy tool_parameters_unordered default refused/refused x-both
+gemma/Legacy smollm3_system_override default refused/refused x-both
+gemma/Legacy smollm3_system_override_history default refused/refused x-both
+gemma/Legacy assistant_text_before_call default refused/refused x-both
+gemma/Legacy two_assistant_calls default refused/refused x-both
+gemma/Legacy parallel_tool_calls default refused/refused x-both
+gemma/Legacy tool_output_with_think default refused/refused x-both
+gemma/Legacy tool_choice_required default refused/refused x-both
+gemma/Legacy tool_choice_named default refused/refused x-both
+gemma/Legacy tool_choice_none default chat/chat ! 1 c962f775a98425ce 1a3c8ea0cea4145b  # the pinned side looks right: the legacy template never prints `bos_token`, and MacLLM tokenizes without inserting special tokens
+gemma/Legacy automatic_tool_call default refused/refused x-both
+gemma/Legacy forced_tool_call default refused/refused x-both
+gemma/Legacy multi_part_content default refused/refused x-both
+gemma/Legacy system_only default refused/refused x-both
+gemma/Legacy explicit_thinking_off default refused/chat x-pinned 2b508c223c1185da  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+gemma/Legacy explicit_thinking_on default refused/chat x-pinned 2b508c223c1185da  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+gemma2/Official user_only default chat/chat =
+gemma2/Official system_and_user default refused/refused x-both
+gemma2/Official multi_turn default chat/chat =
+gemma2/Official multi_turn_with_system default refused/refused x-both
+gemma2/Official non_ascii default chat/chat =
+gemma2/Official padded_content default chat/chat =
+gemma2/Official plain default refused/refused x-both
+gemma2/Official tools_first_turn default refused/refused x-both
+gemma2/Official tools_no_system default refused/refused x-both
+gemma2/Official tool_loop default refused/refused x-both
+gemma2/Official reasoning_and_text_before_call default refused/refused x-both
+gemma2/Official typed_arguments_then_new_user default refused/refused x-both
+gemma2/Official compact_arguments default refused/refused x-both
+gemma2/Official float_arguments default refused/refused x-both
+gemma2/Official reasoning_content_echo default refused/refused x-both
+gemma2/Official think_history default chat/chat =
+gemma2/Official repeated_think_close default refused/refused x-both
+gemma2/Official repeated_think_close_history default chat/chat =
+gemma2/Official tool_response_user_turn default chat/chat =
+gemma2/Official empty_user_text default chat/chat =
+gemma2/Official empty_assistant_text default chat/chat =
+gemma2/Official padded_assistant_content default chat/chat =
+gemma2/Official padded_system_content default refused/refused x-both
+gemma2/Official empty_system_message default refused/refused x-both
+gemma2/Official tool_history_without_tools default refused/refused x-both
+gemma2/Official tool_without_description default refused/refused x-both
+gemma2/Official tool_strict default refused/refused x-both
+gemma2/Official tool_parameters_unordered default refused/refused x-both
+gemma2/Official smollm3_system_override default refused/refused x-both
+gemma2/Official smollm3_system_override_history default refused/refused x-both
+gemma2/Official assistant_text_before_call default refused/refused x-both
+gemma2/Official two_assistant_calls default refused/refused x-both
+gemma2/Official parallel_tool_calls default refused/refused x-both
+gemma2/Official tool_output_with_think default refused/refused x-both
+gemma2/Official tool_choice_required default refused/refused x-both
+gemma2/Official tool_choice_named default refused/refused x-both
+gemma2/Official tool_choice_none default chat/chat =
+gemma2/Official automatic_tool_call default refused/refused x-both
+gemma2/Official forced_tool_call default refused/refused x-both
+gemma2/Official multi_part_content default refused/refused x-both
+gemma2/Official system_only default refused/refused x-both
+gemma2/Official explicit_thinking_off default refused/chat x-pinned bf12b6d99b589347  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+gemma2/Official explicit_thinking_on default refused/chat x-pinned bf12b6d99b589347  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+gemma3/Official user_only default chat/chat =
+gemma3/Official system_and_user default chat/chat =
+gemma3/Official multi_turn default chat/chat =
+gemma3/Official multi_turn_with_system default chat/chat =
+gemma3/Official non_ascii default chat/chat =
+gemma3/Official padded_content default chat/chat =
+gemma3/Official plain default chat/chat =
+gemma3/Official tools_first_turn default refused/refused x-both
+gemma3/Official tools_no_system default refused/refused x-both
+gemma3/Official tool_loop default refused/refused x-both
+gemma3/Official reasoning_and_text_before_call default refused/refused x-both
+gemma3/Official typed_arguments_then_new_user default refused/refused x-both
+gemma3/Official compact_arguments default refused/refused x-both
+gemma3/Official float_arguments default refused/refused x-both
+gemma3/Official reasoning_content_echo default refused/refused x-both
+gemma3/Official think_history default chat/chat =
+gemma3/Official repeated_think_close default refused/refused x-both
+gemma3/Official repeated_think_close_history default chat/chat =
+gemma3/Official tool_response_user_turn default chat/chat =
+gemma3/Official empty_user_text default chat/chat =
+gemma3/Official empty_assistant_text default chat/chat =
+gemma3/Official padded_assistant_content default chat/chat =
+gemma3/Official padded_system_content default chat/chat =
+gemma3/Official empty_system_message default chat/chat =
+gemma3/Official tool_history_without_tools default refused/refused x-both
+gemma3/Official tool_without_description default refused/refused x-both
+gemma3/Official tool_strict default refused/refused x-both
+gemma3/Official tool_parameters_unordered default refused/refused x-both
+gemma3/Official smollm3_system_override default chat/chat =
+gemma3/Official smollm3_system_override_history default chat/chat =
+gemma3/Official assistant_text_before_call default refused/refused x-both
+gemma3/Official two_assistant_calls default refused/refused x-both
+gemma3/Official parallel_tool_calls default refused/refused x-both
+gemma3/Official tool_output_with_think default refused/refused x-both
+gemma3/Official tool_choice_required default refused/refused x-both
+gemma3/Official tool_choice_named default refused/refused x-both
+gemma3/Official tool_choice_none default chat/chat =
+gemma3/Official automatic_tool_call default refused/refused x-both
+gemma3/Official forced_tool_call default refused/refused x-both
+gemma3/Official multi_part_content default refused/refused x-both
+gemma3/Official system_only default refused/refused x-both
+gemma3/Official explicit_thinking_off default refused/chat x-pinned bf12b6d99b589347  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+gemma3/Official explicit_thinking_on default refused/chat x-pinned bf12b6d99b589347  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+granite_moe/LegacyGranite3_1Instruct user_only default chat/chat =
+granite_moe/LegacyGranite3_1Instruct system_and_user default chat/chat =
+granite_moe/LegacyGranite3_1Instruct multi_turn default chat/chat =
+granite_moe/LegacyGranite3_1Instruct multi_turn_with_system default chat/chat =
+granite_moe/LegacyGranite3_1Instruct non_ascii default chat/chat =
+granite_moe/LegacyGranite3_1Instruct padded_content default chat/chat =
+granite_moe/LegacyGranite3_1Instruct plain default chat/chat =
+granite_moe/LegacyGranite3_1Instruct tools_first_turn default refused/agent x-pinned 9f95c128136994d1  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct tools_no_system default refused/agent x-pinned 62a7396dd9e129f2  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct tool_loop default refused/agent x-pinned 280d311878d7a6f2  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct reasoning_and_text_before_call default refused/agent x-pinned 5735c9c1d22f53b2  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct typed_arguments_then_new_user default refused/agent x-pinned 7876327c5f9c9cf0  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct compact_arguments default refused/agent x-pinned eda2420e0ecc86a9  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct float_arguments default refused/agent x-pinned 53574d5915b6cf1b  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct reasoning_content_echo default refused/refused x-both
+granite_moe/LegacyGranite3_1Instruct think_history default chat/chat =
+granite_moe/LegacyGranite3_1Instruct repeated_think_close default refused/refused x-both
+granite_moe/LegacyGranite3_1Instruct repeated_think_close_history default chat/chat =
+granite_moe/LegacyGranite3_1Instruct tool_response_user_turn default chat/chat =
+granite_moe/LegacyGranite3_1Instruct empty_user_text default chat/chat =
+granite_moe/LegacyGranite3_1Instruct empty_assistant_text default chat/chat =
+granite_moe/LegacyGranite3_1Instruct padded_assistant_content default chat/chat =
+granite_moe/LegacyGranite3_1Instruct padded_system_content default chat/chat =
+granite_moe/LegacyGranite3_1Instruct empty_system_message default chat/chat =
+granite_moe/LegacyGranite3_1Instruct tool_history_without_tools default refused/agent x-pinned ee38b2e01534b901  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct tool_without_description default refused/agent x-pinned a0702c977e06bde4  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct tool_strict default refused/agent x-pinned bf72fb59bbc11677  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct tool_parameters_unordered default refused/agent x-pinned 12673ed3a676361a  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct smollm3_system_override default chat/chat =
+granite_moe/LegacyGranite3_1Instruct smollm3_system_override_history default chat/chat =
+granite_moe/LegacyGranite3_1Instruct assistant_text_before_call default refused/agent x-pinned 8758eac9152eff58  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct two_assistant_calls default refused/agent x-pinned c5f5e8fdd4f816ea  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct parallel_tool_calls default refused/agent x-pinned 0a48f7079cfc6abb  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+granite_moe/LegacyGranite3_1Instruct tool_output_with_think default refused/agent x-pinned 754057d3e0ca9024  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct tool_choice_required default refused/refused x-both
+granite_moe/LegacyGranite3_1Instruct tool_choice_named default refused/refused x-both
+granite_moe/LegacyGranite3_1Instruct tool_choice_none default chat/chat =
+granite_moe/LegacyGranite3_1Instruct automatic_tool_call default refused/agent x-pinned ef6ba39d5eb958ab  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/LegacyGranite3_1Instruct forced_tool_call default refused/refused x-both
+granite_moe/LegacyGranite3_1Instruct multi_part_content default refused/refused x-both
+granite_moe/LegacyGranite3_1Instruct system_only default refused/refused x-both
+granite_moe/LegacyGranite3_1Instruct explicit_thinking_off default refused/chat x-pinned aea35b1a6a6487c9  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+granite_moe/LegacyGranite3_1Instruct explicit_thinking_on default refused/chat x-pinned aea35b1a6a6487c9  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+granite_moe/CurrentGranite3_1Instruct user_only default refused/chat x-pinned e94a00a45c54b2a4  # undecided: the pinned renderer refuses a conversation without a system message, the template asks for the current date
+granite_moe/CurrentGranite3_1Instruct system_and_user default chat/chat =
+granite_moe/CurrentGranite3_1Instruct multi_turn default refused/chat x-pinned c56cb35b2dc13d2b  # undecided: the pinned renderer refuses a conversation without a system message, the template asks for the current date
+granite_moe/CurrentGranite3_1Instruct multi_turn_with_system default chat/chat =
+granite_moe/CurrentGranite3_1Instruct non_ascii default refused/chat x-pinned e9902ebb6d16dfe4  # undecided: the pinned renderer refuses a conversation without a system message, the template asks for the current date
+granite_moe/CurrentGranite3_1Instruct padded_content default refused/chat x-pinned d28e1210ba53fe0e  # undecided: the pinned renderer refuses a conversation without a system message, the template asks for the current date
+granite_moe/CurrentGranite3_1Instruct plain default chat/chat =
+granite_moe/CurrentGranite3_1Instruct tools_first_turn default refused/agent x-pinned 908966a8e5a8a262  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct tools_no_system default refused/agent x-pinned 9ad0e8129d7900f8  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct tool_loop default refused/agent x-pinned e54c2b57895fbc37  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct reasoning_and_text_before_call default refused/agent x-pinned 104ba787ef65155b  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct typed_arguments_then_new_user default refused/agent x-pinned 9b929494d910f79c  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct compact_arguments default refused/agent x-pinned 8d754157727be8a6  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct float_arguments default refused/agent x-pinned 78d7e39527337c90  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct reasoning_content_echo default refused/refused x-both
+granite_moe/CurrentGranite3_1Instruct think_history default refused/chat x-pinned 798c167993fa6410  # undecided: the pinned renderer refuses a conversation without a system message, the template asks for the current date
+granite_moe/CurrentGranite3_1Instruct repeated_think_close default refused/refused x-both
+granite_moe/CurrentGranite3_1Instruct repeated_think_close_history default refused/chat x-pinned fbedfd50ec755904  # undecided: the pinned renderer refuses a conversation without a system message, the template asks for the current date
+granite_moe/CurrentGranite3_1Instruct tool_response_user_turn default refused/chat x-pinned db803b15d271d3c4  # undecided: the pinned renderer refuses a conversation without a system message, the template asks for the current date
+granite_moe/CurrentGranite3_1Instruct empty_user_text default refused/chat x-pinned 0d96e07bed2feefb  # undecided: the pinned renderer refuses a conversation without a system message, the template asks for the current date
+granite_moe/CurrentGranite3_1Instruct empty_assistant_text default refused/chat x-pinned 1000438afb16fc7d  # undecided: the pinned renderer refuses a conversation without a system message, the template asks for the current date
+granite_moe/CurrentGranite3_1Instruct padded_assistant_content default refused/chat x-pinned 237c2b13f8f5d26a  # undecided: the pinned renderer refuses a conversation without a system message, the template asks for the current date
+granite_moe/CurrentGranite3_1Instruct padded_system_content default chat/chat =
+granite_moe/CurrentGranite3_1Instruct empty_system_message default chat/chat =
+granite_moe/CurrentGranite3_1Instruct tool_history_without_tools default refused/agent x-pinned 630117268dbf64bf  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct tool_without_description default refused/agent x-pinned fa908083df6762b9  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct tool_strict default refused/agent x-pinned 4aade09e3ac27bc6  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct tool_parameters_unordered default refused/agent x-pinned 3a58dd4fe0b71b46  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct smollm3_system_override default chat/chat =
+granite_moe/CurrentGranite3_1Instruct smollm3_system_override_history default chat/chat =
+granite_moe/CurrentGranite3_1Instruct assistant_text_before_call default refused/agent x-pinned b0a4b4d875af9e65  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct two_assistant_calls default refused/agent x-pinned 29776f695791801e  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct parallel_tool_calls default refused/agent x-pinned 83aefce8363e02b6  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+granite_moe/CurrentGranite3_1Instruct tool_output_with_think default refused/agent x-pinned f420479a718dc6fd  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct tool_choice_required default refused/refused x-both
+granite_moe/CurrentGranite3_1Instruct tool_choice_named default refused/refused x-both
+granite_moe/CurrentGranite3_1Instruct tool_choice_none default refused/chat x-pinned 2ea4fa53421a7f36  # undecided: the pinned renderer refuses a conversation without a system message, the template asks for the current date
+granite_moe/CurrentGranite3_1Instruct automatic_tool_call default refused/agent x-pinned 0b3985bf8f308199  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+granite_moe/CurrentGranite3_1Instruct forced_tool_call default refused/refused x-both
+granite_moe/CurrentGranite3_1Instruct multi_part_content default refused/refused x-both
+granite_moe/CurrentGranite3_1Instruct system_only default refused/refused x-both
+granite_moe/CurrentGranite3_1Instruct explicit_thinking_off default refused/chat x-pinned e94a00a45c54b2a4  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+granite_moe/CurrentGranite3_1Instruct explicit_thinking_on default refused/chat x-pinned e94a00a45c54b2a4  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+lfm2/OfficialGguf user_only default chat/chat =
+lfm2/OfficialGguf system_and_user default chat/chat =
+lfm2/OfficialGguf multi_turn default chat/chat =
+lfm2/OfficialGguf multi_turn_with_system default chat/chat =
+lfm2/OfficialGguf non_ascii default chat/chat =
+lfm2/OfficialGguf padded_content default chat/chat =
+lfm2/OfficialGguf plain default chat/chat =
+lfm2/OfficialGguf tools_first_turn default refused/refused x-both
+lfm2/OfficialGguf tools_no_system default refused/refused x-both
+lfm2/OfficialGguf tool_loop default refused/refused x-both
+lfm2/OfficialGguf reasoning_and_text_before_call default refused/refused x-both
+lfm2/OfficialGguf typed_arguments_then_new_user default refused/refused x-both
+lfm2/OfficialGguf compact_arguments default refused/refused x-both
+lfm2/OfficialGguf float_arguments default refused/refused x-both
+lfm2/OfficialGguf reasoning_content_echo default refused/refused x-both
+lfm2/OfficialGguf think_history default chat/chat =
+lfm2/OfficialGguf repeated_think_close default refused/refused x-both
+lfm2/OfficialGguf repeated_think_close_history default chat/chat =
+lfm2/OfficialGguf tool_response_user_turn default chat/chat =
+lfm2/OfficialGguf empty_user_text default chat/chat =
+lfm2/OfficialGguf empty_assistant_text default chat/chat =
+lfm2/OfficialGguf padded_assistant_content default chat/chat =
+lfm2/OfficialGguf padded_system_content default chat/chat =
+lfm2/OfficialGguf empty_system_message default chat/chat =
+lfm2/OfficialGguf tool_history_without_tools default refused/refused x-both
+lfm2/OfficialGguf tool_without_description default refused/refused x-both
+lfm2/OfficialGguf tool_strict default refused/refused x-both
+lfm2/OfficialGguf tool_parameters_unordered default refused/refused x-both
+lfm2/OfficialGguf smollm3_system_override default chat/chat =
+lfm2/OfficialGguf smollm3_system_override_history default chat/chat =
+lfm2/OfficialGguf assistant_text_before_call default refused/refused x-both
+lfm2/OfficialGguf two_assistant_calls default refused/refused x-both
+lfm2/OfficialGguf parallel_tool_calls default refused/refused x-both
+lfm2/OfficialGguf tool_output_with_think default refused/refused x-both
+lfm2/OfficialGguf tool_choice_required default refused/refused x-both
+lfm2/OfficialGguf tool_choice_named default refused/refused x-both
+lfm2/OfficialGguf tool_choice_none default chat/chat =
+lfm2/OfficialGguf automatic_tool_call default refused/refused x-both
+lfm2/OfficialGguf forced_tool_call default refused/refused x-both
+lfm2/OfficialGguf multi_part_content default refused/refused x-both
+lfm2/OfficialGguf system_only default refused/refused x-both
+lfm2/OfficialGguf explicit_thinking_off default refused/chat x-pinned 7eb341f34d4ca015  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+lfm2/OfficialGguf explicit_thinking_on default refused/chat x-pinned 7eb341f34d4ca015  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+llama/SmolLm2ChatMl user_only default chat/chat =
+llama/SmolLm2ChatMl system_and_user default chat/chat =
+llama/SmolLm2ChatMl multi_turn default chat/chat =
+llama/SmolLm2ChatMl multi_turn_with_system default chat/chat =
+llama/SmolLm2ChatMl non_ascii default chat/chat =
+llama/SmolLm2ChatMl padded_content default chat/chat =
+llama/SmolLm2ChatMl plain default chat/chat =
+llama/SmolLm2ChatMl tools_first_turn default refused/refused x-both
+llama/SmolLm2ChatMl tools_no_system default refused/refused x-both
+llama/SmolLm2ChatMl tool_loop default refused/refused x-both
+llama/SmolLm2ChatMl reasoning_and_text_before_call default refused/refused x-both
+llama/SmolLm2ChatMl typed_arguments_then_new_user default refused/refused x-both
+llama/SmolLm2ChatMl compact_arguments default refused/refused x-both
+llama/SmolLm2ChatMl float_arguments default refused/refused x-both
+llama/SmolLm2ChatMl reasoning_content_echo default refused/refused x-both
+llama/SmolLm2ChatMl think_history default chat/chat =
+llama/SmolLm2ChatMl repeated_think_close default refused/refused x-both
+llama/SmolLm2ChatMl repeated_think_close_history default chat/chat =
+llama/SmolLm2ChatMl tool_response_user_turn default chat/chat =
+llama/SmolLm2ChatMl empty_user_text default chat/chat =
+llama/SmolLm2ChatMl empty_assistant_text default chat/chat =
+llama/SmolLm2ChatMl padded_assistant_content default chat/chat =
+llama/SmolLm2ChatMl padded_system_content default chat/chat =
+llama/SmolLm2ChatMl empty_system_message default chat/chat =
+llama/SmolLm2ChatMl tool_history_without_tools default refused/refused x-both
+llama/SmolLm2ChatMl tool_without_description default refused/refused x-both
+llama/SmolLm2ChatMl tool_strict default refused/refused x-both
+llama/SmolLm2ChatMl tool_parameters_unordered default refused/refused x-both
+llama/SmolLm2ChatMl smollm3_system_override default chat/chat =
+llama/SmolLm2ChatMl smollm3_system_override_history default chat/chat =
+llama/SmolLm2ChatMl assistant_text_before_call default refused/refused x-both
+llama/SmolLm2ChatMl two_assistant_calls default refused/refused x-both
+llama/SmolLm2ChatMl parallel_tool_calls default refused/refused x-both
+llama/SmolLm2ChatMl tool_output_with_think default refused/refused x-both
+llama/SmolLm2ChatMl tool_choice_required default refused/refused x-both
+llama/SmolLm2ChatMl tool_choice_named default refused/refused x-both
+llama/SmolLm2ChatMl tool_choice_none default chat/chat =
+llama/SmolLm2ChatMl automatic_tool_call default refused/refused x-both
+llama/SmolLm2ChatMl forced_tool_call default refused/refused x-both
+llama/SmolLm2ChatMl multi_part_content default refused/refused x-both
+llama/SmolLm2ChatMl system_only default refused/refused x-both
+llama/SmolLm2ChatMl explicit_thinking_off default refused/chat x-pinned 7f2de2f77990d068  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+llama/SmolLm2ChatMl explicit_thinking_on default refused/chat x-pinned 7f2de2f77990d068  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+llama/Llama3_2Instruct user_only default chat/chat ! 111 6e09bf9f99cc3232 09e12537340e8f96  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct system_and_user default chat/chat ! 111 20c674a786b63a65 de0cf28d8983dfec  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct multi_turn default chat/chat ! 111 994da43fd793d7ef 2fab23283a9db7ee  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct multi_turn_with_system default chat/chat ! 111 87436d29cb690f48 4bfae44b84a9c916  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct non_ascii default chat/chat ! 111 e2c1372945c5a826 32d2c4c672c72c92  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct padded_content default chat/chat ! 111 6e09bf9f99cc3232 09e12537340e8f96  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct plain default chat/chat ! 111 370f75f20bd55d7a 813048d811a5d1d5  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct tools_first_turn default refused/agent x-pinned 86d02b338fb3a166  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct tools_no_system default refused/agent x-pinned 9d04aa1cb01ead47  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct tool_loop default refused/agent x-pinned a92deb5bf613fa99  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct reasoning_and_text_before_call default refused/agent x-pinned a92deb5bf613fa99  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct typed_arguments_then_new_user default refused/agent x-pinned ae4064f29db9fde2  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct compact_arguments default refused/agent x-pinned d7d981432527d7e8  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct float_arguments default refused/agent x-pinned f13e3555d956f41b  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct reasoning_content_echo default refused/refused x-both
+llama/Llama3_2Instruct think_history default chat/chat ! 111 4f349cb27a91d265 a1766308fae32c0d  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct repeated_think_close default refused/refused x-both
+llama/Llama3_2Instruct repeated_think_close_history default chat/chat ! 111 1535b08801cc0b15 1c90c3bccfbf5757  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct tool_response_user_turn default chat/chat ! 111 c4efd126aeda82fa 1e1b0e948646f760  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct empty_user_text default chat/chat ! 111 a40c1c46ec138ab7 fe881a84d1a33b30  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct empty_assistant_text default chat/chat ! 111 e26528f862c085be 32799dcecc30c61c  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct padded_assistant_content default chat/chat ! 111 fe03bdcf5780dd00 b6177712cb7d7d0e  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct padded_system_content default chat/chat ! 111 c51e0db41f4c3e55 656d0ae87d3fe98d  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct empty_system_message default chat/chat ! 111 f11f5ae09c006398 37684d66f5daa708  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct tool_history_without_tools default refused/agent x-pinned b221197581a193f0  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct tool_without_description default refused/agent x-pinned 066e3747bb8d9624  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct tool_strict default refused/agent x-pinned aa4cd0b3a1ac28c3  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct tool_parameters_unordered default refused/agent x-pinned 2333199569669b2d  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct smollm3_system_override default chat/chat ! 111 646a9b13dc1d4cd1 da911dea5b425097  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct smollm3_system_override_history default chat/chat ! 111 f7bacc4140964ca4 b0f74df593a2ace5  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct assistant_text_before_call default refused/agent x-pinned 4062d92b11d2aa36  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct two_assistant_calls default refused/agent x-pinned 0364759dca456108  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct parallel_tool_calls default refused/refused x-both
+llama/Llama3_2Instruct tool_output_with_think default refused/agent x-pinned 2072ff867553a37c  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct tool_choice_required default refused/refused x-both
+llama/Llama3_2Instruct tool_choice_named default refused/refused x-both
+llama/Llama3_2Instruct tool_choice_none default chat/chat ! 111 ce6ffb5e55bf8554 d6579a1633a3b779  # the generic side looks right: the template prints the current date, the pinned renderer prints its fixed fallback date
+llama/Llama3_2Instruct automatic_tool_call default refused/agent x-pinned 212654e7231c58e0  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+llama/Llama3_2Instruct forced_tool_call default refused/refused x-both
+llama/Llama3_2Instruct multi_part_content default refused/refused x-both
+llama/Llama3_2Instruct system_only default refused/refused x-both
+llama/Llama3_2Instruct explicit_thinking_off default refused/chat x-pinned 09e12537340e8f96  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+llama/Llama3_2Instruct explicit_thinking_on default refused/chat x-pinned 09e12537340e8f96  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+qwen2/OfficialQwen2_5 user_only default chat/chat =
+qwen2/OfficialQwen2_5 system_and_user default chat/chat =
+qwen2/OfficialQwen2_5 multi_turn default chat/chat =
+qwen2/OfficialQwen2_5 multi_turn_with_system default chat/chat =
+qwen2/OfficialQwen2_5 non_ascii default chat/chat =
+qwen2/OfficialQwen2_5 padded_content default chat/chat =
+qwen2/OfficialQwen2_5 plain default chat/chat =
+qwen2/OfficialQwen2_5 tools_first_turn default refused/agent x-pinned 7f949696701e519a  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 tools_no_system default refused/agent x-pinned 8c0aa754e94e3bce  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 tool_loop default refused/agent x-pinned 06338440908b587f  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 reasoning_and_text_before_call default refused/agent x-pinned 8530f4310cd8933c  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 typed_arguments_then_new_user default refused/agent x-pinned 7302edb71f9fe1a1  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 compact_arguments default refused/agent x-pinned eef1200aa2f026be  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 float_arguments default refused/agent x-pinned 8101364666c5f666  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 reasoning_content_echo default refused/refused x-both
+qwen2/OfficialQwen2_5 think_history default chat/chat =
+qwen2/OfficialQwen2_5 repeated_think_close default refused/refused x-both
+qwen2/OfficialQwen2_5 repeated_think_close_history default chat/chat =
+qwen2/OfficialQwen2_5 tool_response_user_turn default chat/chat =
+qwen2/OfficialQwen2_5 empty_user_text default chat/chat =
+qwen2/OfficialQwen2_5 empty_assistant_text default chat/chat =
+qwen2/OfficialQwen2_5 padded_assistant_content default chat/chat =
+qwen2/OfficialQwen2_5 padded_system_content default chat/chat =
+qwen2/OfficialQwen2_5 empty_system_message default chat/chat =
+qwen2/OfficialQwen2_5 tool_history_without_tools default refused/agent x-pinned 2a7aade4afecd897  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 tool_without_description default refused/agent x-pinned 7049acd0ecc92795  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 tool_strict default refused/agent x-pinned 8922e3b4c0e475cd  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 tool_parameters_unordered default refused/agent x-pinned a04f81ea8e8d52dd  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 smollm3_system_override default chat/chat =
+qwen2/OfficialQwen2_5 smollm3_system_override_history default chat/chat =
+qwen2/OfficialQwen2_5 assistant_text_before_call default refused/agent x-pinned 4719794bf9732ea5  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 two_assistant_calls default refused/agent x-pinned 4f585142d296386b  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 parallel_tool_calls default refused/agent x-pinned d14665c7cc84cab1  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+qwen2/OfficialQwen2_5 tool_output_with_think default refused/agent x-pinned 71ecde1333e73383  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 tool_choice_required default refused/refused x-both
+qwen2/OfficialQwen2_5 tool_choice_named default refused/refused x-both
+qwen2/OfficialQwen2_5 tool_choice_none default chat/chat =
+qwen2/OfficialQwen2_5 automatic_tool_call default refused/agent x-pinned 9d9ab80e586e6453  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 forced_tool_call default refused/refused x-both
+qwen2/OfficialQwen2_5 multi_part_content default refused/refused x-both
+qwen2/OfficialQwen2_5 system_only default refused/refused x-both
+qwen2/OfficialQwen2_5 explicit_thinking_off default refused/chat x-pinned 74fdbba9eed4bb2c  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+qwen2/OfficialQwen2_5 explicit_thinking_on default refused/chat x-pinned 74fdbba9eed4bb2c  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+qwen3/Current user_only default chat/chat =
+qwen3/Current user_only on chat/chat =
+qwen3/Current user_only off chat/chat =
+qwen3/Current system_and_user default chat/chat =
+qwen3/Current system_and_user on chat/chat =
+qwen3/Current system_and_user off chat/chat =
+qwen3/Current multi_turn default chat/chat =
+qwen3/Current multi_turn on chat/chat =
+qwen3/Current multi_turn off chat/chat =
+qwen3/Current multi_turn_with_system default chat/chat =
+qwen3/Current multi_turn_with_system on chat/chat =
+qwen3/Current multi_turn_with_system off chat/chat =
+qwen3/Current non_ascii default chat/chat =
+qwen3/Current non_ascii on chat/chat =
+qwen3/Current non_ascii off chat/chat =
+qwen3/Current padded_content default chat/chat =
+qwen3/Current padded_content on chat/chat =
+qwen3/Current padded_content off chat/chat =
+qwen3/Current plain default chat/chat =
+qwen3/Current plain on chat/chat =
+qwen3/Current plain off chat/chat =
+qwen3/Current tools_first_turn default agent/agent =
+qwen3/Current tools_first_turn on agent/agent =
+qwen3/Current tools_first_turn off agent/agent =
+qwen3/Current tools_no_system default agent/agent =
+qwen3/Current tools_no_system on agent/agent =
+qwen3/Current tools_no_system off agent/agent =
+qwen3/Current tool_loop default agent/agent =
+qwen3/Current tool_loop on agent/agent =
+qwen3/Current tool_loop off agent/agent =
+qwen3/Current reasoning_and_text_before_call default agent/refused x-generic 662bd49ab3d63ef8  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Current reasoning_and_text_before_call on agent/refused x-generic 662bd49ab3d63ef8  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Current reasoning_and_text_before_call off agent/refused x-generic 1e45ab62abd9a1f5  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Current typed_arguments_then_new_user default agent/agent =
+qwen3/Current typed_arguments_then_new_user on agent/agent =
+qwen3/Current typed_arguments_then_new_user off agent/agent =
+qwen3/Current compact_arguments default agent/agent ! 745 eda3445e18d4f0df d3b1613554fa181d  # the pinned side looks right: the template prints a string argument verbatim, the generic engine parses it into an object first
+qwen3/Current compact_arguments on agent/agent ! 745 eda3445e18d4f0df d3b1613554fa181d  # the pinned side looks right: the template prints a string argument verbatim, the generic engine parses it into an object first
+qwen3/Current compact_arguments off agent/agent ! 745 217e498c82fc13fb f6c343c406f98b75  # the pinned side looks right: the template prints a string argument verbatim, the generic engine parses it into an object first
+qwen3/Current float_arguments default agent/agent ! 729 f54a2142ca120999 d7e404bdf516dc15  # the pinned side looks right: the template prints a string argument verbatim, the generic engine re-serialises the parsed number
+qwen3/Current float_arguments on agent/agent ! 729 f54a2142ca120999 d7e404bdf516dc15  # the pinned side looks right: the template prints a string argument verbatim, the generic engine re-serialises the parsed number
+qwen3/Current float_arguments off agent/agent ! 729 3bd1ff0679142020 7e3f4617286e23e6  # the pinned side looks right: the template prints a string argument verbatim, the generic engine re-serialises the parsed number
+qwen3/Current reasoning_content_echo default chat/refused x-generic 7674c238842e84e0  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Current reasoning_content_echo on chat/refused x-generic 7674c238842e84e0  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Current reasoning_content_echo off chat/refused x-generic b9a012fa52ae037b  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Current think_history default chat/refused x-generic 855ee631343d5678  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Current think_history on chat/refused x-generic 855ee631343d5678  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Current think_history off chat/refused x-generic b5196bf5bed1a0cb  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Current repeated_think_close default refused/refused x-both
+qwen3/Current repeated_think_close on refused/refused x-both
+qwen3/Current repeated_think_close off refused/refused x-both
+qwen3/Current repeated_think_close_history default chat/refused x-generic c015998a2c817172  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Current repeated_think_close_history on chat/refused x-generic c015998a2c817172  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Current repeated_think_close_history off chat/refused x-generic 18e8ca436e65d1cd  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Current tool_response_user_turn default chat/refused x-generic fd093b45495de542  # undecided: user text holding a reserved string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen3/Current tool_response_user_turn on chat/refused x-generic fd093b45495de542  # undecided: user text holding a reserved string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen3/Current tool_response_user_turn off chat/refused x-generic a6846d684ac8e6a7  # undecided: user text holding a reserved string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen3/Current empty_user_text default chat/chat =
+qwen3/Current empty_user_text on chat/chat =
+qwen3/Current empty_user_text off chat/chat =
+qwen3/Current empty_assistant_text default chat/chat =
+qwen3/Current empty_assistant_text on chat/chat =
+qwen3/Current empty_assistant_text off chat/chat =
+qwen3/Current padded_assistant_content default chat/chat =
+qwen3/Current padded_assistant_content on chat/chat =
+qwen3/Current padded_assistant_content off chat/chat =
+qwen3/Current padded_system_content default chat/chat =
+qwen3/Current padded_system_content on chat/chat =
+qwen3/Current padded_system_content off chat/chat =
+qwen3/Current empty_system_message default chat/chat =
+qwen3/Current empty_system_message on chat/chat =
+qwen3/Current empty_system_message off chat/chat =
+qwen3/Current tool_history_without_tools default agent/agent =
+qwen3/Current tool_history_without_tools on agent/agent =
+qwen3/Current tool_history_without_tools off agent/agent =
+qwen3/Current tool_without_description default agent/agent ! 229 16bae93f7f771312 35fa64e1b51adc3f  # the pinned side looks right: the client's declaration has no description, the generic engine adds a null one
+qwen3/Current tool_without_description on agent/agent ! 229 16bae93f7f771312 35fa64e1b51adc3f  # the pinned side looks right: the client's declaration has no description, the generic engine adds a null one
+qwen3/Current tool_without_description off agent/agent ! 229 1977e8d7e599ccb9 2cc6a7c1b03cc7a8  # the pinned side looks right: the client's declaration has no description, the generic engine adds a null one
+qwen3/Current tool_strict default agent/agent ! 260 654493e3b8ac094f 0d5b654de4d9c83b  # the pinned side looks right: the client's `strict` flag reaches the model, the generic engine drops it from the tool declaration
+qwen3/Current tool_strict on agent/agent ! 260 654493e3b8ac094f 0d5b654de4d9c83b  # the pinned side looks right: the client's `strict` flag reaches the model, the generic engine drops it from the tool declaration
+qwen3/Current tool_strict off agent/agent ! 260 d6ea503523521adb a057def816f02391  # the pinned side looks right: the client's `strict` flag reaches the model, the generic engine drops it from the tool declaration
+qwen3/Current tool_parameters_unordered default agent/agent =
+qwen3/Current tool_parameters_unordered on agent/agent =
+qwen3/Current tool_parameters_unordered off agent/agent =
+qwen3/Current smollm3_system_override default chat/chat =
+qwen3/Current smollm3_system_override on chat/chat =
+qwen3/Current smollm3_system_override off chat/chat =
+qwen3/Current smollm3_system_override_history default chat/chat =
+qwen3/Current smollm3_system_override_history on chat/chat =
+qwen3/Current smollm3_system_override_history off chat/chat =
+qwen3/Current assistant_text_before_call default agent/agent =
+qwen3/Current assistant_text_before_call on agent/agent =
+qwen3/Current assistant_text_before_call off agent/agent =
+qwen3/Current two_assistant_calls default agent/agent =
+qwen3/Current two_assistant_calls on agent/agent =
+qwen3/Current two_assistant_calls off agent/agent =
+qwen3/Current parallel_tool_calls default refused/agent x-pinned 9f7efe14b9101def  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+qwen3/Current parallel_tool_calls on refused/agent x-pinned 9f7efe14b9101def  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+qwen3/Current parallel_tool_calls off refused/agent x-pinned ec410fbe39a3dd6e  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+qwen3/Current tool_output_with_think default agent/refused x-generic bb8af6862bab5194  # undecided: the tool output holds a reserved control string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen3/Current tool_output_with_think on agent/refused x-generic bb8af6862bab5194  # undecided: the tool output holds a reserved control string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen3/Current tool_output_with_think off agent/refused x-generic b7b6e9a2b878168b  # undecided: the tool output holds a reserved control string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen3/Current tool_choice_required default agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Current tool_choice_required on agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Current tool_choice_required off agent/refused x-generic 5118dd9f0d357243  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Current tool_choice_named default agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Current tool_choice_named on agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Current tool_choice_named off agent/refused x-generic 5118dd9f0d357243  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Current tool_choice_none default chat/chat =
+qwen3/Current tool_choice_none on chat/chat =
+qwen3/Current tool_choice_none off chat/chat =
+qwen3/Current automatic_tool_call default agent/agent =
+qwen3/Current automatic_tool_call on agent/agent =
+qwen3/Current automatic_tool_call off agent/agent =
+qwen3/Current forced_tool_call default agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Current forced_tool_call on agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Current forced_tool_call off agent/refused x-generic 5118dd9f0d357243  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Current multi_part_content default refused/refused x-both
+qwen3/Current multi_part_content on refused/refused x-both
+qwen3/Current multi_part_content off refused/refused x-both
+qwen3/Current system_only default refused/refused x-both
+qwen3/Current system_only on refused/refused x-both
+qwen3/Current system_only off refused/refused x-both
+qwen3/Current explicit_thinking_off default chat/chat =
+qwen3/Current explicit_thinking_off on chat/chat =
+qwen3/Current explicit_thinking_off off chat/chat =
+qwen3/Current explicit_thinking_on default chat/chat =
+qwen3/Current explicit_thinking_on on chat/chat =
+qwen3/Current explicit_thinking_on off chat/chat =
+qwen3/Gguf user_only default chat/chat =
+qwen3/Gguf user_only on chat/chat =
+qwen3/Gguf user_only off chat/chat =
+qwen3/Gguf system_and_user default chat/chat =
+qwen3/Gguf system_and_user on chat/chat =
+qwen3/Gguf system_and_user off chat/chat =
+qwen3/Gguf multi_turn default chat/chat =
+qwen3/Gguf multi_turn on chat/chat =
+qwen3/Gguf multi_turn off chat/chat =
+qwen3/Gguf multi_turn_with_system default chat/chat =
+qwen3/Gguf multi_turn_with_system on chat/chat =
+qwen3/Gguf multi_turn_with_system off chat/chat =
+qwen3/Gguf non_ascii default chat/chat =
+qwen3/Gguf non_ascii on chat/chat =
+qwen3/Gguf non_ascii off chat/chat =
+qwen3/Gguf padded_content default chat/chat =
+qwen3/Gguf padded_content on chat/chat =
+qwen3/Gguf padded_content off chat/chat =
+qwen3/Gguf plain default chat/chat =
+qwen3/Gguf plain on chat/chat =
+qwen3/Gguf plain off chat/chat =
+qwen3/Gguf tools_first_turn default agent/agent =
+qwen3/Gguf tools_first_turn on agent/agent =
+qwen3/Gguf tools_first_turn off agent/agent =
+qwen3/Gguf tools_no_system default agent/agent =
+qwen3/Gguf tools_no_system on agent/agent =
+qwen3/Gguf tools_no_system off agent/agent =
+qwen3/Gguf tool_loop default agent/agent =
+qwen3/Gguf tool_loop on agent/agent =
+qwen3/Gguf tool_loop off agent/agent =
+qwen3/Gguf reasoning_and_text_before_call default agent/refused x-generic 662bd49ab3d63ef8  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Gguf reasoning_and_text_before_call on agent/refused x-generic 662bd49ab3d63ef8  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Gguf reasoning_and_text_before_call off agent/refused x-generic 1e45ab62abd9a1f5  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Gguf typed_arguments_then_new_user default agent/agent =
+qwen3/Gguf typed_arguments_then_new_user on agent/agent =
+qwen3/Gguf typed_arguments_then_new_user off agent/agent =
+qwen3/Gguf compact_arguments default agent/agent ! 745 eda3445e18d4f0df d3b1613554fa181d  # the pinned side looks right: the template prints a string argument verbatim, the generic engine parses it into an object first
+qwen3/Gguf compact_arguments on agent/agent ! 745 eda3445e18d4f0df d3b1613554fa181d  # the pinned side looks right: the template prints a string argument verbatim, the generic engine parses it into an object first
+qwen3/Gguf compact_arguments off agent/agent ! 745 217e498c82fc13fb f6c343c406f98b75  # the pinned side looks right: the template prints a string argument verbatim, the generic engine parses it into an object first
+qwen3/Gguf float_arguments default agent/agent ! 729 f54a2142ca120999 d7e404bdf516dc15  # the pinned side looks right: the template prints a string argument verbatim, the generic engine re-serialises the parsed number
+qwen3/Gguf float_arguments on agent/agent ! 729 f54a2142ca120999 d7e404bdf516dc15  # the pinned side looks right: the template prints a string argument verbatim, the generic engine re-serialises the parsed number
+qwen3/Gguf float_arguments off agent/agent ! 729 3bd1ff0679142020 7e3f4617286e23e6  # the pinned side looks right: the template prints a string argument verbatim, the generic engine re-serialises the parsed number
+qwen3/Gguf reasoning_content_echo default chat/refused x-generic 7674c238842e84e0  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Gguf reasoning_content_echo on chat/refused x-generic 7674c238842e84e0  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Gguf reasoning_content_echo off chat/refused x-generic b9a012fa52ae037b  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Gguf think_history default chat/refused x-generic 855ee631343d5678  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Gguf think_history on chat/refused x-generic 855ee631343d5678  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Gguf think_history off chat/refused x-generic b5196bf5bed1a0cb  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Gguf repeated_think_close default refused/refused x-both
+qwen3/Gguf repeated_think_close on refused/refused x-both
+qwen3/Gguf repeated_think_close off refused/refused x-both
+qwen3/Gguf repeated_think_close_history default chat/refused x-generic c015998a2c817172  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Gguf repeated_think_close_history on chat/refused x-generic c015998a2c817172  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Gguf repeated_think_close_history off chat/refused x-generic 18e8ca436e65d1cd  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen3/Gguf tool_response_user_turn default chat/refused x-generic fd093b45495de542  # undecided: user text holding a reserved string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen3/Gguf tool_response_user_turn on chat/refused x-generic fd093b45495de542  # undecided: user text holding a reserved string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen3/Gguf tool_response_user_turn off chat/refused x-generic a6846d684ac8e6a7  # undecided: user text holding a reserved string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen3/Gguf empty_user_text default chat/chat =
+qwen3/Gguf empty_user_text on chat/chat =
+qwen3/Gguf empty_user_text off chat/chat =
+qwen3/Gguf empty_assistant_text default chat/chat =
+qwen3/Gguf empty_assistant_text on chat/chat =
+qwen3/Gguf empty_assistant_text off chat/chat =
+qwen3/Gguf padded_assistant_content default chat/chat =
+qwen3/Gguf padded_assistant_content on chat/chat =
+qwen3/Gguf padded_assistant_content off chat/chat =
+qwen3/Gguf padded_system_content default chat/chat =
+qwen3/Gguf padded_system_content on chat/chat =
+qwen3/Gguf padded_system_content off chat/chat =
+qwen3/Gguf empty_system_message default chat/chat =
+qwen3/Gguf empty_system_message on chat/chat =
+qwen3/Gguf empty_system_message off chat/chat =
+qwen3/Gguf tool_history_without_tools default agent/agent =
+qwen3/Gguf tool_history_without_tools on agent/agent =
+qwen3/Gguf tool_history_without_tools off agent/agent =
+qwen3/Gguf tool_without_description default agent/agent ! 229 16bae93f7f771312 35fa64e1b51adc3f  # the pinned side looks right: the client's declaration has no description, the generic engine adds a null one
+qwen3/Gguf tool_without_description on agent/agent ! 229 16bae93f7f771312 35fa64e1b51adc3f  # the pinned side looks right: the client's declaration has no description, the generic engine adds a null one
+qwen3/Gguf tool_without_description off agent/agent ! 229 1977e8d7e599ccb9 2cc6a7c1b03cc7a8  # the pinned side looks right: the client's declaration has no description, the generic engine adds a null one
+qwen3/Gguf tool_strict default agent/agent ! 260 654493e3b8ac094f 0d5b654de4d9c83b  # the pinned side looks right: the client's `strict` flag reaches the model, the generic engine drops it from the tool declaration
+qwen3/Gguf tool_strict on agent/agent ! 260 654493e3b8ac094f 0d5b654de4d9c83b  # the pinned side looks right: the client's `strict` flag reaches the model, the generic engine drops it from the tool declaration
+qwen3/Gguf tool_strict off agent/agent ! 260 d6ea503523521adb a057def816f02391  # the pinned side looks right: the client's `strict` flag reaches the model, the generic engine drops it from the tool declaration
+qwen3/Gguf tool_parameters_unordered default agent/agent =
+qwen3/Gguf tool_parameters_unordered on agent/agent =
+qwen3/Gguf tool_parameters_unordered off agent/agent =
+qwen3/Gguf smollm3_system_override default chat/chat =
+qwen3/Gguf smollm3_system_override on chat/chat =
+qwen3/Gguf smollm3_system_override off chat/chat =
+qwen3/Gguf smollm3_system_override_history default chat/chat =
+qwen3/Gguf smollm3_system_override_history on chat/chat =
+qwen3/Gguf smollm3_system_override_history off chat/chat =
+qwen3/Gguf assistant_text_before_call default agent/agent =
+qwen3/Gguf assistant_text_before_call on agent/agent =
+qwen3/Gguf assistant_text_before_call off agent/agent =
+qwen3/Gguf two_assistant_calls default agent/agent =
+qwen3/Gguf two_assistant_calls on agent/agent =
+qwen3/Gguf two_assistant_calls off agent/agent =
+qwen3/Gguf parallel_tool_calls default refused/agent x-pinned 9f7efe14b9101def  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+qwen3/Gguf parallel_tool_calls on refused/agent x-pinned 9f7efe14b9101def  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+qwen3/Gguf parallel_tool_calls off refused/agent x-pinned ec410fbe39a3dd6e  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+qwen3/Gguf tool_output_with_think default agent/refused x-generic bb8af6862bab5194  # undecided: the tool output holds a reserved control string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen3/Gguf tool_output_with_think on agent/refused x-generic bb8af6862bab5194  # undecided: the tool output holds a reserved control string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen3/Gguf tool_output_with_think off agent/refused x-generic b7b6e9a2b878168b  # undecided: the tool output holds a reserved control string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen3/Gguf tool_choice_required default agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Gguf tool_choice_required on agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Gguf tool_choice_required off agent/refused x-generic 5118dd9f0d357243  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Gguf tool_choice_named default agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Gguf tool_choice_named on agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Gguf tool_choice_named off agent/refused x-generic 5118dd9f0d357243  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Gguf tool_choice_none default chat/chat =
+qwen3/Gguf tool_choice_none on chat/chat =
+qwen3/Gguf tool_choice_none off chat/chat =
+qwen3/Gguf automatic_tool_call default agent/agent =
+qwen3/Gguf automatic_tool_call on agent/agent =
+qwen3/Gguf automatic_tool_call off agent/agent =
+qwen3/Gguf forced_tool_call default agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Gguf forced_tool_call on agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Gguf forced_tool_call off agent/refused x-generic 5118dd9f0d357243  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Gguf multi_part_content default refused/refused x-both
+qwen3/Gguf multi_part_content on refused/refused x-both
+qwen3/Gguf multi_part_content off refused/refused x-both
+qwen3/Gguf system_only default refused/refused x-both
+qwen3/Gguf system_only on refused/refused x-both
+qwen3/Gguf system_only off refused/refused x-both
+qwen3/Gguf explicit_thinking_off default chat/chat =
+qwen3/Gguf explicit_thinking_off on chat/chat =
+qwen3/Gguf explicit_thinking_off off chat/chat =
+qwen3/Gguf explicit_thinking_on default chat/chat =
+qwen3/Gguf explicit_thinking_on on chat/chat =
+qwen3/Gguf explicit_thinking_on off chat/chat =
+qwen35/Official user_only default chat/chat =
+qwen35/Official user_only on chat/chat =
+qwen35/Official user_only off chat/chat =
+qwen35/Official system_and_user default chat/chat =
+qwen35/Official system_and_user on chat/chat =
+qwen35/Official system_and_user off chat/chat =
+qwen35/Official multi_turn default chat/chat =
+qwen35/Official multi_turn on chat/chat =
+qwen35/Official multi_turn off chat/chat =
+qwen35/Official multi_turn_with_system default chat/chat =
+qwen35/Official multi_turn_with_system on chat/chat =
+qwen35/Official multi_turn_with_system off chat/chat =
+qwen35/Official non_ascii default chat/chat =
+qwen35/Official non_ascii on chat/chat =
+qwen35/Official non_ascii off chat/chat =
+qwen35/Official padded_content default chat/chat =
+qwen35/Official padded_content on chat/chat =
+qwen35/Official padded_content off chat/chat =
+qwen35/Official plain default chat/chat =
+qwen35/Official plain on chat/chat =
+qwen35/Official plain off chat/chat =
+qwen35/Official tools_first_turn default agent/agent =
+qwen35/Official tools_first_turn on agent/agent =
+qwen35/Official tools_first_turn off agent/agent =
+qwen35/Official tools_no_system default agent/agent =
+qwen35/Official tools_no_system on agent/agent =
+qwen35/Official tools_no_system off agent/agent =
+qwen35/Official tool_loop default agent/agent =
+qwen35/Official tool_loop on agent/agent =
+qwen35/Official tool_loop off agent/agent =
+qwen35/Official reasoning_and_text_before_call default agent/refused x-generic 2d11582b62654f7b  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Official reasoning_and_text_before_call on agent/refused x-generic 2d11582b62654f7b  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Official reasoning_and_text_before_call off agent/refused x-generic fed96a049fd4d9d7  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Official typed_arguments_then_new_user default agent/agent =
+qwen35/Official typed_arguments_then_new_user on agent/agent =
+qwen35/Official typed_arguments_then_new_user off agent/agent =
+qwen35/Official compact_arguments default agent/agent =
+qwen35/Official compact_arguments on agent/agent =
+qwen35/Official compact_arguments off agent/agent =
+qwen35/Official float_arguments default agent/agent ! 1259 2480ec8a11129a6c 74cf60ea56773789  # the pinned side looks right: `1e-05` is the Python text of the float, the generic template prints the number with `| string`
+qwen35/Official float_arguments on agent/agent ! 1259 2480ec8a11129a6c 74cf60ea56773789  # the pinned side looks right: `1e-05` is the Python text of the float, the generic template prints the number with `| string`
+qwen35/Official float_arguments off agent/agent ! 1259 fc51a3c99b449eca c1911112c77cd4c3  # the pinned side looks right: `1e-05` is the Python text of the float, the generic template prints the number with `| string`
+qwen35/Official reasoning_content_echo default chat/refused x-generic b6271b9adb02fad1  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Official reasoning_content_echo on chat/refused x-generic b6271b9adb02fad1  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Official reasoning_content_echo off chat/refused x-generic b9a012fa52ae037b  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Official think_history default chat/refused x-generic 6dde31fe266c0650  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Official think_history on chat/refused x-generic 6dde31fe266c0650  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Official think_history off chat/refused x-generic b5196bf5bed1a0cb  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Official repeated_think_close default refused/refused x-both
+qwen35/Official repeated_think_close on refused/refused x-both
+qwen35/Official repeated_think_close off refused/refused x-both
+qwen35/Official repeated_think_close_history default chat/refused x-generic 00284b48618883bb  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Official repeated_think_close_history on chat/refused x-generic 00284b48618883bb  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Official repeated_think_close_history off chat/refused x-generic 18e8ca436e65d1cd  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Official tool_response_user_turn default chat/refused x-generic b0b27ad4eefd927c  # undecided: user text holding a reserved string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen35/Official tool_response_user_turn on chat/refused x-generic b0b27ad4eefd927c  # undecided: user text holding a reserved string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen35/Official tool_response_user_turn off chat/refused x-generic a6846d684ac8e6a7  # undecided: user text holding a reserved string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen35/Official empty_user_text default chat/chat =
+qwen35/Official empty_user_text on chat/chat =
+qwen35/Official empty_user_text off chat/chat =
+qwen35/Official empty_assistant_text default chat/chat =
+qwen35/Official empty_assistant_text on chat/chat =
+qwen35/Official empty_assistant_text off chat/chat =
+qwen35/Official padded_assistant_content default chat/chat =
+qwen35/Official padded_assistant_content on chat/chat =
+qwen35/Official padded_assistant_content off chat/chat =
+qwen35/Official padded_system_content default chat/chat =
+qwen35/Official padded_system_content on chat/chat =
+qwen35/Official padded_system_content off chat/chat =
+qwen35/Official empty_system_message default chat/chat =
+qwen35/Official empty_system_message on chat/chat =
+qwen35/Official empty_system_message off chat/chat =
+qwen35/Official tool_history_without_tools default agent/agent =
+qwen35/Official tool_history_without_tools on agent/agent =
+qwen35/Official tool_history_without_tools off agent/agent =
+qwen35/Official tool_without_description default agent/agent ! 132 23dffb040b1b21b5 70ea0c9c75ce4d07  # the pinned side looks right: the client's declaration has no description, the generic engine adds a null one
+qwen35/Official tool_without_description on agent/agent ! 132 23dffb040b1b21b5 70ea0c9c75ce4d07  # the pinned side looks right: the client's declaration has no description, the generic engine adds a null one
+qwen35/Official tool_without_description off agent/agent ! 132 63e065e52cff8a96 b67b5e450ee088b5  # the pinned side looks right: the client's declaration has no description, the generic engine adds a null one
+qwen35/Official tool_strict default agent/agent ! 163 e000a518793bbdba 853da72d27ba93e1  # the pinned side looks right: the client's `strict` flag reaches the model, the generic engine drops it from the tool declaration
+qwen35/Official tool_strict on agent/agent ! 163 e000a518793bbdba 853da72d27ba93e1  # the pinned side looks right: the client's `strict` flag reaches the model, the generic engine drops it from the tool declaration
+qwen35/Official tool_strict off agent/agent ! 163 807e825ad1be7c91 9ed5238f9c29a58c  # the pinned side looks right: the client's `strict` flag reaches the model, the generic engine drops it from the tool declaration
+qwen35/Official tool_parameters_unordered default agent/agent =
+qwen35/Official tool_parameters_unordered on agent/agent =
+qwen35/Official tool_parameters_unordered off agent/agent =
+qwen35/Official smollm3_system_override default chat/chat =
+qwen35/Official smollm3_system_override on chat/chat =
+qwen35/Official smollm3_system_override off chat/chat =
+qwen35/Official smollm3_system_override_history default chat/chat =
+qwen35/Official smollm3_system_override_history on chat/chat =
+qwen35/Official smollm3_system_override_history off chat/chat =
+qwen35/Official assistant_text_before_call default agent/agent =
+qwen35/Official assistant_text_before_call on agent/agent =
+qwen35/Official assistant_text_before_call off agent/agent =
+qwen35/Official two_assistant_calls default agent/agent =
+qwen35/Official two_assistant_calls on agent/agent =
+qwen35/Official two_assistant_calls off agent/agent =
+qwen35/Official parallel_tool_calls default refused/agent x-pinned fe84ee6be48e438a  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+qwen35/Official parallel_tool_calls on refused/agent x-pinned fe84ee6be48e438a  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+qwen35/Official parallel_tool_calls off refused/agent x-pinned c474090a3aa540a4  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+qwen35/Official tool_output_with_think default agent/refused x-generic 923322ae0a2aa0a4  # undecided: the tool output holds a reserved control string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen35/Official tool_output_with_think on agent/refused x-generic 923322ae0a2aa0a4  # undecided: the tool output holds a reserved control string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen35/Official tool_output_with_think off agent/refused x-generic bd5f87072942c302  # undecided: the tool output holds a reserved control string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen35/Official tool_choice_required default refused/refused x-both
+qwen35/Official tool_choice_required on refused/refused x-both
+qwen35/Official tool_choice_required off refused/refused x-both
+qwen35/Official tool_choice_named default refused/refused x-both
+qwen35/Official tool_choice_named on refused/refused x-both
+qwen35/Official tool_choice_named off refused/refused x-both
+qwen35/Official tool_choice_none default chat/chat =
+qwen35/Official tool_choice_none on chat/chat =
+qwen35/Official tool_choice_none off chat/chat =
+qwen35/Official automatic_tool_call default agent/agent =
+qwen35/Official automatic_tool_call on agent/agent =
+qwen35/Official automatic_tool_call off agent/agent =
+qwen35/Official forced_tool_call default refused/refused x-both
+qwen35/Official forced_tool_call on refused/refused x-both
+qwen35/Official forced_tool_call off refused/refused x-both
+qwen35/Official multi_part_content default refused/refused x-both
+qwen35/Official multi_part_content on refused/refused x-both
+qwen35/Official multi_part_content off refused/refused x-both
+qwen35/Official system_only default refused/refused x-both
+qwen35/Official system_only on refused/refused x-both
+qwen35/Official system_only off refused/refused x-both
+qwen35/Official explicit_thinking_off default chat/chat =
+qwen35/Official explicit_thinking_off on chat/chat =
+qwen35/Official explicit_thinking_off off chat/chat =
+qwen35/Official explicit_thinking_on default chat/chat =
+qwen35/Official explicit_thinking_on on chat/chat =
+qwen35/Official explicit_thinking_on off chat/chat =
+qwen35/Unsloth user_only default chat/chat =
+qwen35/Unsloth user_only on chat/chat =
+qwen35/Unsloth user_only off chat/chat =
+qwen35/Unsloth system_and_user default chat/chat =
+qwen35/Unsloth system_and_user on chat/chat =
+qwen35/Unsloth system_and_user off chat/chat =
+qwen35/Unsloth multi_turn default chat/chat =
+qwen35/Unsloth multi_turn on chat/chat =
+qwen35/Unsloth multi_turn off chat/chat =
+qwen35/Unsloth multi_turn_with_system default chat/chat =
+qwen35/Unsloth multi_turn_with_system on chat/chat =
+qwen35/Unsloth multi_turn_with_system off chat/chat =
+qwen35/Unsloth non_ascii default chat/chat =
+qwen35/Unsloth non_ascii on chat/chat =
+qwen35/Unsloth non_ascii off chat/chat =
+qwen35/Unsloth padded_content default chat/chat =
+qwen35/Unsloth padded_content on chat/chat =
+qwen35/Unsloth padded_content off chat/chat =
+qwen35/Unsloth plain default chat/chat =
+qwen35/Unsloth plain on chat/chat =
+qwen35/Unsloth plain off chat/chat =
+qwen35/Unsloth tools_first_turn default agent/agent =
+qwen35/Unsloth tools_first_turn on agent/agent =
+qwen35/Unsloth tools_first_turn off agent/agent =
+qwen35/Unsloth tools_no_system default agent/agent =
+qwen35/Unsloth tools_no_system on agent/agent =
+qwen35/Unsloth tools_no_system off agent/agent =
+qwen35/Unsloth tool_loop default agent/agent =
+qwen35/Unsloth tool_loop on agent/agent =
+qwen35/Unsloth tool_loop off agent/agent =
+qwen35/Unsloth reasoning_and_text_before_call default agent/refused x-generic fed96a049fd4d9d7  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Unsloth reasoning_and_text_before_call on agent/refused x-generic 2d11582b62654f7b  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Unsloth reasoning_and_text_before_call off agent/refused x-generic fed96a049fd4d9d7  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Unsloth typed_arguments_then_new_user default agent/agent =
+qwen35/Unsloth typed_arguments_then_new_user on agent/agent =
+qwen35/Unsloth typed_arguments_then_new_user off agent/agent =
+qwen35/Unsloth compact_arguments default agent/agent =
+qwen35/Unsloth compact_arguments on agent/agent =
+qwen35/Unsloth compact_arguments off agent/agent =
+qwen35/Unsloth float_arguments default agent/agent ! 1259 fc51a3c99b449eca c1911112c77cd4c3  # the pinned side looks right: `1e-05` is the Python text of the float, the generic template prints the number with `| string`
+qwen35/Unsloth float_arguments on agent/agent ! 1259 2480ec8a11129a6c 74cf60ea56773789  # the pinned side looks right: `1e-05` is the Python text of the float, the generic template prints the number with `| string`
+qwen35/Unsloth float_arguments off agent/agent ! 1259 fc51a3c99b449eca c1911112c77cd4c3  # the pinned side looks right: `1e-05` is the Python text of the float, the generic template prints the number with `| string`
+qwen35/Unsloth reasoning_content_echo default chat/refused x-generic b9a012fa52ae037b  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Unsloth reasoning_content_echo on chat/refused x-generic b6271b9adb02fad1  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Unsloth reasoning_content_echo off chat/refused x-generic b9a012fa52ae037b  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Unsloth think_history default chat/refused x-generic b5196bf5bed1a0cb  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Unsloth think_history on chat/refused x-generic 6dde31fe266c0650  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Unsloth think_history off chat/refused x-generic b5196bf5bed1a0cb  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Unsloth repeated_think_close default refused/refused x-both
+qwen35/Unsloth repeated_think_close on refused/refused x-both
+qwen35/Unsloth repeated_think_close off refused/refused x-both
+qwen35/Unsloth repeated_think_close_history default chat/refused x-generic 18e8ca436e65d1cd  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Unsloth repeated_think_close_history on chat/refused x-generic 00284b48618883bb  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Unsloth repeated_think_close_history off chat/refused x-generic 18e8ca436e65d1cd  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/Unsloth tool_response_user_turn default chat/refused x-generic a6846d684ac8e6a7  # undecided: user text holding a reserved string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen35/Unsloth tool_response_user_turn on chat/refused x-generic b0b27ad4eefd927c  # undecided: user text holding a reserved string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen35/Unsloth tool_response_user_turn off chat/refused x-generic a6846d684ac8e6a7  # undecided: user text holding a reserved string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen35/Unsloth empty_user_text default chat/chat =
+qwen35/Unsloth empty_user_text on chat/chat =
+qwen35/Unsloth empty_user_text off chat/chat =
+qwen35/Unsloth empty_assistant_text default chat/chat =
+qwen35/Unsloth empty_assistant_text on chat/chat =
+qwen35/Unsloth empty_assistant_text off chat/chat =
+qwen35/Unsloth padded_assistant_content default chat/chat =
+qwen35/Unsloth padded_assistant_content on chat/chat =
+qwen35/Unsloth padded_assistant_content off chat/chat =
+qwen35/Unsloth padded_system_content default chat/chat =
+qwen35/Unsloth padded_system_content on chat/chat =
+qwen35/Unsloth padded_system_content off chat/chat =
+qwen35/Unsloth empty_system_message default chat/chat =
+qwen35/Unsloth empty_system_message on chat/chat =
+qwen35/Unsloth empty_system_message off chat/chat =
+qwen35/Unsloth tool_history_without_tools default agent/agent =
+qwen35/Unsloth tool_history_without_tools on agent/agent =
+qwen35/Unsloth tool_history_without_tools off agent/agent =
+qwen35/Unsloth tool_without_description default agent/agent ! 132 63e065e52cff8a96 b67b5e450ee088b5  # the pinned side looks right: the client's declaration has no description, the generic engine adds a null one
+qwen35/Unsloth tool_without_description on agent/agent ! 132 23dffb040b1b21b5 70ea0c9c75ce4d07  # the pinned side looks right: the client's declaration has no description, the generic engine adds a null one
+qwen35/Unsloth tool_without_description off agent/agent ! 132 63e065e52cff8a96 b67b5e450ee088b5  # the pinned side looks right: the client's declaration has no description, the generic engine adds a null one
+qwen35/Unsloth tool_strict default agent/agent ! 163 807e825ad1be7c91 9ed5238f9c29a58c  # the pinned side looks right: the client's `strict` flag reaches the model, the generic engine drops it from the tool declaration
+qwen35/Unsloth tool_strict on agent/agent ! 163 e000a518793bbdba 853da72d27ba93e1  # the pinned side looks right: the client's `strict` flag reaches the model, the generic engine drops it from the tool declaration
+qwen35/Unsloth tool_strict off agent/agent ! 163 807e825ad1be7c91 9ed5238f9c29a58c  # the pinned side looks right: the client's `strict` flag reaches the model, the generic engine drops it from the tool declaration
+qwen35/Unsloth tool_parameters_unordered default agent/agent =
+qwen35/Unsloth tool_parameters_unordered on agent/agent =
+qwen35/Unsloth tool_parameters_unordered off agent/agent =
+qwen35/Unsloth smollm3_system_override default chat/chat =
+qwen35/Unsloth smollm3_system_override on chat/chat =
+qwen35/Unsloth smollm3_system_override off chat/chat =
+qwen35/Unsloth smollm3_system_override_history default chat/chat =
+qwen35/Unsloth smollm3_system_override_history on chat/chat =
+qwen35/Unsloth smollm3_system_override_history off chat/chat =
+qwen35/Unsloth assistant_text_before_call default agent/agent =
+qwen35/Unsloth assistant_text_before_call on agent/agent =
+qwen35/Unsloth assistant_text_before_call off agent/agent =
+qwen35/Unsloth two_assistant_calls default agent/agent =
+qwen35/Unsloth two_assistant_calls on agent/agent =
+qwen35/Unsloth two_assistant_calls off agent/agent =
+qwen35/Unsloth parallel_tool_calls default refused/agent x-pinned c474090a3aa540a4  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+qwen35/Unsloth parallel_tool_calls on refused/agent x-pinned fe84ee6be48e438a  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+qwen35/Unsloth parallel_tool_calls off refused/agent x-pinned c474090a3aa540a4  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
+qwen35/Unsloth tool_output_with_think default agent/refused x-generic bd5f87072942c302  # undecided: the tool output holds a reserved control string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen35/Unsloth tool_output_with_think on agent/refused x-generic 923322ae0a2aa0a4  # undecided: the tool output holds a reserved control string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen35/Unsloth tool_output_with_think off agent/refused x-generic bd5f87072942c302  # undecided: the tool output holds a reserved control string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen35/Unsloth tool_choice_required default refused/refused x-both
+qwen35/Unsloth tool_choice_required on refused/refused x-both
+qwen35/Unsloth tool_choice_required off refused/refused x-both
+qwen35/Unsloth tool_choice_named default refused/refused x-both
+qwen35/Unsloth tool_choice_named on refused/refused x-both
+qwen35/Unsloth tool_choice_named off refused/refused x-both
+qwen35/Unsloth tool_choice_none default chat/chat =
+qwen35/Unsloth tool_choice_none on chat/chat =
+qwen35/Unsloth tool_choice_none off chat/chat =
+qwen35/Unsloth automatic_tool_call default agent/agent =
+qwen35/Unsloth automatic_tool_call on agent/agent =
+qwen35/Unsloth automatic_tool_call off agent/agent =
+qwen35/Unsloth forced_tool_call default refused/refused x-both
+qwen35/Unsloth forced_tool_call on refused/refused x-both
+qwen35/Unsloth forced_tool_call off refused/refused x-both
+qwen35/Unsloth multi_part_content default refused/refused x-both
+qwen35/Unsloth multi_part_content on refused/refused x-both
+qwen35/Unsloth multi_part_content off refused/refused x-both
+qwen35/Unsloth system_only default refused/refused x-both
+qwen35/Unsloth system_only on refused/refused x-both
+qwen35/Unsloth system_only off refused/refused x-both
+qwen35/Unsloth explicit_thinking_off default chat/chat =
+qwen35/Unsloth explicit_thinking_off on chat/chat =
+qwen35/Unsloth explicit_thinking_off off chat/chat =
+qwen35/Unsloth explicit_thinking_on default chat/chat =
+qwen35/Unsloth explicit_thinking_on on chat/chat =
+qwen35/Unsloth explicit_thinking_on off chat/chat =
+qwen35/OfficialTextSubset user_only default chat/chat =
+qwen35/OfficialTextSubset system_and_user default chat/chat =
+qwen35/OfficialTextSubset multi_turn default chat/chat =
+qwen35/OfficialTextSubset multi_turn_with_system default chat/chat =
+qwen35/OfficialTextSubset non_ascii default chat/chat =
+qwen35/OfficialTextSubset padded_content default chat/chat =
+qwen35/OfficialTextSubset plain default chat/chat =
+qwen35/OfficialTextSubset tools_first_turn default agent/agent =
+qwen35/OfficialTextSubset tools_no_system default agent/agent =
+qwen35/OfficialTextSubset tool_loop default agent/agent =
+qwen35/OfficialTextSubset reasoning_and_text_before_call default refused/refused x-both
+qwen35/OfficialTextSubset typed_arguments_then_new_user default agent/agent =
+qwen35/OfficialTextSubset compact_arguments default agent/agent =
+qwen35/OfficialTextSubset float_arguments default agent/agent =
+qwen35/OfficialTextSubset reasoning_content_echo default chat/refused x-generic b9a012fa52ae037b  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/OfficialTextSubset think_history default chat/refused x-generic b5196bf5bed1a0cb  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/OfficialTextSubset repeated_think_close default refused/refused x-both
+qwen35/OfficialTextSubset repeated_think_close_history default chat/refused x-generic 18e8ca436e65d1cd  # the pinned side looks right: reasoning a client echoes in assistant history is ordinary input, the generic path refuses it as a reserved string
+qwen35/OfficialTextSubset tool_response_user_turn default chat/refused x-generic a6846d684ac8e6a7  # undecided: user text holding a reserved string; pinned echoes it, generic refuses it as control-token protection; step 2 decides
+qwen35/OfficialTextSubset empty_user_text default chat/chat =
+qwen35/OfficialTextSubset empty_assistant_text default chat/chat =
+qwen35/OfficialTextSubset padded_assistant_content default chat/chat =
+qwen35/OfficialTextSubset padded_system_content default chat/chat =
+qwen35/OfficialTextSubset empty_system_message default chat/chat =
+qwen35/OfficialTextSubset tool_history_without_tools default agent/agent =
+qwen35/OfficialTextSubset tool_without_description default agent/agent =
+qwen35/OfficialTextSubset tool_strict default agent/agent =
+qwen35/OfficialTextSubset tool_parameters_unordered default agent/agent =
+qwen35/OfficialTextSubset smollm3_system_override default chat/chat =
+qwen35/OfficialTextSubset smollm3_system_override_history default chat/chat =
+qwen35/OfficialTextSubset assistant_text_before_call default agent/agent =
+qwen35/OfficialTextSubset two_assistant_calls default agent/agent =
+qwen35/OfficialTextSubset parallel_tool_calls default agent/agent =
+qwen35/OfficialTextSubset tool_output_with_think default refused/refused x-both
+qwen35/OfficialTextSubset tool_choice_required default refused/refused x-both
+qwen35/OfficialTextSubset tool_choice_named default refused/refused x-both
+qwen35/OfficialTextSubset tool_choice_none default chat/chat =
+qwen35/OfficialTextSubset automatic_tool_call default agent/agent =
+qwen35/OfficialTextSubset forced_tool_call default refused/refused x-both
+qwen35/OfficialTextSubset multi_part_content default refused/refused x-both
+qwen35/OfficialTextSubset system_only default refused/refused x-both
+qwen35/OfficialTextSubset explicit_thinking_off default refused/chat x-pinned 13071b0f0e23e976  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+qwen35/OfficialTextSubset explicit_thinking_on default refused/chat x-pinned bcff7d22d26a5158  # undecided: an explicit enable_thinking; the pinned renderer of this family handles it differently from the template; step 2 decides
+smollm3/OfficialSystemOverrideTextSubset user_only default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset system_and_user default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset multi_turn default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset multi_turn_with_system default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset non_ascii default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset padded_content default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset plain default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset tools_first_turn default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset tools_no_system default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset tool_loop default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset reasoning_and_text_before_call default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset typed_arguments_then_new_user default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset compact_arguments default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset float_arguments default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset reasoning_content_echo default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset think_history default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset repeated_think_close default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset repeated_think_close_history default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset tool_response_user_turn default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset empty_user_text default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset empty_assistant_text default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset padded_assistant_content default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset padded_system_content default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset empty_system_message default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset tool_history_without_tools default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset tool_without_description default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset tool_strict default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset tool_parameters_unordered default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset smollm3_system_override default chat/refused x-generic 76adf8353fecb943  # undecided: the shared engine cannot compile the real template because of its transformers-only {% generation %} markers; step 2 decides
+smollm3/OfficialSystemOverrideTextSubset smollm3_system_override_history default chat/refused x-generic 4ef33d433368b94a  # undecided: the shared engine cannot compile the real template because of its transformers-only {% generation %} markers; step 2 decides
+smollm3/OfficialSystemOverrideTextSubset assistant_text_before_call default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset two_assistant_calls default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset parallel_tool_calls default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset tool_output_with_think default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset tool_choice_required default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset tool_choice_named default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset tool_choice_none default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset automatic_tool_call default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset forced_tool_call default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset multi_part_content default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset system_only default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset explicit_thinking_off default refused/refused x-both
+smollm3/OfficialSystemOverrideTextSubset explicit_thinking_on default refused/refused x-both

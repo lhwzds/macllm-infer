@@ -1,0 +1,33 @@
+{
+  "tokens": {
+    "none": [],
+    "gemma": ["<bos>", "<start_of_turn>", "<end_of_turn>"],
+    "granite": ["<|start_of_role|>", "<|end_of_role|>", "<|end_of_text|>", "<|tool_call|>"],
+    "lfm2": ["<|startoftext|>", "<|im_start|>", "<|im_end|>"],
+    "smollm2": ["<|im_start|>", "<|im_end|>"],
+    "llama3_2": ["<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"],
+    "chatml": ["<|im_start|>", "<|im_end|>"],
+    "smollm3": ["<|im_start|>", "<|im_end|>"],
+    "qwen3": ["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|object_ref_start|>", "<|object_ref_end|>", "<|box_start|>", "<|box_end|>", "<|quad_start|>", "<|quad_end|>", "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>", "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>"],
+    "qwen35": ["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|object_ref_start|>", "<|object_ref_end|>", "<|box_start|>", "<|box_end|>", "<|quad_start|>", "<|quad_end|>", "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>", "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>", "<|audio_start|>", "<|audio_end|>", "<tts_pad>", "<tts_text_bos>", "<tts_text_eod>", "<tts_text_bos_single>", "<|audio_pad|>"],
+    "qwen_user": ["<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>", "<think>", "</think>"]
+  },
+  "variants": [
+    { "key": "gemma/Official", "family": "gemma", "source": "templates/pinned/gemma-official.jinja", "bos": "<bos>", "eos": "", "special": "gemma", "user": "none", "thinking": ["default"], "agent": false, "tokens_source": "read from code" },
+    { "key": "gemma/Legacy", "family": "gemma", "source": "templates/pinned/gemma-legacy.jinja", "bos": "<bos>", "eos": "", "special": "gemma", "user": "none", "thinking": ["default"], "agent": false, "tokens_source": "read from code" },
+    { "key": "gemma2/Official", "family": "gemma2", "source": "templates/pinned/gemma2-official.jinja", "bos": "<bos>", "eos": "", "special": "gemma", "user": "none", "thinking": ["default"], "agent": false, "tokens_source": "read from code" },
+    { "key": "gemma3/Official", "family": "gemma3", "source": "templates/pinned/gemma3-official.jinja", "bos": "<bos>", "eos": "", "special": "gemma", "user": "none", "thinking": ["default"], "agent": false, "tokens_source": "read from code" },
+    { "key": "granite_moe/LegacyGranite3_1Instruct", "family": "granitemoe", "source": "templates/pinned/granite_moe-legacy-granite3-1-instruct.jinja", "bos": "", "eos": "", "special": "granite", "user": "none", "thinking": ["default"], "agent": false, "tokens_source": "read from code" },
+    { "key": "granite_moe/CurrentGranite3_1Instruct", "family": "granitemoe", "source": "templates/pinned/granite_moe-current-granite3-1-instruct.jinja", "bos": "", "eos": "", "special": "granite", "user": "none", "thinking": ["default"], "agent": false, "tokens_source": "read from code" },
+    { "key": "lfm2/OfficialGguf", "family": "lfm2", "source": "templates/pinned/lfm2-official-gguf.jinja", "bos": "<|startoftext|>", "eos": "", "special": "lfm2", "user": "none", "thinking": ["default"], "agent": false, "tokens_source": "read from code" },
+    { "key": "llama/SmolLm2ChatMl", "family": "llama", "source": "templates/pinned/llama-smollm2-chatml.jinja", "bos": "", "eos": "<|im_end|>", "special": "smollm2", "user": "none", "thinking": ["default"], "agent": false, "tokens_source": "read from code" },
+    { "key": "llama/Llama3_2Instruct", "family": "llama", "source": "templates/pinned/llama-llama3-2-instruct.jinja", "bos": "<|begin_of_text|>", "eos": "<|eot_id|>", "special": "llama3_2", "user": "none", "thinking": ["default"], "agent": false, "tokens_source": "read from code" },
+    { "key": "qwen2/OfficialQwen2_5", "family": "qwen2", "source": "templates/pinned/qwen2-official-qwen2-5.jinja", "bos": "", "eos": "<|im_end|>", "special": "chatml", "user": "none", "thinking": ["default"], "agent": false, "tokens_source": "read from code" },
+    { "key": "qwen3/Current", "family": "qwen3", "source": "templates/qwen3-current.jinja", "bos": "", "eos": "<|im_end|>", "special": "qwen3", "user": "qwen_user", "thinking": ["default", "on", "off"], "agent": true, "tokens_source": "measured from GGUF" },
+    { "key": "qwen3/Gguf", "family": "qwen3", "source": "templates/qwen3-gguf.jinja", "bos": "", "eos": "<|im_end|>", "special": "qwen3", "user": "qwen_user", "thinking": ["default", "on", "off"], "agent": true, "tokens_source": "measured from GGUF" },
+    { "key": "qwen35/Official", "family": "qwen35", "source": "templates/qwen35-official.jinja", "bos": "", "eos": "<|im_end|>", "special": "qwen35", "user": "qwen_user", "thinking": ["default", "on", "off"], "agent": true, "tokens_source": "measured from GGUF" },
+    { "key": "qwen35/Unsloth", "family": "qwen35", "source": "templates/qwen35-unsloth.jinja", "bos": "", "eos": "<|im_end|>", "special": "qwen35", "user": "qwen_user", "thinking": ["default", "on", "off"], "agent": true, "tokens_source": "measured from GGUF" },
+    { "key": "qwen35/OfficialTextSubset", "family": "qwen35", "source": "templates/pinned/qwen35-official-text-subset.jinja", "bos": "", "eos": "<|im_end|>", "special": "qwen35", "user": "qwen_user", "thinking": ["default"], "agent": false, "tokens_source": "measured from GGUF" },
+    { "key": "smollm3/OfficialSystemOverrideTextSubset", "family": "smollm3", "source": "templates/pinned/smollm3-official-system-override-text-subset.jinja", "bos": "", "eos": "<|im_end|>", "special": "smollm3", "user": "none", "thinking": ["default"], "agent": false, "tokens_source": "read from code" }
+  ]
+}

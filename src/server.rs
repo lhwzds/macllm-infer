@@ -840,45 +840,43 @@ fn engine_failure_response(kind: EngineFailureKind, message: String) -> Response
     api_error(status, engine_failure_error(kind, message))
 }
 
-#[allow(clippy::too_many_lines)]
-async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Response {
-    let mut request = match ChatCompletionRequest::from_json(&body) {
-        Ok(request) => request,
-        Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
-    };
-    let metadata = state.engine.metadata();
-    if metadata.tool_call_format.is_some()
+/// The gates the chat endpoint applies before it routes a request.
+///
+/// The server refuses a request whose forced tool choice its template cannot
+/// serve and a request whose reasoning history its template cannot render.
+/// The parity measurement calls the same gates with the metadata of each arm,
+/// so a measured refusal is the refusal a client would see.
+pub(crate) fn check_chat_completion_gates(
+    request: &mut ChatCompletionRequest,
+    family: &str,
+    tool_call_format: Option<ToolCallFormat>,
+) -> std::result::Result<(), ApiError> {
+    if tool_call_format.is_some()
         && matches!(
             request.tool_choice,
             Some(ToolChoice::Mode(ToolChoiceMode::Required) | ToolChoice::Function { .. })
         )
     {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            ApiError::invalid_request(
-                "forced or required tool choice is unsupported for generic templates; use auto or none",
-                Some("tool_choice".to_owned()),
-                Some("unsupported_value".to_owned()),
-            ),
-        );
+        return Err(ApiError::invalid_request(
+            "forced or required tool choice is unsupported for generic templates; use auto or none",
+            Some("tool_choice".to_owned()),
+            Some("unsupported_value".to_owned()),
+        ));
     }
-    if metadata.family == "qwen35"
-        && metadata.tool_call_format.is_none()
+    if family == "qwen35"
+        && tool_call_format.is_none()
         && matches!(
             request.tool_choice,
             Some(ToolChoice::Mode(ToolChoiceMode::Required) | ToolChoice::Function { .. })
         )
     {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            ApiError::invalid_request(
-                "Qwen3.5 supports tool_choice auto or none only; forced named and required tool choices are not supported".to_owned(),
-                Some("tool_choice".to_owned()),
-                Some("invalid_value".to_owned()),
-            ),
-        );
+        return Err(ApiError::invalid_request(
+            "Qwen3.5 supports tool_choice auto or none only; forced named and required tool choices are not supported".to_owned(),
+            Some("tool_choice".to_owned()),
+            Some("invalid_value".to_owned()),
+        ));
     }
-    if !supports_reasoning_history(&metadata.family)
+    if !supports_reasoning_history(family)
         && let Some(index) = request.messages.iter().position(|message| {
             message
                 .reasoning_content
@@ -886,24 +884,35 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
                 .is_some_and(|reasoning| !reasoning.is_empty())
         })
     {
-        return api_error(
-            StatusCode::BAD_REQUEST,
-            ApiError::invalid_request(
-                format!(
-                    "the `{}` chat template does not render assistant `reasoning_content` history",
-                    metadata.family
-                ),
-                Some(format!("messages.{index}.reasoning_content")),
-                Some("unsupported_value".to_owned()),
+        return Err(ApiError::invalid_request(
+            format!(
+                "the `{family}` chat template does not render assistant `reasoning_content` history",
             ),
-        );
+            Some(format!("messages.{index}.reasoning_content")),
+            Some("unsupported_value".to_owned()),
+        ));
     }
-    if !supports_reasoning_history(&metadata.family) {
+    if !supports_reasoning_history(family) {
         for message in &mut request.messages {
             if message.reasoning_content.as_deref() == Some("") {
                 message.reasoning_content = None;
             }
         }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Response {
+    let mut request = match ChatCompletionRequest::from_json(&body) {
+        Ok(request) => request,
+        Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
+    };
+    let metadata = state.engine.metadata();
+    if let Err(error) =
+        check_chat_completion_gates(&mut request, &metadata.family, metadata.tool_call_format)
+    {
+        return api_error(StatusCode::BAD_REQUEST, error);
     }
     let request = match request.validate_with_generic(
         &metadata.served_model,
@@ -1016,7 +1025,7 @@ fn supports_reasoning_history(family: &str) -> bool {
 /// How the HTTP layer turns generated text into one assistant message.
 /// It is fixed while lowering the request, so the response parser always
 /// matches what the engine was asked to generate.
-enum AssistantOutput {
+pub(crate) enum AssistantOutput {
     /// Generated text is the message content.
     Text,
     /// The prompt opened one named call; generated text is its arguments.
@@ -1042,7 +1051,7 @@ fn to_engine_request(
 }
 
 #[allow(clippy::too_many_lines)]
-fn to_engine_request_with_syntax(
+pub(crate) fn to_engine_request_with_syntax(
     request: ValidatedChatCompletionRequest,
     request_default_seed: u64,
     defaults: SamplingDefaults,

@@ -11,6 +11,8 @@ pub mod qwen35;
 pub mod qwen3_moe;
 pub mod qwen3_tasks;
 pub mod smollm3;
+#[cfg(test)]
+mod template_parity;
 
 use std::{fs, path::Path};
 

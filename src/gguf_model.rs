@@ -21,7 +21,10 @@ use crate::{
 };
 
 /// Tokenizer control tokens and marker-like added tokens printed by the template.
-fn prompt_control_tokens(tokenizer: &Tokenizer, chat_template: Option<&str>) -> Vec<String> {
+pub(crate) fn prompt_control_tokens(
+    tokenizer: &Tokenizer,
+    chat_template: Option<&str>,
+) -> Vec<String> {
     let literal = chat_template.map(template_literal_text);
     tokenizer
         .get_added_tokens_decoder()

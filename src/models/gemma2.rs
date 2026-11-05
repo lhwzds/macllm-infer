@@ -164,6 +164,20 @@ mod tests {
         }
     }
 
+    /// The pinned template source still classifies to its variant.
+    ///
+    /// The fixture file holds the exact source of the pinned variant, and the
+    /// classifier recognises it by string equality.
+    #[test]
+    fn the_pinned_template_source_still_classifies_to_its_variant() {
+        let text = crate::models::template_parity::pinned_text("gemma2-official.jinja");
+        assert_eq!(text, OFFICIAL_CHAT_TEMPLATE);
+        assert_eq!(
+            classify_chat_template(Some(&text)),
+            Some(Gemma2ChatTemplate::Official),
+        );
+    }
+
     #[test]
     fn accepts_only_the_exact_official_template_and_renders_turns() -> Result<()> {
         let adapter = Gemma2Adapter::from_decoder_spec(tiny_spec(), Some(OFFICIAL_CHAT_TEMPLATE))?;

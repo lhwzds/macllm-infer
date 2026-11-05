@@ -366,6 +366,35 @@ mod tests {
         Ok(())
     }
 
+    /// The pinned template source still classifies to its variant.
+    ///
+    /// The Qwen 2 classifier is the comparison of the pinned source itself,
+    /// so the fixture has to be that source, and the adapter built from it
+    /// has to select the pinned renderer.
+    #[test]
+    fn the_pinned_template_source_still_classifies_to_its_variant() -> Result<()> {
+        let text = crate::models::template_parity::pinned_text("qwen2-official-qwen2-5.jinja");
+        assert_eq!(text, QWEN2_5_CHAT_TEMPLATE);
+        let config: Qwen2Config = serde_json::from_str(
+            r#"{
+              "model_type":"qwen2","vocab_size":64,"hidden_size":8,
+              "intermediate_size":16,"num_hidden_layers":1,
+              "num_attention_heads":2,"num_key_value_heads":1,
+              "max_position_embeddings":16,"tie_word_embeddings":true,
+              "rope_theta":10000.0,"rms_norm_eps":0.000001,
+              "hidden_act":"silu","use_sliding_window":false,
+              "eos_token_id":2
+            }"#,
+        )?;
+        let spec = config.to_spec()?;
+        let pinned = Qwen2Adapter::from_decoder_spec(spec.clone(), Some(&text))?;
+        assert!(pinned.has_pinned_chat_template());
+        assert!(pinned.format_chat(None, "Hello").is_ok());
+        let unpinned = Qwen2Adapter::from_decoder_spec(spec, Some("{{ unknown template }}"))?;
+        assert!(!unpinned.has_pinned_chat_template());
+        Ok(())
+    }
+
     #[test]
     fn gguf_adapter_only_formats_the_pinned_official_template() -> Result<()> {
         let config: Qwen2Config = serde_json::from_str(
