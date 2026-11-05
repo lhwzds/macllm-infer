@@ -162,6 +162,28 @@ impl JinjaChatTemplate {
         options: &ChatTemplateOptions,
         add_generation_prompt: bool,
     ) -> Result<String> {
+        self.render_inner(messages, tools, *options, add_generation_prompt, false)
+    }
+
+    /// Render an agent prompt, representing disabled tools as Jinja `none`.
+    pub fn render_agent(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        options: &ChatTemplateOptions,
+        add_generation_prompt: bool,
+    ) -> Result<String> {
+        self.render_inner(messages, tools, *options, add_generation_prompt, true)
+    }
+
+    fn render_inner(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        options: ChatTemplateOptions,
+        add_generation_prompt: bool,
+        none_tools: bool,
+    ) -> Result<String> {
         let mut context = serde_json::Map::new();
         context.insert(
             "messages".to_owned(),
@@ -169,6 +191,8 @@ impl JinjaChatTemplate {
         );
         if let Some(tools) = tools {
             context.insert("tools".to_owned(), serde_json::Value::Array(tools.to_vec()));
+        } else if none_tools {
+            context.insert("tools".to_owned(), serde_json::Value::Null);
         }
         context.insert(
             "add_generation_prompt".to_owned(),

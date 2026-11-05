@@ -230,6 +230,9 @@ pub fn format_qwen35_agent_prompt(
                 }
                 out.push_str("<|im_end|>\n");
             }
+            AgentMessage::AssistantBatch { .. } => {
+                anyhow::bail!("multiple calls are unsupported by this renderer")
+            }
             AgentMessage::Tool { content, .. } => {
                 if index == 0 || !matches!(prompt.messages[index - 1], AgentMessage::Tool { .. }) {
                     out.push_str("<|im_start|>user");

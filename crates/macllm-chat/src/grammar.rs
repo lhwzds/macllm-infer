@@ -574,34 +574,46 @@ impl CompiledToolCalls {
     pub fn parse_call(&self, after_open: &str) -> Result<NativeToolCall> {
         let call = if self.xml {
             let raw = parse_xml_tool_call(after_open)?;
-            let tool = self
-                .tools
-                .iter()
-                .find(|tool| tool.name == raw.name)
-                .with_context(|| format!("tool `{}` is not declared", raw.name))?;
-            let Some(SchemaKind::Object(object)) = &tool.arguments.root.kind else {
-                bail!("XML tool arguments must have type object");
-            };
-            let mut arguments = Map::new();
-            for (name, text) in raw.parameters {
-                let property = object
-                    .properties
-                    .iter()
-                    .find(|property| property.name == name)
-                    .with_context(|| format!("parameter {name:?} is not declared"))?;
-                arguments.insert(name, convert_xml_value(&property.schema, &text)?);
-            }
-            let arguments = Value::Object(arguments);
-            NativeToolCall {
-                name: raw.name,
-                arguments_text: serde_json::to_string(&arguments)?,
-                arguments,
-            }
+            self.convert_xml_call(raw)?
         } else {
             parse_tool_call(after_open)?
         };
         self.validate_call(&call.name, &call.arguments)?;
         Ok(call)
+    }
+
+    /// Convert raw XML parameters using the declared schemas.
+    pub fn convert_xml_call(&self, raw: crate::tool_call::XmlToolCall) -> Result<NativeToolCall> {
+        let tool = self
+            .tools
+            .iter()
+            .find(|tool| tool.name == raw.name)
+            .with_context(|| format!("tool `{}` is not declared", raw.name))?;
+        let Some(SchemaKind::Object(object)) = &tool.arguments.root.kind else {
+            bail!("XML tool arguments must have type object");
+        };
+        let mut arguments = Map::new();
+        for (name, text) in raw.parameters {
+            let property = object
+                .properties
+                .iter()
+                .find(|property| property.name == name)
+                .with_context(|| format!("parameter {name:?} is not declared"))?;
+            arguments.insert(name, convert_xml_value(&property.schema, &text)?);
+        }
+        let arguments = Value::Object(arguments);
+        Ok(NativeToolCall {
+            id: None,
+            name: raw.name,
+            arguments_text: serde_json::to_string(&arguments)?,
+            arguments,
+        })
+    }
+
+    /// Whether a function name is declared.
+    #[must_use]
+    pub fn contains_name(&self, name: &str) -> bool {
+        self.tools.iter().any(|tool| tool.name == name)
     }
 
     /// Check a parsed call against the declared names and their schemas.

@@ -19,3 +19,4 @@ pub mod jinja;
 pub mod openai;
 pub mod output;
 pub mod tool_call;
+pub mod tool_format;

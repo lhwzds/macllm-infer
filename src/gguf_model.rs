@@ -20,6 +20,113 @@ use crate::{
     },
 };
 
+/// Tokenizer control tokens and marker-like added tokens printed by the template.
+fn prompt_control_tokens(tokenizer: &Tokenizer, chat_template: Option<&str>) -> Vec<String> {
+    let literal = chat_template.map(template_literal_text);
+    tokenizer
+        .get_added_tokens_decoder()
+        .into_values()
+        .filter(|token| {
+            let content = &token.content;
+            token.special
+                || (content.len() >= 3
+                    && !content.chars().any(char::is_whitespace)
+                    && content.contains(['<', '>', '[', ']', '|'])
+                    && literal.as_ref().is_some_and(|text| text.contains(content)))
+        })
+        .map(|token| token.content)
+        .collect()
+}
+
+// Remove only closed comments outside tags and raw blocks. Retaining tags
+// deliberately reserves markers appearing in expressions and string literals.
+fn template_literal_text(template: &str) -> String {
+    let bytes = template.as_bytes();
+    let mut result = String::new();
+    let mut index = 0;
+    let mut kept = 0;
+    let mut raw = false;
+    while index + 1 < bytes.len() {
+        if raw {
+            if bytes[index..].starts_with(b"{%") {
+                let mut tag = &template[index + 2..];
+                tag = tag.strip_prefix(['-', '+']).unwrap_or(tag);
+                tag = tag.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                if let Some(tail) = tag.strip_prefix("endraw") {
+                    let tail = tail.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                    let tail = tail.strip_prefix(['-', '+']).unwrap_or(tail);
+                    if let Some(after) = tail.strip_prefix("%}") {
+                        index = template.len() - after.len();
+                        raw = false;
+                        continue;
+                    }
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if bytes[index..].starts_with(b"{#") {
+            if let Some(end) = template[index + 2..].find("#}") {
+                result.push_str(&template[kept..index]);
+                result.push(' ');
+                index += end + 4;
+                kept = index;
+                continue;
+            }
+            break;
+        }
+        let statement = bytes[index..].starts_with(b"{%");
+        if statement || (!raw && bytes[index..].starts_with(b"{{")) {
+            let start = index;
+            let close = if statement { b"%}" } else { b"}}" };
+            index += 2;
+            let mut quote = None;
+            let mut escaped = false;
+            let mut depth = 0_usize;
+            while index + 1 < bytes.len() {
+                let byte = bytes[index];
+                if let Some(delimiter) = quote {
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == delimiter {
+                        quote = None;
+                    }
+                } else if byte == b'\'' || byte == b'"' {
+                    quote = Some(byte);
+                } else if !statement && byte == b'{' {
+                    depth += 1;
+                } else if !statement && byte == b'}' && depth > 0 {
+                    depth -= 1;
+                } else if bytes[index..].starts_with(close) && depth == 0 {
+                    if statement {
+                        let tag = template[start + 2..index]
+                            .trim_matches(|c: char| c.is_ascii_whitespace())
+                            .trim_matches(['-', '+'])
+                            .trim_matches(|c: char| c.is_ascii_whitespace());
+                        if !raw && tag == "raw" {
+                            raw = true;
+                        } else if raw && tag == "endraw" {
+                            raw = false;
+                        }
+                    }
+                    index += 2;
+                    break;
+                }
+                index += 1;
+            }
+            if index + 1 >= bytes.len() {
+                break;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    result.push_str(&template[kept..]);
+    result
+}
+
 const MAX_GGUF_CONTEXT_LENGTH: usize = 1 << 20;
 const MAX_TOKENIZER_BUILD_INPUT_BYTES: u64 = 64 << 20;
 const SUPPORTED_LLAMA_METADATA_KEYS: &[&str] = &[
@@ -322,7 +429,9 @@ impl GgufModel {
         // Prompt tokens ride along so an unpinned template can still render
         // chat through the generic Jinja renderer.
         let mut adapter = self.architecture_adapter()?;
+        let special_tokens = prompt_control_tokens(&self.tokenizer, self.chat_template.as_deref());
         let tokens = GgufPromptTokens {
+            special_tokens: &special_tokens,
             chat_template: self.chat_template.as_deref(),
             bos_token: self.bos_token.as_deref(),
             eos_token: self.eos_token.as_deref(),
@@ -3978,6 +4087,146 @@ mod tests {
     use crate::model_weights::GgufWeightSource;
 
     use super::*;
+
+    #[test]
+    fn prompt_control_tokens_exclude_user_defined_added_tokens() {
+        use tokenizers::{AddedToken, models::bpe::BPE};
+        let mut tokenizer = Tokenizer::new(BPE::default());
+        tokenizer
+            .add_tokens([AddedToken::from("<table>", false)])
+            .unwrap();
+        tokenizer
+            .add_special_tokens([AddedToken::from("[INST]", true)])
+            .unwrap();
+        let tokens = prompt_control_tokens(&tokenizer, None);
+        assert!(tokens.contains(&"[INST]".to_owned()));
+        assert!(!tokens.contains(&"<table>".to_owned()));
+        let prompt = crate::agent::AgentPrompt {
+            messages: vec![crate::agent::AgentMessage::User {
+                content: "<table>".into(),
+            }],
+            tools: vec![],
+            directive: crate::agent::AgentDirective::TextOnly,
+        };
+        assert!(prompt.reject_generic_controls(&[], &tokens).is_ok());
+    }
+
+    #[test]
+    fn template_tokens_only_reserve_literal_markers() {
+        use tokenizers::{AddedToken, models::bpe::BPE};
+        let mut tokenizer = Tokenizer::new(BPE::default());
+        for token in [
+            "\n\n", "  ", "user", "<table>", "<|user|>", "<|end|>", "<|x|>",
+        ] {
+            tokenizer
+                .add_tokens([AddedToken::from(token, false)])
+                .unwrap();
+        }
+        let template = "\n\n  user {{ '<|user|>' }}<|end|>{# <|x|> #}";
+        let tokens = prompt_control_tokens(&tokenizer, Some(template));
+        for content in ["\n\n", "  ", "user", "<table>", "<|x|>"] {
+            let prompt = crate::agent::AgentPrompt {
+                messages: vec![crate::agent::AgentMessage::User {
+                    content: content.into(),
+                }],
+                tools: vec![],
+                directive: crate::agent::AgentDirective::TextOnly,
+            };
+            assert!(
+                prompt.reject_generic_controls(&[], &tokens).is_ok(),
+                "{content:?}"
+            );
+        }
+        assert!(tokens.contains(&"<|user|>".to_owned()));
+        assert!(tokens.contains(&"<|end|>".to_owned()));
+    }
+
+    #[test]
+    fn template_tokens_include_quoted_tags_and_raw_blocks() {
+        use tokenizers::{AddedToken, models::bpe::BPE};
+        let mut tokenizer = Tokenizer::new(BPE::default());
+        for token in [
+            "<|user|>", "<fake>", "<|end|>", "<|a|>", "<|e|>", "<|x|>", "<|y|>",
+        ] {
+            tokenizer
+                .add_tokens([AddedToken::from(token, false)])
+                .unwrap();
+        }
+        for (template, marker) in [
+            ("{{ '{% <|user|> %}' }}", "<|user|>"),
+            ("{% set x = '%} <fake>' %}", "<fake>"),
+            ("{{ '{#' }}<|end|>{{ '#}' }}", "<|end|>"),
+            ("{% raw %}<|a|>{% endraw %}", "<|a|>"),
+            (
+                "{% raw %}{% ' {% endraw %}{{ \" ' %}{% endraw %}{# <|x|> #}\" }}",
+                "<|x|>",
+            ),
+            ("{{ {'k': '<|y|>'} }}{# <|x|> #}<|end|>", "<|y|>"),
+            ("{{ {'a':{'b':1}} ~ '{# <|x|> #}' }}", "<|x|>"),
+            ("{%- raw -%}{# <|x|> #}{%- endraw -%}", "<|x|>"),
+            ("{%+ raw +%}{# <|x|> #}{%+ endraw +%}", "<|x|>"),
+            ("{% set eos = '<|e|>' %}{{ eos }}", "<|e|>"),
+            ("{# <|x|>", "<|x|>"),
+            ("{{ '<|e|>", "<|e|>"),
+        ] {
+            assert!(
+                prompt_control_tokens(&tokenizer, Some(template)).contains(&marker.to_owned()),
+                "{template}"
+            );
+        }
+        assert!(
+            !prompt_control_tokens(&tokenizer, Some("{# <|x|> #}")).contains(&"<|x|>".to_owned())
+        );
+        let tokens =
+            prompt_control_tokens(&tokenizer, Some("{{ {'k': '<|y|>'} }}{# <|x|> #}<|end|>"));
+        assert!(tokens.contains(&"<|end|>".to_owned()));
+        assert!(!tokens.contains(&"<|x|>".to_owned()));
+    }
+
+    #[test]
+    fn prompt_control_tokens_reserve_template_role_markers_of_any_type() {
+        use tokenizers::{AddedToken, models::bpe::BPE};
+        let mut tokenizer = Tokenizer::new(BPE::default());
+        tokenizer
+            .add_tokens([AddedToken::from("<table>", false)])
+            .unwrap();
+        // An older Phi-3-style checkpoint keeps its role markers as
+        // user-defined tokens.
+        tokenizer
+            .add_tokens([AddedToken::from("<|user|>", false)])
+            .unwrap();
+        tokenizer
+            .add_tokens([AddedToken::from("<|end|>", false)])
+            .unwrap();
+        let template =
+            "{% for message in messages %}<|user|>{{ message.content }}<|end|>{% endfor %}";
+        let tokens = prompt_control_tokens(&tokenizer, Some(template));
+        assert!(tokens.contains(&"<|user|>".to_owned()));
+        assert!(tokens.contains(&"<|end|>".to_owned()));
+        // A user-defined token the template never prints stays ordinary text.
+        assert!(!tokens.contains(&"<table>".to_owned()));
+        for content in ["<|user|>", "<|end|>"] {
+            let prompt = crate::agent::AgentPrompt {
+                messages: vec![crate::agent::AgentMessage::User {
+                    content: content.into(),
+                }],
+                tools: vec![],
+                directive: crate::agent::AgentDirective::TextOnly,
+            };
+            assert!(
+                prompt.reject_generic_controls(&[], &tokens).is_err(),
+                "{content}"
+            );
+        }
+        let prompt = crate::agent::AgentPrompt {
+            messages: vec![crate::agent::AgentMessage::User {
+                content: "<table>".into(),
+            }],
+            tools: vec![],
+            directive: crate::agent::AgentDirective::TextOnly,
+        };
+        assert!(prompt.reject_generic_controls(&[], &tokens).is_ok());
+    }
 
     #[test]
     fn invalid_chat_templates_preserve_raw_inference() -> Result<()> {

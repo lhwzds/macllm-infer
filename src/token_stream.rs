@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::Result;
 use tokenizers::{
     DecodeStream, DecoderWrapper, ModelWrapper, NormalizerWrapper, PostProcessorWrapper,
@@ -20,6 +22,7 @@ pub struct TokenStream<'a> {
     token_ids: Vec<u32>,
     emitted: String,
     finished: bool,
+    suppressed_special_ids: Option<HashSet<u32>>,
 }
 
 impl<'a> TokenStream<'a> {
@@ -31,7 +34,26 @@ impl<'a> TokenStream<'a> {
             token_ids: Vec::new(),
             emitted: String::new(),
             finished: false,
+            suppressed_special_ids: None,
         }
+    }
+
+    /// Preserve selected marker token IDs while continuing to suppress other special tokens.
+    #[must_use]
+    pub fn with_markers(mut self, markers: &[&str]) -> Self {
+        // Feed retained markers through the same contextual decoder as text.
+        // Resetting at a marker would strip SentencePiece's next leading space.
+        self.inner = self.tokenizer.decode_stream(false);
+        self.suppressed_special_ids = Some(
+            self.tokenizer
+                .get_added_tokens_decoder()
+                .into_iter()
+                .filter_map(|(id, token)| {
+                    (token.special && !markers.contains(&token.content.as_str())).then_some(id)
+                })
+                .collect(),
+        );
+        self
     }
 
     pub fn push(&mut self, token: u32) -> Result<Option<String>> {
@@ -39,6 +61,14 @@ impl<'a> TokenStream<'a> {
             !self.finished,
             "cannot push a token after the token stream has finished"
         );
+
+        if self
+            .suppressed_special_ids
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&token))
+        {
+            return Ok(None);
+        }
 
         let chunk = self
             .inner
@@ -67,7 +97,7 @@ impl<'a> TokenStream<'a> {
 
         let decoded = self
             .tokenizer
-            .decode(&self.token_ids, true)
+            .decode(&self.token_ids, self.suppressed_special_ids.is_none())
             .map_err(|error| {
                 anyhow::anyhow!("tokenizer failed while finalizing output: {error}")
             })?;
@@ -89,9 +119,164 @@ impl<'a> TokenStream<'a> {
 
 #[cfg(test)]
 mod tests {
-    use tokenizers::{Tokenizer, decoders::byte_fallback::ByteFallback, models::bpe::BPE};
+    use tokenizers::{
+        AddedToken, Tokenizer, decoders::byte_fallback::ByteFallback, models::bpe::BPE,
+    };
 
     use super::TokenStream;
+
+    #[test]
+    fn preserving_markers_keeps_sentencepiece_decoder_context() -> anyhow::Result<()> {
+        use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
+
+        let model = BPE::builder()
+            .vocab_and_merges(
+                [("▁before".to_owned(), 0), ("▁after".to_owned(), 1)],
+                Vec::new(),
+            )
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_decoder(Some(Metaspace::new('▁', PrependScheme::Always, true)));
+        tokenizer
+            .add_special_tokens([AddedToken::from("<tool_call>", true)])
+            .unwrap();
+        let marker = tokenizer.token_to_id("<tool_call>").unwrap();
+        let mut stream = TokenStream::new(&tokenizer).with_markers(&["<tool_call>"]);
+        let mut text = String::new();
+        for id in [0, marker, 1] {
+            text.push_str(&stream.push(id)?.unwrap_or_default());
+        }
+        text.push_str(&stream.finish()?.unwrap_or_default());
+        assert_eq!(text, "before<tool_call> after");
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_only_selected_special_markers_for_parser() -> anyhow::Result<()> {
+        use ToolCallFormat::{GraniteJson, Hermes, Llama3Json, MistralJson, Pythonic, QwenXml};
+        use macllm_chat::tool_format::{ToolCallFormat, ToolCallParser};
+
+        let formats = [
+            Hermes,
+            QwenXml,
+            Llama3Json,
+            MistralJson,
+            GraniteJson,
+            Pythonic,
+        ];
+        let vocab: tokenizers::models::bpe::Vocab = (0..=255)
+            .map(|byte| (format!("<0x{byte:02X}>"), byte))
+            .collect();
+        let model = BPE::builder()
+            .vocab_and_merges(vocab, Vec::new())
+            .byte_fallback(true)
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_decoder(Some(ByteFallback::default()));
+        for format in formats {
+            tokenizer
+                .add_special_tokens(format.markers().iter().map(|m| AddedToken::from(*m, true)))
+                .unwrap();
+        }
+        tokenizer
+            .add_special_tokens([AddedToken::from("<|unrelated|>", true)])
+            .unwrap();
+
+        for (format, fragments) in [
+            (
+                Hermes,
+                vec![
+                    "<tool_call>",
+                    r#"{"name":"f","arguments":{"x":"é"}}"#,
+                    "</tool_call>",
+                ],
+            ),
+            (
+                QwenXml,
+                vec![
+                    "<tool_call>",
+                    "<function=",
+                    "f>",
+                    "<parameter=",
+                    "x>é",
+                    "</parameter>",
+                    "</function>",
+                    "</tool_call>",
+                ],
+            ),
+            (
+                Llama3Json,
+                vec!["<|python_tag|>", r#"{"name":"f","parameters":{"x":"é"}}"#],
+            ),
+            (
+                MistralJson,
+                vec!["[TOOL_CALLS]", "f", "[ARGS]", r#"{"x":"é"}"#],
+            ),
+            (
+                GraniteJson,
+                vec!["<|tool_call|>", r#"[{"name":"f","arguments":{"x":"é"}}]"#],
+            ),
+            (
+                Pythonic,
+                vec!["<|tool_call_start|>", "[f(x='é')]", "<|tool_call_end|>"],
+            ),
+        ] {
+            let mut ids = Vec::new();
+            // Other formats' special markers must stay suppressed too.
+            for other in formats {
+                for marker in other.markers() {
+                    if !format.markers().contains(marker) {
+                        ids.push(tokenizer.token_to_id(marker).unwrap());
+                    }
+                }
+            }
+            ids.push(tokenizer.token_to_id("<|unrelated|>").unwrap());
+            let mut ordinary = String::new();
+            for fragment in fragments {
+                if format.markers().contains(&fragment) {
+                    ids.push(tokenizer.token_to_id(fragment).unwrap());
+                } else {
+                    ordinary.push_str(fragment);
+                    ids.extend(fragment.bytes().map(u32::from));
+                }
+            }
+            ids.push(tokenizer.token_to_id("<|unrelated|>").unwrap());
+            assert_eq!(tokenizer.decode(&ids, true).unwrap(), ordinary);
+
+            let mut stream = TokenStream::new(&tokenizer).with_markers(format.markers());
+            let mut pinned_stream = TokenStream::new(&tokenizer);
+            let mut parser = ToolCallParser::new(format);
+            let mut calls = Vec::new();
+            let mut content = String::new();
+            let mut pinned_text = String::new();
+            for id in ids {
+                if let Some(chunk) = stream.push(id)? {
+                    let parsed = parser.push(&chunk);
+                    content.push_str(&parsed.content);
+                    calls.extend(parsed.calls);
+                }
+                if let Some(chunk) = pinned_stream.push(id)? {
+                    pinned_text.push_str(&chunk);
+                }
+            }
+            if let Some(chunk) = stream.finish()? {
+                let parsed = parser.push(&chunk);
+                content.push_str(&parsed.content);
+                calls.extend(parsed.calls);
+            }
+            let end = parser.finish()?;
+            content.push_str(&end.content);
+            calls.extend(end.calls);
+            assert!(content.is_empty(), "{format:?}: {content}");
+            assert_eq!(calls.len(), 1, "{format:?}");
+            assert_eq!(calls[0].arguments["x"], "é", "{format:?}");
+            pinned_text.push_str(&pinned_stream.finish()?.unwrap_or_default());
+            assert_eq!(pinned_text, ordinary, "{format:?}");
+        }
+        Ok(())
+    }
 
     fn byte_fallback_tokenizer() -> tokenizers::Tokenizer {
         let vocab = [

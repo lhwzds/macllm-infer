@@ -132,7 +132,12 @@ mod tests {
                 chat_template: Some(source),
                 bos_token: Some("<bos>"),
                 eos_token: Some("<eos>"),
+                ..Default::default()
             },
+        );
+        assert_eq!(
+            adapter.format_serving_chat_probe()?,
+            "<bos>health check<eos>"
         );
         assert_eq!(
             adapter.format_chat_messages(&[ChatMessage::user("hello")])?,
@@ -161,6 +166,69 @@ mod tests {
                 .format_agent_prompt_with(&prompt, crate::chat::ChatTemplateOptions::default())
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn detected_tool_template_routes_both_agent_methods_through_jinja() -> Result<()> {
+        use crate::agent::{AgentDirective, AgentMessage, AgentPrompt, ToolDefinition};
+        use crate::chat::ChatTemplateOptions;
+        let source = "{# <tool_call> \"name\": \"arguments\": #}{{ tools | tojson }} {{ enable_thinking | default('unset') }}";
+        let adapter = GemmaAdapter::from_decoder_spec(tiny_spec(), Some(source))?;
+        let adapter = crate::models::with_jinja_fallback(
+            Box::new(adapter),
+            crate::models::GgufPromptTokens {
+                chat_template: Some(source),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            adapter.tool_call_format(),
+            Some(macllm_chat::tool_format::ToolCallFormat::Hermes)
+        );
+        assert!(adapter.agent_template_profile().is_none());
+        let mut prompt = AgentPrompt {
+            messages: vec![AgentMessage::User {
+                content: "go".into(),
+            }],
+            tools: vec![ToolDefinition {
+                name: "weather".into(),
+                description: Some("forecast".into()),
+                parameters: serde_json::json!({"type":"object"}),
+                strict: false,
+                declaration: None,
+            }],
+            directive: AgentDirective::Auto,
+        };
+        let rendered = adapter.format_agent_prompt(&prompt)?;
+        assert!(rendered.contains("\"type\": \"function\""));
+        assert!(rendered.contains("\"name\": \"weather\""));
+        assert!(rendered.ends_with("unset"));
+        let rendered = adapter.format_agent_prompt_with(
+            &prompt,
+            ChatTemplateOptions {
+                enable_thinking: Some(false),
+            },
+        )?;
+        assert!(rendered.ends_with("False"));
+        prompt.directive = AgentDirective::TextOnly;
+        prompt.tools.clear();
+        assert_eq!(adapter.format_agent_prompt(&prompt)?, "null unset");
+        prompt.directive = AgentDirective::ForcedSingle {
+            name: "weather".into(),
+        };
+        for error in [
+            adapter.format_agent_prompt(&prompt).unwrap_err(),
+            adapter
+                .format_agent_prompt_with(&prompt, ChatTemplateOptions::default())
+                .unwrap_err(),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("forced or required tool choice is unsupported")
+            );
+        }
         Ok(())
     }
 
@@ -194,6 +262,7 @@ mod tests {
                 chat_template: Some(OFFICIAL_CHAT_TEMPLATE),
                 bos_token: Some("different BOS"),
                 eos_token: Some("different EOS"),
+                ..Default::default()
             },
         );
         assert_eq!(adapter.format_chat_messages(&messages)?, expected);

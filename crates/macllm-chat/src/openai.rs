@@ -80,9 +80,9 @@ pub struct ChatCompletionRequest {
     pub n: Option<usize>,
 
     // Agent request fields are parsed and validated into an explicit contract.
-    // JSON-schema response formats, forced single calls and automatic tool
-    // choice (at most one call per turn) are connected to constrained
-    // generation.
+    // JSON-schema response formats, forced single calls and pinned-template
+    // automatic choice use constrained generation. Generic detected formats
+    // parse automatic calls and enforce `parallel_tool_calls` after generation.
     #[serde(default)]
     pub tools: Option<Vec<FunctionTool>>,
     #[serde(default)]
@@ -128,6 +128,16 @@ impl ChatCompletionRequest {
         self,
         served_model: &str,
         default_max_completion_tokens: usize,
+    ) -> Result<ValidatedChatCompletionRequest, ApiError> {
+        self.validate_with_generic(served_model, default_max_completion_tokens, false)
+    }
+
+    /// Validate with support for multi-call history in generic templates.
+    pub fn validate_with_generic(
+        self,
+        served_model: &str,
+        default_max_completion_tokens: usize,
+        generic: bool,
     ) -> Result<ValidatedChatCompletionRequest, ApiError> {
         if self.model.trim().is_empty() {
             return Err(invalid_value("model", "model must not be empty"));
@@ -218,7 +228,7 @@ impl ChatCompletionRequest {
         };
 
         let chat_template = normalize_chat_template_kwargs(self.chat_template_kwargs)?;
-        let messages = validate_messages(self.messages)?;
+        let messages = validate_messages(self.messages, generic)?;
         let response_format = self
             .response_format
             .map(validate_response_format)
@@ -717,10 +727,11 @@ fn normalize_tool_choice(
 }
 
 /// `parallel_tool_calls` grants permission for several calls in one turn; it
-/// never obliges more than one. The native runtime emits at most one call:
-/// automatic choice therefore accepts either value (`true` is the `OpenAI`
-/// default), while forced and `required` calls keep their explicit
-/// single-call contract and require `false`.
+/// never obliges more than one. Automatic choice accepts either value (`true`
+/// is the `OpenAI` default): pinned constrained paths emit at most one call,
+/// while generic detected formats enforce this permission on parsed calls.
+/// Forced and `required` calls keep their explicit single-call contract and
+/// require `false`.
 fn normalize_parallel_tool_calls(
     requested: Option<bool>,
     tools: &[FunctionTool],
@@ -763,8 +774,8 @@ fn validate_tool_runtime_subset(
         ));
     }
     match choice {
-        // The model chooses text or one native call; the runtime stops after
-        // the first call whatever `parallel_tool_calls` permits.
+        // Pinned constrained paths stop after one call. Generic detected
+        // formats may return several calls when `parallel_tool_calls` permits.
         ToolChoice::Mode(ToolChoiceMode::Auto) => return Ok(()),
         ToolChoice::Mode(ToolChoiceMode::Required) if tools.len() != 1 => {
             return Err(unsupported_value(
@@ -923,7 +934,10 @@ fn normalize_stop_sequences(stop: Option<StopSequences>) -> Result<Vec<String>, 
     Ok(stops)
 }
 
-fn validate_messages(messages: Vec<RequestMessage>) -> Result<ValidatedMessages, ApiError> {
+fn validate_messages(
+    messages: Vec<RequestMessage>,
+    generic: bool,
+) -> Result<ValidatedMessages, ApiError> {
     if messages.is_empty() {
         return Err(invalid_value(
             "messages",
@@ -939,7 +953,7 @@ fn validate_messages(messages: Vec<RequestMessage>) -> Result<ValidatedMessages,
                 .is_some_and(|calls| !calls.is_empty())
     });
     if tool_aware {
-        validate_tool_aware_messages(messages)
+        validate_tool_aware_messages(messages, generic)
     } else {
         validate_text_messages(messages)
     }
@@ -1033,6 +1047,7 @@ enum ToolConversationState {
 #[allow(clippy::too_many_lines)]
 fn validate_tool_aware_messages(
     messages: Vec<RequestMessage>,
+    generic: bool,
 ) -> Result<ValidatedMessages, ApiError> {
     let mut validated = Vec::with_capacity(messages.len());
     let mut state = ToolConversationState::NeedUser;
@@ -1110,7 +1125,7 @@ fn validate_tool_aware_messages(
                     state = ToolConversationState::NeedUser;
                     continue;
                 }
-                if tool_calls.len() != 1 {
+                if !generic && tool_calls.len() != 1 {
                     return Err(unsupported_value(
                         format!("messages.{index}.tool_calls"),
                         "the native tool history subset supports exactly one call per assistant turn",
@@ -1824,6 +1839,13 @@ mod tests {
     fn parse_and_validate(value: Value) -> Result<ValidatedChatCompletionRequest, ApiError> {
         ChatCompletionRequest::from_json(&serde_json::to_vec(&value).unwrap())?
             .validate(MODEL, DEFAULT_MAX_COMPLETION_TOKENS)
+    }
+
+    fn parse_and_validate_generic(
+        value: Value,
+    ) -> Result<ValidatedChatCompletionRequest, ApiError> {
+        ChatCompletionRequest::from_json(&serde_json::to_vec(&value).unwrap())?
+            .validate_with_generic(MODEL, DEFAULT_MAX_COMPLETION_TOKENS, true)
     }
 
     fn strict_schema() -> Value {
@@ -2616,6 +2638,94 @@ mod tests {
     }
 
     #[test]
+    fn validates_multiple_historical_calls_and_out_of_order_tool_responses() {
+        let calls = json!([
+            {
+                "id": "call_tokyo", "type": "function",
+                "function": {"name": "weather", "arguments": "{\"city\":\"東京\"}"}
+            },
+            {
+                "id": "call_la", "type": "function",
+                "function": {"name": "weather", "arguments": "{ \"city\" : \"LA\" }"}
+            }
+        ]);
+        let request = parse_and_validate_generic(json!({
+            "model": MODEL,
+            "messages": [
+                {"role": "user", "content": "Weather in both cities?"},
+                {"role": "assistant", "content": "Checking both.", "tool_calls": calls},
+                {"role": "tool", "content": "warm", "tool_call_id": "call_la"},
+                {"role": "tool", "content": "rain", "tool_call_id": "call_tokyo"}
+            ]
+        }))
+        .unwrap();
+        let messages = request.messages.as_tool_aware().unwrap();
+        let AgentMessage::Assistant {
+            content,
+            tool_calls,
+        } = &messages[1]
+        else {
+            panic!("expected assistant tool calls");
+        };
+        assert_eq!(content.as_deref(), Some("Checking both."));
+        assert_eq!(serde_json::to_value(tool_calls).unwrap(), calls);
+        assert_eq!(
+            messages[2],
+            AgentMessage::Tool {
+                content: "warm".into(),
+                tool_call_id: "call_la".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn pinned_history_rejects_multiple_calls_with_original_error() {
+        for arguments in ["{}", "not json"] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": MODEL,
+                "messages": [
+                    {"role":"user", "content":"go"},
+                    {"role":"assistant", "tool_calls":[
+                        {"id":"a", "type":"function", "function":{"name":"f", "arguments":arguments}},
+                        {"id":"b", "type":"function", "function":{"name":"f", "arguments":"{}"}}
+                    ]}
+                ]
+            }))
+            .unwrap();
+            let error = request
+                .validate(MODEL, DEFAULT_MAX_COMPLETION_TOKENS)
+                .unwrap_err();
+            assert_eq!(error.status, ApiErrorStatus::BadRequest);
+            assert_eq!(
+                serde_json::to_string(&error.into_response()).unwrap(),
+                r#"{"error":{"message":"the native tool history subset supports exactly one call per assistant turn","type":"invalid_request_error","param":"messages.1.tool_calls","code":"unsupported_value"}}"#,
+                "arguments={arguments}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_or_unknown_responses_in_a_historical_batch() {
+        for second_id in ["call_a", "unknown"] {
+            let error = parse_and_validate_generic(json!({
+                "model": MODEL,
+                "messages": [
+                    {"role": "user", "content": "Weather?"},
+                    {"role": "assistant", "tool_calls": [
+                        {"id":"call_a", "type":"function", "function":{"name":"weather", "arguments":"{}"}},
+                        {"id":"call_b", "type":"function", "function":{"name":"weather", "arguments":"{}"}}
+                    ]},
+                    {"role": "tool", "content": "result", "tool_call_id": "call_a"},
+                    {"role": "tool", "content": "result", "tool_call_id": second_id}
+                ]
+            }))
+            .unwrap_err();
+            assert_eq!(error.param.as_deref(), Some("messages.3.tool_call_id"));
+            assert_eq!(error.code.as_deref(), Some("invalid_value"));
+        }
+    }
+
+    #[test]
     fn rejects_orphaned_mismatched_or_incomplete_tool_histories() {
         let cases = [
             (
@@ -2687,14 +2797,14 @@ mod tests {
                         ]
                     }
                 ]),
-                "messages.1.tool_calls",
-                "unsupported_value",
+                "messages",
+                "invalid_value",
             ),
         ];
 
         for (messages, param, code) in cases {
-            let error =
-                parse_and_validate(json!({"model": MODEL, "messages": messages})).unwrap_err();
+            let error = parse_and_validate_generic(json!({"model": MODEL, "messages": messages}))
+                .unwrap_err();
             assert_eq!(error.param.as_deref(), Some(param));
             assert_eq!(error.code.as_deref(), Some(code));
         }

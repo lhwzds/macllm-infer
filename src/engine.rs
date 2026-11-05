@@ -49,6 +49,9 @@ pub struct EngineMetadata {
     /// Whether the model's chat template leaves the reasoning block open for
     /// the model to continue when thinking is enabled.
     pub opens_thinking_block: bool,
+    /// Detected syntax for a non-pinned template. Pinned profiles retain
+    /// their existing constrained native-call response path.
+    pub tool_call_format: Option<macllm_chat::tool_format::ToolCallFormat>,
 }
 
 /// Worker-owned automatic-prefix-cache diagnostics mirrored for read-only callers.
@@ -1277,6 +1280,7 @@ fn worker_main(
             .chat_template_defaults
             .or(runtime.adapter.chat_template_defaults()),
         opens_thinking_block: opens_thinking_block(runtime.adapter.as_ref()),
+        tool_call_format: runtime.adapter.tool_call_format(),
     };
     let rendered = match runtime.adapter.format_serving_chat_probe() {
         Ok(rendered) => rendered,
@@ -1756,12 +1760,27 @@ impl<'a> ServingScheduler<'a> {
         }
         let prefix_lookup_attach_time = sequence.prefix_lookup_attach_time();
         let batch_trace = job.batch_trace.as_ref().map(|member| member.handle.clone());
+        let markers = match &job.request.input {
+            EngineInput::Agent {
+                prompt,
+                constraint: None,
+            } if matches!(prompt.directive, macllm_chat::agent::AgentDirective::Auto) => {
+                self.runtime.adapter.tool_call_format()
+            }
+            _ => None,
+        };
+        let stream = match markers {
+            Some(format) => {
+                TokenStream::new(&self.runtime.tokenizer).with_markers(format.markers())
+            }
+            None => TokenStream::new(&self.runtime.tokenizer),
+        };
         self.active.push_back(ActiveSequence {
             job,
             sequence: Some(sequence),
             reclaimed_session: None,
             prompt_tokens: prompt_token_count,
-            stream: TokenStream::new(&self.runtime.tokenizer),
+            stream,
             stop_filter,
             phase: ActivePhase::Generating,
             pending: VecDeque::with_capacity(3),
@@ -3012,7 +3031,7 @@ mod tests {
     use candle_core::{Device, Tensor};
     use serde_json::json;
     use tokenizers::{
-        Tokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
+        AddedToken, Tokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
     };
 
     use crate::{
@@ -3144,6 +3163,10 @@ mod tests {
                 .map(|message| message.content.as_str())
                 .collect::<Vec<_>>()
                 .join(" "))
+        }
+
+        fn format_agent_prompt(&self, _prompt: &AgentPrompt) -> Result<String> {
+            Ok("a".to_owned())
         }
     }
 
@@ -3586,6 +3609,113 @@ mod tests {
             dtype: DTypeKind::F32,
         };
         Ok((runtime, state))
+    }
+
+    #[test]
+    fn generic_agent_decodes_only_its_format_special_markers() -> Result<()> {
+        use crate::agent::{AgentDirective, AgentMessage, ToolDefinition};
+        use crate::models::{GgufPromptTokens, with_jinja_fallback};
+
+        let (mut runtime, _) = fake_runtime()?;
+        let mut vocab = runtime.tokenizer.get_vocab(false);
+        vocab.remove("x");
+        vocab.remove("y");
+        vocab.insert("<|tool_call|>".to_owned(), 3);
+        vocab.insert("<|unrelated|>".to_owned(), 4);
+        let model = WordLevel::builder()
+            .vocab(vocab.into_iter().collect())
+            .unk_token("[UNK]".to_owned())
+            .build()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        tokenizer
+            .add_special_tokens([
+                AddedToken::from("<|tool_call|>", true),
+                AddedToken::from("<|unrelated|>", true),
+            ])
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        runtime.tokenizer = Arc::new(tokenizer);
+        runtime.adapter = with_jinja_fallback(
+            runtime.adapter,
+            GgufPromptTokens {
+                chat_template: Some("{# <|tool_call|> #}{{ messages[0].content }}"),
+                ..GgufPromptTokens::default()
+            },
+        );
+
+        let (jobs, receiver) = mpsc::channel(4);
+        let status = Arc::new(AtomicU8::new(EngineStatus::Ready as u8));
+        let mut generic_scheduler = scheduler(&runtime, receiver, status, scheduler_config())?;
+        let mut tickets = Vec::new();
+        for (directive, prompt, expected) in [
+            (Some(AgentDirective::Auto), "a", "<|tool_call|>"),
+            (Some(AgentDirective::Auto), "b", ""),
+            (Some(AgentDirective::TextOnly), "a", ""),
+            (None, "a", ""),
+        ] {
+            let (mut job, ticket) = job(prompt, 1, 8, Duration::from_secs(1));
+            if let Some(directive) = directive {
+                job.request.input = EngineInput::Agent {
+                    prompt: AgentPrompt {
+                        messages: vec![AgentMessage::User {
+                            content: prompt.to_owned(),
+                        }],
+                        tools: vec![ToolDefinition {
+                            name: "f".to_owned(),
+                            description: None,
+                            parameters: json!({"type": "object"}),
+                            strict: false,
+                            declaration: None,
+                        }],
+                        directive,
+                    },
+                    constraint: None,
+                };
+            }
+            jobs.try_send(job).expect("test request fits");
+            tickets.push((ticket, expected));
+        }
+        drop(jobs);
+        generic_scheduler.run();
+
+        for (mut ticket, expected) in tickets {
+            assert!(preflight_is_ready(&mut ticket));
+            assert_eq!(collect_success(&mut ticket).0, expected);
+        }
+        drop(generic_scheduler);
+
+        // An adapter without a generic format keeps the original decoding
+        // even when the engine input requests automatic tools.
+        runtime.adapter = Box::new(FakeAdapter {
+            spec: runtime.adapter.runtime_spec().clone(),
+        });
+        let (jobs, receiver) = mpsc::channel(1);
+        let status = Arc::new(AtomicU8::new(EngineStatus::Ready as u8));
+        let mut scheduler = scheduler(&runtime, receiver, status, scheduler_config())?;
+        let (mut native, mut ticket) = job("a", 1, 8, Duration::from_secs(1));
+        native.request.input = EngineInput::Agent {
+            prompt: AgentPrompt {
+                messages: vec![AgentMessage::User {
+                    content: "a".to_owned(),
+                }],
+                tools: vec![ToolDefinition {
+                    name: "f".to_owned(),
+                    description: None,
+                    parameters: json!({"type": "object"}),
+                    strict: false,
+                    declaration: None,
+                }],
+                directive: AgentDirective::Auto,
+            },
+            constraint: None,
+        };
+        jobs.try_send(native).expect("native request fits");
+        drop(jobs);
+        scheduler.run();
+        assert!(preflight_is_ready(&mut ticket));
+        assert_eq!(collect_success(&mut ticket).0, "");
+        Ok(())
     }
 
     #[test]
@@ -4229,6 +4359,7 @@ mod tests {
                 dtype: "f32".to_owned(),
                 chat_template_defaults: ChatTemplateOptions::default(),
                 opens_thinking_block: false,
+                tool_call_format: None,
             },
             prefix_cache_snapshot: Arc::new(Mutex::new(EnginePrefixCacheSnapshot::default())),
             event_capacity: 1,
@@ -4271,6 +4402,7 @@ mod tests {
                 dtype: "f32".to_owned(),
                 chat_template_defaults: ChatTemplateOptions::default(),
                 opens_thinking_block: false,
+                tool_call_format: None,
             },
             prefix_cache_snapshot: Arc::new(Mutex::new(EnginePrefixCacheSnapshot::default())),
             event_capacity: 8,
@@ -4357,6 +4489,7 @@ mod tests {
                 dtype: "f32".to_owned(),
                 chat_template_defaults: ChatTemplateOptions::default(),
                 opens_thinking_block: false,
+                tool_call_format: None,
             },
             prefix_cache_snapshot: Arc::new(Mutex::new(EnginePrefixCacheSnapshot::default())),
             event_capacity: 8,
@@ -4435,6 +4568,7 @@ mod tests {
                 dtype: "f32".to_owned(),
                 chat_template_defaults: ChatTemplateOptions::default(),
                 opens_thinking_block: false,
+                tool_call_format: None,
             },
             prefix_cache_snapshot: Arc::new(Mutex::new(EnginePrefixCacheSnapshot::default())),
             event_capacity: 1,

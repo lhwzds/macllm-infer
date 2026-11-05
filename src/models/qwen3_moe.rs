@@ -7,7 +7,7 @@ use crate::{
     decoder::DecoderModel,
     model_weights::WeightSource,
     models::{
-        GgufPromptTokens, JinjaChatFallback, ModelAdapter, jinja_chat_fallback,
+        GenericPaths, GgufPromptTokens, JinjaChatFallback, ModelAdapter, jinja_fallback,
         qwen3::{
             Qwen3ChatTemplate, classify_chat_template, format_qwen3_agent_prompt,
             format_qwen3_chat_messages,
@@ -74,7 +74,15 @@ impl ModelAdapter for Qwen3MoeAdapter {
     }
 
     fn attach_prompt_tokens(&mut self, tokens: GgufPromptTokens<'_>) -> Result<()> {
-        self.jinja = jinja_chat_fallback(self.family(), self.chat_template.is_some(), tokens);
+        let pinned = self.chat_template.is_some();
+        self.jinja = jinja_fallback(
+            self.family(),
+            GenericPaths {
+                chat: !pinned,
+                agent: !pinned,
+            },
+            tokens,
+        );
         Ok(())
     }
 
@@ -100,6 +108,12 @@ impl ModelAdapter for Qwen3MoeAdapter {
         }
     }
 
+    fn tool_call_format(&self) -> Option<macllm_chat::tool_format::ToolCallFormat> {
+        self.jinja
+            .as_ref()
+            .and_then(JinjaChatFallback::tool_call_format)
+    }
+
     fn agent_template_profile(&self) -> Option<AgentTemplateProfile> {
         match self.chat_template {
             Some(Qwen3ChatTemplate::Current) => Some(AgentTemplateProfile::Qwen3Current),
@@ -117,6 +131,11 @@ impl ModelAdapter for Qwen3MoeAdapter {
         prompt: &AgentPrompt,
         options: ChatTemplateOptions,
     ) -> Result<String> {
+        if self.agent_template_profile().is_none()
+            && let Some(jinja) = &self.jinja
+        {
+            return jinja.format_agent_prompt(prompt, options);
+        }
         let Some(profile) = self.agent_template_profile() else {
             bail!("unsupported or missing Qwen3MoE native agent template profile");
         };

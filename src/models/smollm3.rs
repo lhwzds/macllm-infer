@@ -332,6 +332,25 @@ mod tests {
     }
 
     #[test]
+    fn pinned_probe_survives_fallback_selection() -> Result<()> {
+        let adapter = SmolLm3Adapter {
+            spec: tiny_spec(),
+            chat_template: Some(SmolLm3ChatTemplate::OfficialSystemOverrideTextSubset),
+        };
+        let expected = adapter.format_serving_chat_probe()?;
+        let adapter = crate::models::with_jinja_fallback(
+            Box::new(adapter),
+            crate::models::GgufPromptTokens {
+                chat_template: Some("foreign"),
+                ..Default::default()
+            },
+        );
+        assert!(adapter.has_pinned_chat_template());
+        assert_eq!(adapter.format_serving_chat_probe()?, expected);
+        Ok(())
+    }
+
+    #[test]
     fn dynamic_date_and_unknown_template_paths_require_raw_prompt() -> Result<()> {
         for messages in [
             vec![ChatMessage::user("Hello")],

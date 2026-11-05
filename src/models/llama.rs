@@ -578,6 +578,43 @@ mod tests {
     }
 
     #[test]
+    fn unpinned_wrapped_format_chat_uses_jinja() -> Result<()> {
+        let config: LlamaConfig = serde_json::from_str(SMOL_CONFIG)?;
+        let source = "{% for message in messages %}{{ message.role }}:{{ message.content }};{% endfor %}assistant:";
+        let inner = LlamaAdapter::from_decoder_spec(config.to_spec()?, Some(source))?;
+        let adapter = crate::models::with_jinja_fallback(
+            Box::new(inner),
+            crate::models::GgufPromptTokens {
+                chat_template: Some(source),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            adapter.format_chat(Some("rules"), "hello")?,
+            "system:rules;user:hello;assistant:"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_probe_survives_fallback_selection() -> Result<()> {
+        let config: LlamaConfig = serde_json::from_str(SMOL_CONFIG)?;
+        let adapter =
+            LlamaAdapter::from_decoder_spec(config.to_spec()?, Some(SMOLLM2_CHAT_TEMPLATE))?;
+        let expected = adapter.format_serving_chat_probe()?;
+        let adapter = crate::models::with_jinja_fallback(
+            Box::new(adapter),
+            crate::models::GgufPromptTokens {
+                chat_template: Some("foreign"),
+                ..Default::default()
+            },
+        );
+        assert!(adapter.has_pinned_chat_template());
+        assert_eq!(adapter.format_serving_chat_probe()?, expected);
+        Ok(())
+    }
+
+    #[test]
     fn accepts_format_neutral_gguf_geometry_and_known_template() -> Result<()> {
         let config: LlamaConfig = serde_json::from_str(SMOL_CONFIG)?;
         let adapter =

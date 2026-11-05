@@ -18,7 +18,10 @@ use anyhow::{Context, Result, bail, ensure};
 use candle_nn::VarBuilder;
 use serde::Deserialize;
 
-use macllm_chat::jinja::JinjaChatTemplate;
+use macllm_chat::{
+    jinja::JinjaChatTemplate,
+    tool_format::{self, ToolCallFormat},
+};
 
 use crate::model_weights::{DenseWeightSource, WeightSource};
 use crate::{
@@ -65,14 +68,20 @@ pub trait ModelAdapter {
         ChatTemplateOptions::default()
     }
 
+    /// Return a detected generic tool syntax for a non-pinned agent template.
+    fn tool_call_format(&self) -> Option<ToolCallFormat> {
+        None
+    }
+
     /// Return the exact native agent-template profile verified for this
-    /// checkpoint, or `None` when tool-aware prompt rendering is unavailable.
+    /// checkpoint, or `None` when the pinned tool path is unavailable.
     fn agent_template_profile(&self) -> Option<AgentTemplateProfile> {
         None
     }
 
     /// Render a validated protocol-independent agent prompt.  Adapters must
-    /// opt in with a pinned profile; the default fails closed.
+    /// opt in with a pinned profile or a detected Jinja format; the default
+    /// fails closed.
     fn format_agent_prompt(&self, _prompt: &AgentPrompt) -> Result<String> {
         bail!("native agent prompt rendering is unavailable for this model adapter")
     }
@@ -155,6 +164,7 @@ pub struct GgufPromptTokens<'a> {
     pub chat_template: Option<&'a str>,
     pub bos_token: Option<&'a str>,
     pub eos_token: Option<&'a str>,
+    pub special_tokens: &'a [String],
 }
 
 /// A checkpoint's embedded template, compiled for the generic renderer.
@@ -167,19 +177,119 @@ pub struct GgufPromptTokens<'a> {
 pub(crate) struct JinjaChatFallback {
     family: &'static str,
     template: std::result::Result<JinjaChatTemplate, String>,
+    format: Option<ToolCallFormat>,
+    special_tokens: Vec<String>,
 }
 
 impl JinjaChatFallback {
+    pub(crate) fn tool_call_format(&self) -> Option<ToolCallFormat> {
+        self.format
+    }
+    pub(crate) fn format_agent_prompt(
+        &self,
+        prompt: &AgentPrompt,
+        options: ChatTemplateOptions,
+    ) -> Result<String> {
+        use crate::agent::{AgentDirective, AgentMessage};
+        use crate::chat::{ChatToolArguments, ChatToolCall, ChatToolFunction};
+        ensure!(
+            self.format.is_some(),
+            "unsupported tool-call format in chat template"
+        );
+        ensure!(
+            !matches!(prompt.directive, AgentDirective::ForcedSingle { .. }),
+            "forced or required tool choice is unsupported for generic templates"
+        );
+        prompt.validate_generic()?;
+        let markers = self.format.unwrap().markers();
+        prompt.reject_generic_controls(markers, &self.special_tokens)?;
+        let messages: Vec<_> = prompt
+            .messages
+            .iter()
+            .map(|message| match message {
+                AgentMessage::System { content } => ChatMessage::system(content),
+                AgentMessage::User { content } => ChatMessage::user(content),
+                AgentMessage::Assistant { content, tool_call } => {
+                    let mut message =
+                        ChatMessage::assistant(content.as_deref().unwrap_or_default());
+                    if let Some(call) = tool_call {
+                        message.tool_calls = Some(vec![ChatToolCall {
+                            id: call.id.clone(),
+                            kind: "function".to_owned(),
+                            function: ChatToolFunction {
+                                name: call.name.clone(),
+                                arguments: ChatToolArguments::from_json_text(&call.arguments),
+                            },
+                        }]);
+                    }
+                    message
+                }
+                AgentMessage::AssistantBatch {
+                    content,
+                    tool_calls,
+                } => {
+                    let mut message =
+                        ChatMessage::assistant(content.as_deref().unwrap_or_default());
+                    message.tool_calls = Some(
+                        tool_calls
+                            .iter()
+                            .map(|call| ChatToolCall {
+                                id: call.id.clone(),
+                                kind: "function".to_owned(),
+                                function: ChatToolFunction {
+                                    name: call.name.clone(),
+                                    arguments: ChatToolArguments::from_json_text(&call.arguments),
+                                },
+                            })
+                            .collect(),
+                    );
+                    message
+                }
+                AgentMessage::Tool {
+                    content,
+                    tool_call_id,
+                } => ChatMessage::tool(content, tool_call_id),
+            })
+            .collect();
+        let tools: Vec<_> = prompt
+            .tools
+            .iter()
+            .filter(|_| matches!(prompt.directive, AgentDirective::Auto))
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    },
+                })
+            })
+            .collect();
+        self.template
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .render_agent(
+                &messages,
+                matches!(prompt.directive, AgentDirective::Auto).then_some(&tools),
+                &options,
+                true,
+            )
+    }
+
     /// Render a validated chat history through the embedded template.
     ///
-    /// Tool-aware prompts stay on the pinned native profiles; the generic
-    /// renderer only serves ordinary text conversations.
+    /// Ordinary chat omits `tools`; agent prompts pass declarations through
+    /// `format_agent_prompt` instead.
     pub(crate) fn format_chat_messages(
         &self,
         messages: &[ChatMessage],
         options: ChatTemplateOptions,
     ) -> Result<String> {
         validate_chat_messages(messages)?;
+        for message in messages {
+            reject_generic_content(&message.content, self.format, &self.special_tokens)?;
+        }
         self.template
             .as_ref()
             .map_err(|error| anyhow::anyhow!("{error}"))?
@@ -193,6 +303,23 @@ impl JinjaChatFallback {
     }
 }
 
+fn reject_generic_content(
+    content: &str,
+    format: Option<ToolCallFormat>,
+    tokens: &[String],
+) -> Result<()> {
+    for control in format
+        .into_iter()
+        .flat_map(|format| format.markers().iter().copied())
+        .chain(tokens.iter().map(String::as_str))
+    {
+        if !control.is_empty() && content.contains(control) {
+            anyhow::bail!("content contains reserved native control string `{control}`");
+        }
+    }
+    Ok(())
+}
+
 /// Resolve the chat prompt path of a checkpoint and compile the generic
 /// renderer when the template is not one of the byte-pinned programs.
 ///
@@ -202,27 +329,53 @@ impl JinjaChatFallback {
 /// disables chat rendering for a checkpoint that embeds a template. A failed
 /// compilation is cached just like a successful one and reported at render
 /// time; it must never prevent raw-prompt inference.
-pub(crate) fn jinja_chat_fallback(
+pub(crate) fn jinja_fallback(
     family: &'static str,
-    pinned: bool,
+    paths: GenericPaths,
     tokens: GgufPromptTokens<'_>,
 ) -> Option<JinjaChatFallback> {
-    if pinned {
-        log_chat_template_path(family, "pinned");
-        return None;
-    }
-    let Some(source) = tokens.chat_template else {
+    debug_assert!(!paths.chat || paths.agent);
+    let source = tokens.chat_template;
+    if paths.chat && source.is_none() {
         log_chat_template_path(family, "none (structured chat needs a raw prompt)");
         return None;
-    };
+    }
+    if paths.chat {
+        log_chat_template_path(family, "jinja");
+    } else {
+        log_chat_template_path(family, "pinned");
+    }
+    if !paths.agent {
+        return None;
+    }
+    let source = source?;
     let template = JinjaChatTemplate::new(
         source,
         tokens.bos_token.unwrap_or_default(),
         tokens.eos_token.unwrap_or_default(),
     )
     .map_err(|error| format!("the {family} chat template is not a valid Jinja program: {error:#}"));
-    log_chat_template_path(family, "jinja");
-    Some(JinjaChatFallback { family, template })
+    let format = tool_format::detect(source);
+    eprintln!("tool call format: family={family} format={format:?}");
+    Some(JinjaChatFallback {
+        family,
+        template,
+        format,
+        special_tokens: tokens.special_tokens.to_vec(),
+    })
+}
+
+/// The prompt paths the generic renderer serves for a checkpoint.
+///
+/// The chat path and the agent path are decided separately: a checkpoint can
+/// render chat through a byte-pinned template and still need the generic
+/// renderer for its tool calls. The combination `chat: true, agent: false` is invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GenericPaths {
+    /// The generic renderer renders ordinary chat.
+    pub chat: bool,
+    /// The generic renderer renders agent prompts and their tool calls.
+    pub agent: bool,
 }
 
 /// One line per loaded model, so an operator can see which prompt path a
@@ -236,8 +389,14 @@ pub(crate) fn with_jinja_fallback(
     adapter: Box<dyn ModelAdapter>,
     tokens: GgufPromptTokens<'_>,
 ) -> Box<dyn ModelAdapter> {
-    let fallback =
-        jinja_chat_fallback(adapter.family(), adapter.has_pinned_chat_template(), tokens);
+    let pinned_chat = adapter.has_pinned_chat_template();
+    // The shared fallback renders both paths, so it exists only when the
+    // chat template is generic.
+    let paths = GenericPaths {
+        chat: !pinned_chat,
+        agent: !pinned_chat,
+    };
+    let fallback = jinja_fallback(adapter.family(), paths, tokens);
     if let Some(fallback) = fallback {
         Box::new(FallbackAdapter { adapter, fallback })
     } else {
@@ -277,18 +436,34 @@ impl ModelAdapter for FallbackAdapter {
     fn chat_template_defaults(&self) -> ChatTemplateOptions {
         self.adapter.chat_template_defaults()
     }
+    fn attach_prompt_tokens(&mut self, tokens: GgufPromptTokens<'_>) -> Result<()> {
+        self.adapter.attach_prompt_tokens(tokens)
+    }
+    fn validate(&self) -> Result<()> {
+        self.adapter.validate()
+    }
+    fn build_dense(&self, weights: VarBuilder<'_>) -> candle_core::Result<Box<dyn CausalLm>> {
+        self.adapter.build_dense(weights)
+    }
+    fn build(&self, weights: &dyn WeightSource) -> candle_core::Result<Box<dyn CausalLm>> {
+        self.adapter.build(weights)
+    }
+    fn tool_call_format(&self) -> Option<ToolCallFormat> {
+        self.fallback.tool_call_format()
+    }
     fn agent_template_profile(&self) -> Option<AgentTemplateProfile> {
         self.adapter.agent_template_profile()
     }
     fn format_agent_prompt(&self, prompt: &AgentPrompt) -> Result<String> {
-        self.adapter.format_agent_prompt(prompt)
+        self.fallback
+            .format_agent_prompt(prompt, self.chat_template_defaults())
     }
     fn format_agent_prompt_with(
         &self,
         prompt: &AgentPrompt,
         options: ChatTemplateOptions,
     ) -> Result<String> {
-        self.adapter.format_agent_prompt_with(prompt, options)
+        self.fallback.format_agent_prompt(prompt, options)
     }
 }
 
@@ -522,5 +697,268 @@ mod tests {
         assert!(resolve_default_rope_theta("test", None, Some(&partial)).is_err());
         assert!(resolve_default_rope_theta("test", Some(1.0), Some(&current)).is_err());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod generic_agent_tests {
+    use super::*;
+    use crate::agent::{AgentDirective, AgentMessage, ToolDefinition};
+
+    #[test]
+    fn generic_rejects_markers_and_tokenizer_tokens_and_omits_tools() {
+        for (source, marker) in [
+            ("<tool_call> \"name\": \"arguments\":", "<tool_call>"),
+            ("<tool_call> <function=", "<function="),
+            ("<|python_tag|>", "<|python_tag|>"),
+            ("[TOOL_CALLS]", "[CALL_ID]"),
+            ("<|tool_call|>", "<|tool_call|>"),
+            ("<|tool_call_start|>", "<|tool_call_end|>"),
+        ] {
+            let template = format!(
+                "{{# {source} #}}{{% if tools is not none %}}present{{% else %}}absent{{% endif %}}"
+            );
+            let special = vec!["<|eot_id|>".to_owned()];
+            let fallback = jinja_fallback(
+                "test",
+                GenericPaths {
+                    chat: true,
+                    agent: true,
+                },
+                GgufPromptTokens {
+                    chat_template: Some(&template),
+                    special_tokens: &special,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut prompt = AgentPrompt {
+                messages: vec![AgentMessage::User {
+                    content: "hello".into(),
+                }],
+                tools: vec![],
+                directive: AgentDirective::TextOnly,
+            };
+            assert_eq!(
+                fallback
+                    .format_agent_prompt(&prompt, ChatTemplateOptions::default())
+                    .unwrap(),
+                "absent"
+            );
+            for invalid in [marker, "<|eot_id|>"] {
+                prompt.messages = vec![AgentMessage::User {
+                    content: invalid.into(),
+                }];
+                assert!(
+                    fallback
+                        .format_agent_prompt(&prompt, ChatTemplateOptions::default())
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn renders_tools_and_rejects_forced_choice() {
+        let source = "<tool_call>{# \"name\": \"arguments\": #}{{ tools | tojson }}{% for message in messages %}{{ message.role }}:{{ message.content }}{% endfor %}";
+        let fallback = jinja_fallback(
+            "test",
+            GenericPaths {
+                chat: true,
+                agent: true,
+            },
+            GgufPromptTokens {
+                chat_template: Some(source),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut prompt = AgentPrompt {
+            messages: vec![AgentMessage::User {
+                content: "hello".into(),
+            }],
+            tools: vec![ToolDefinition {
+                name: "weather".into(),
+                description: Some("forecast".into()),
+                parameters: serde_json::json!({"type":"object"}),
+                strict: false,
+                declaration: None,
+            }],
+            directive: AgentDirective::Auto,
+        };
+        let rendered = fallback
+            .format_agent_prompt(&prompt, ChatTemplateOptions::default())
+            .unwrap();
+        assert!(
+            rendered.contains("weather")
+                && rendered.contains("forecast")
+                && rendered.contains("hello")
+        );
+        // `none` keeps historical calls but does not advertise callable
+        // functions for the next turn, even if the caller retains tools.
+        prompt.directive = AgentDirective::TextOnly;
+        assert_eq!(
+            fallback
+                .format_agent_prompt(&prompt, ChatTemplateOptions::default())
+                .unwrap(),
+            "<tool_call>nulluser:hello"
+        );
+        prompt.directive = AgentDirective::ForcedSingle {
+            name: "weather".into(),
+        };
+        assert!(
+            fallback
+                .format_agent_prompt(&prompt, ChatTemplateOptions::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn generic_history_is_passed_in_hugging_face_message_form() {
+        let source = "{# <tool_call> \"name\": \"arguments\": #}{{ {'tools': tools, 'messages': messages, 'generation': add_generation_prompt, 'thinking': enable_thinking} | tojson }}";
+        let fallback = jinja_fallback(
+            "test",
+            GenericPaths {
+                chat: true,
+                agent: true,
+            },
+            GgufPromptTokens {
+                chat_template: Some(source),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let prompt = AgentPrompt {
+            messages: vec![
+                AgentMessage::User {
+                    content: "weather?".into(),
+                },
+                AgentMessage::Assistant {
+                    content: Some("Checking.".into()),
+                    tool_call: Some(crate::agent::ToolCall {
+                        id: "call_1".into(),
+                        name: "weather".into(),
+                        arguments: r#"{"city":"東京"}"#.into(),
+                    }),
+                },
+                AgentMessage::Tool {
+                    content: "sunny".into(),
+                    tool_call_id: "call_1".into(),
+                },
+            ],
+            tools: vec![ToolDefinition {
+                name: "weather".into(),
+                description: Some("forecast".into()),
+                parameters: serde_json::json!({"type":"object", "properties":{"city":{"type":"string"}}}),
+                strict: false,
+                declaration: None,
+            }],
+            directive: AgentDirective::Auto,
+        };
+        let rendered = fallback
+            .format_agent_prompt(
+                &prompt,
+                ChatTemplateOptions {
+                    enable_thinking: Some(false),
+                },
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "tools": [{"type":"function", "function": {
+                    "name":"weather", "description":"forecast", "parameters":prompt.tools[0].parameters,
+                }}],
+                "messages": [
+                    {"role":"user", "content":"weather?"},
+                    {"role":"assistant", "content":"Checking.", "tool_calls":[{
+                        "id":"call_1", "type":"function", "function":{"name":"weather", "arguments":{"city":"東京"}},
+                    }]},
+                    {"role":"tool", "content":"sunny", "tool_call_id":"call_1"},
+                ],
+                "generation":true, "thinking":false,
+            })
+        );
+    }
+
+    #[test]
+    fn generic_batch_history_renders_one_assistant_message() {
+        let source = "{# [TOOL_CALLS] #}{{ messages | tojson }}";
+        let fallback = jinja_fallback(
+            "test",
+            GenericPaths {
+                chat: true,
+                agent: true,
+            },
+            GgufPromptTokens {
+                chat_template: Some(source),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let calls = ["a", "b"]
+            .into_iter()
+            .map(|id| crate::agent::ToolCall {
+                id: id.into(),
+                name: "weather".into(),
+                arguments: r#"{"city":"東京"}"#.into(),
+            })
+            .collect();
+        let prompt = AgentPrompt {
+            messages: vec![
+                AgentMessage::User {
+                    content: "weather?".into(),
+                },
+                AgentMessage::AssistantBatch {
+                    content: Some("Checking both.".into()),
+                    tool_calls: calls,
+                },
+                AgentMessage::Tool {
+                    content: "b".into(),
+                    tool_call_id: "b".into(),
+                },
+                AgentMessage::Tool {
+                    content: "a".into(),
+                    tool_call_id: "a".into(),
+                },
+            ],
+            tools: vec![],
+            directive: AgentDirective::TextOnly,
+        };
+        let rendered = fallback
+            .format_agent_prompt(&prompt, ChatTemplateOptions::default())
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {"role":"user", "content":"weather?"},
+                {"role":"assistant", "content":"Checking both.", "tool_calls":[
+                    {"id":"a", "type":"function", "function":{"name":"weather", "arguments":{"city":"東京"}}},
+                    {"id":"b", "type":"function", "function":{"name":"weather", "arguments":{"city":"東京"}}},
+                ]},
+                {"role":"tool", "content":"b", "tool_call_id":"b"},
+                {"role":"tool", "content":"a", "tool_call_id":"a"},
+            ])
+        );
+    }
+
+    #[test]
+    fn detects_all_qwen_template_fixtures() {
+        for (name, expected) in [
+            ("qwen3-current", ToolCallFormat::Hermes),
+            ("qwen3-gguf", ToolCallFormat::Hermes),
+            ("qwen35-official", ToolCallFormat::QwenXml),
+            ("qwen35-unsloth", ToolCallFormat::QwenXml),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/chat_templates/templates")
+                .join(format!("{name}.jinja"));
+            assert_eq!(
+                tool_format::detect(&std::fs::read_to_string(path).unwrap()),
+                Some(expected)
+            );
+        }
     }
 }

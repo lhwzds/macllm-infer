@@ -12,7 +12,7 @@ use crate::{
     decoder::DecoderModel,
     model_weights::WeightSource,
     models::{
-        GgufPromptTokens, JinjaChatFallback, ModelAdapter, jinja_chat_fallback,
+        GenericPaths, GgufPromptTokens, JinjaChatFallback, ModelAdapter, jinja_fallback,
         load_stop_token_ids, resolve_default_rope_theta,
     },
 };
@@ -228,7 +228,15 @@ impl ModelAdapter for Qwen3Adapter {
     }
 
     fn attach_prompt_tokens(&mut self, tokens: GgufPromptTokens<'_>) -> Result<()> {
-        self.jinja = jinja_chat_fallback(self.family(), self.chat_template.is_some(), tokens);
+        let pinned = self.chat_template.is_some();
+        self.jinja = jinja_fallback(
+            self.family(),
+            GenericPaths {
+                chat: !pinned,
+                agent: !pinned,
+            },
+            tokens,
+        );
         Ok(())
     }
 
@@ -254,6 +262,12 @@ impl ModelAdapter for Qwen3Adapter {
         }
     }
 
+    fn tool_call_format(&self) -> Option<macllm_chat::tool_format::ToolCallFormat> {
+        self.jinja
+            .as_ref()
+            .and_then(JinjaChatFallback::tool_call_format)
+    }
+
     fn agent_template_profile(&self) -> Option<AgentTemplateProfile> {
         match self.chat_template {
             Some(Qwen3ChatTemplate::Current) => Some(AgentTemplateProfile::Qwen3Current),
@@ -271,6 +285,11 @@ impl ModelAdapter for Qwen3Adapter {
         prompt: &AgentPrompt,
         options: ChatTemplateOptions,
     ) -> Result<String> {
+        if self.agent_template_profile().is_none()
+            && let Some(jinja) = &self.jinja
+        {
+            return jinja.format_agent_prompt(prompt, options);
+        }
         let profile = self
             .agent_template_profile()
             .context("unsupported or missing Qwen3 native agent template profile")?;
@@ -757,8 +776,8 @@ mod tests {
     }
 
     /// A checkpoint whose template is not one of the pinned programs still
-    /// chats through the generic Jinja renderer, while its agent prompts stay
-    /// fail-closed because no native profile has been verified for it.
+    /// chats through the generic Jinja renderer. Agent prompts stay closed
+    /// when its text does not identify a supported tool-call syntax.
     #[test]
     fn an_unrecognised_template_chats_through_the_generic_jinja_renderer() -> Result<()> {
         // A deliberately foreign template, so the render cannot be confused
@@ -785,6 +804,7 @@ mod tests {
             chat_template: Some(FOREIGN_TEMPLATE),
             bos_token: Some("<bos>"),
             eos_token: Some("<eos>"),
+            ..Default::default()
         })?;
         assert!(adapter.jinja.is_some());
         assert_eq!(
@@ -812,6 +832,60 @@ mod tests {
         };
         assert!(adapter.agent_template_profile().is_none());
         assert!(adapter.format_agent_prompt(&prompt).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn detected_unpinned_template_renders_agent_tools_through_jinja() -> Result<()> {
+        const SOURCE: &str = concat!(
+            "{# <tool_call> \"name\": \"arguments\": #}{{ bos_token }}{{ tools | tojson }}",
+            "{% for message in messages %}{{ message.role }}:{{ message.content }}{% endfor %}",
+            "{{ enable_thinking | default('unset') }}{{ eos_token }}",
+        );
+        let mut adapter =
+            Qwen3Adapter::from_decoder_spec(official_config().to_spec()?, Some(SOURCE))?;
+        adapter.attach_prompt_tokens(GgufPromptTokens {
+            chat_template: Some(SOURCE),
+            bos_token: Some("<bos>"),
+            eos_token: Some("<eos>"),
+            ..Default::default()
+        })?;
+        assert!(adapter.agent_template_profile().is_none());
+        assert_eq!(
+            adapter.tool_call_format(),
+            Some(macllm_chat::tool_format::ToolCallFormat::Hermes)
+        );
+        let mut prompt = AgentPrompt {
+            messages: vec![AgentMessage::User {
+                content: "Find AAPL.".to_owned(),
+            }],
+            tools: vec![lookup_tool()],
+            directive: AgentDirective::Auto,
+        };
+        let rendered = adapter.format_agent_prompt(&prompt)?;
+        assert!(rendered.starts_with("<bos>[{\"type\": \"function\""));
+        assert!(rendered.contains("\"name\": \"lookup\""));
+        assert!(rendered.ends_with("user:Find AAPL.unset<eos>"));
+        assert!(
+            adapter
+                .format_agent_prompt_with(
+                    &prompt,
+                    ChatTemplateOptions {
+                        enable_thinking: Some(false),
+                    },
+                )?
+                .ends_with("False<eos>")
+        );
+        prompt.directive = AgentDirective::ForcedSingle {
+            name: "lookup".to_owned(),
+        };
+        assert!(
+            adapter
+                .format_agent_prompt(&prompt)
+                .unwrap_err()
+                .to_string()
+                .contains("forced or required tool choice is unsupported")
+        );
         Ok(())
     }
 }

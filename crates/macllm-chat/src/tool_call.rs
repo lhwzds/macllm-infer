@@ -143,6 +143,7 @@ fn scan_call_from(text: &str, armed_from: usize) -> ToolCallScan {
 /// declared tools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeToolCall {
+    pub id: Option<String>,
     pub name: String,
     pub arguments: Value,
     pub arguments_text: String,
@@ -156,6 +157,7 @@ pub fn parse_tool_call(after_open: &str) -> Result<NativeToolCall> {
     let body = after_open
         .strip_suffix(TOOL_CALL_CLOSE)
         .context("tool call is not terminated by its closing tag")?;
+    // The pinned path keeps Unicode trimming on purpose.
     let value: Value =
         serde_json::from_str(body.trim()).context("tool call body is not one JSON object")?;
     let object = value
@@ -176,6 +178,7 @@ pub fn parse_tool_call(after_open: &str) -> Result<NativeToolCall> {
     let raw: std::collections::HashMap<String, Box<serde_json::value::RawValue>> =
         serde_json::from_str(body.trim())?;
     Ok(NativeToolCall {
+        id: None,
         name: name.to_owned(),
         arguments: arguments.clone(),
         arguments_text: raw["arguments"].get().to_owned(),
@@ -693,6 +696,7 @@ mod tests {
         assert_eq!(
             parse_tool_call(after_open).unwrap(),
             NativeToolCall {
+                id: None,
                 arguments_text: r#"{"command": "ls"}"#.to_owned(),
                 name: "shell".to_owned(),
                 arguments: json!({"command": "ls"})

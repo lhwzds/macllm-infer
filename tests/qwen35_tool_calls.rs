@@ -8,7 +8,7 @@ use macllm_infer::{
         ToolCallGrammar,
     },
     sampling::{LogitsConstraint, Sampler, SamplingConfig},
-    tool_call::parse_xml_tool_call,
+    tool_call::{XmlToolCall, parse_xml_tool_call},
 };
 use serde_json::{Value, json};
 use tokenizers::{Tokenizer, decoders::byte_fallback::ByteFallback, models::bpe::BPE};
@@ -86,7 +86,15 @@ fn xml_value_grammar_and_conversion_table() -> Result<()> {
         let calls = compile_calls(
             &json!({"type":"object", "properties":{"value":schema}, "required":["value"]}),
         )?;
-        let text = envelope(&parameter("value", text));
+        let raw_value = text;
+        let text = envelope(&parameter("value", raw_value));
+        assert_eq!(
+            parse_xml_tool_call(&text)?,
+            XmlToolCall {
+                name: "run".to_owned(),
+                parameters: vec![("value".to_owned(), raw_value.to_owned())],
+            }
+        );
         let mut grammar = ToolCallGrammar::new(calls.clone());
         for c in text.chars() {
             grammar.commit_token_text(&c.to_string())?;
@@ -121,6 +129,16 @@ fn xml_required_optional_and_emitted_key_order() -> Result<()> {
     grammar.commit_token_text(&parameter("a", "first\nsecond"))?;
     grammar.commit_token_text("</function>\n</tool_call>")?;
     assert_eq!(
+        parse_xml_tool_call(grammar.output_text())?,
+        XmlToolCall {
+            name: "run".to_owned(),
+            parameters: vec![
+                ("b".to_owned(), "True".to_owned()),
+                ("a".to_owned(), "first\nsecond".to_owned()),
+            ],
+        }
+    );
+    assert_eq!(
         calls.parse_call(grammar.output_text())?.arguments_text,
         r#"{"b":true,"a":"first\nsecond"}"#
     );
@@ -128,6 +146,13 @@ fn xml_required_optional_and_emitted_key_order() -> Result<()> {
     let mut grammar = ToolCallGrammar::new(no_parameters.clone());
     grammar.commit_token_text(&envelope(""))?;
     grammar.finish()?;
+    assert_eq!(
+        parse_xml_tool_call(grammar.output_text())?,
+        XmlToolCall {
+            name: "run".to_owned(),
+            parameters: vec![],
+        }
+    );
     assert_eq!(
         no_parameters
             .parse_call(grammar.output_text())?
@@ -332,6 +357,16 @@ fn xml_preserves_literal_parameter_names_and_rejects_ambiguous_tag_fields() -> R
     }, "required":["", "x=y"]});
     let calls = compile_calls(&declarations)?;
     let text = envelope(&(parameter("x=y", "yes") + &parameter("", "1")));
+    assert_eq!(
+        parse_xml_tool_call(&text)?,
+        XmlToolCall {
+            name: "run".to_owned(),
+            parameters: vec![
+                ("x=y".to_owned(), "yes".to_owned()),
+                (String::new(), "1".to_owned())
+            ],
+        }
+    );
     let mut grammar = ToolCallGrammar::new(calls.clone());
     grammar.commit_token_text(&text)?;
     assert_eq!(

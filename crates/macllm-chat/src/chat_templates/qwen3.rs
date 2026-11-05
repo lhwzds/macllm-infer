@@ -301,6 +301,9 @@ pub fn format_qwen3_agent_prompt(
                 }
                 rendered.push_str("<|im_end|>\n");
             }
+            AgentMessage::AssistantBatch { .. } => {
+                anyhow::bail!("multiple calls are unsupported by this renderer")
+            }
             AgentMessage::Tool { content, .. } => {
                 rendered.push_str("<|im_start|>user\n<tool_response>\n");
                 rendered.push_str(content);
