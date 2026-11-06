@@ -4438,7 +4438,7 @@ fn optional_approximately_equal(left: Option<f64>, right: Option<f64>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, path::PathBuf};
+    use std::io::Cursor;
 
     use serde_json::json;
 
@@ -4566,8 +4566,14 @@ mod tests {
     }
 
     fn fixture_file(path: &str, filename: &str, digest_byte: char) -> FileProvenance {
+        // The fixture paths are built from the temporary directory so that
+        // they are absolute on every host.
+        let mut canonical_path = std::env::temp_dir();
+        for part in path.split('/').filter(|part| !part.is_empty()) {
+            canonical_path.push(part);
+        }
         FileProvenance {
-            canonical_path: PathBuf::from(path),
+            canonical_path,
             filename: filename.to_owned(),
             size_bytes: 1,
             sha256: digest_byte.to_string().repeat(64),

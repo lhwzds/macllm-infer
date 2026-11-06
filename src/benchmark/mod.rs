@@ -3,6 +3,7 @@
 pub mod assemble;
 pub mod execution;
 pub mod fair_prefix;
+pub(crate) mod file_stamp;
 pub mod host;
 pub mod llama_cpp;
 pub mod llama_server;

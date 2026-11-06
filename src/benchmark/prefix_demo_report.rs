@@ -4,7 +4,6 @@ use std::{
     fmt::Write as _,
     fs,
     io::Write as _,
-    os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -1647,13 +1646,63 @@ pub(crate) fn normalize_artifact_pair(
         json_path.parent() == markdown_path.parent(),
         "prefix-demo JSON and Markdown must share one output directory for paired publication"
     );
-    if let (Ok(json), Ok(markdown)) = (fs::metadata(&json_path), fs::metadata(&markdown_path)) {
-        ensure!(
-            json.dev() != markdown.dev() || json.ino() != markdown.ino(),
-            "prefix-demo JSON and Markdown output paths are hard-link aliases"
-        );
-    }
+    // A pair of paths that resolve to the same file is refused on every host.
+    ensure!(
+        !output_paths_are_same_file(&json_path, &markdown_path)?,
+        "prefix-demo JSON and Markdown output paths are hard-link aliases"
+    );
     Ok((json_path, markdown_path))
+}
+
+/// Reports whether two output paths name the same file.
+///
+/// The check fails closed: a target that exists but cannot be compared is an
+/// error rather than a pair that passes. A target that does not exist yet is
+/// not the same file as anything, so it passes.
+fn output_paths_are_same_file(a: &Path, b: &Path) -> Result<bool> {
+    let metadata_a = match fs::metadata(a) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect output target {}", a.display()));
+        }
+    };
+    let metadata_b = match fs::metadata(b) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect output target {}", b.display()));
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        match (metadata_a, metadata_b) {
+            (Some(metadata_a), Some(metadata_b)) => {
+                Ok(metadata_a.dev() == metadata_b.dev() && metadata_a.ino() == metadata_b.ino())
+            }
+            _ => Ok(false),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // The metadata only proves that both targets exist here; the
+        // comparison itself opens them.
+        if metadata_a.is_none() || metadata_b.is_none() {
+            return Ok(false);
+        }
+        let same_file = same_file::is_same_file(a, b).with_context(|| {
+            format!(
+                "failed to compare output targets {} and {}",
+                a.display(),
+                b.display()
+            )
+        })?;
+        Ok(same_file)
+    }
 }
 
 fn normalize_destination(path: &Path) -> Result<PathBuf> {
@@ -1741,13 +1790,18 @@ pub(crate) fn commit_artifact_pair(
 
     remove_backup(json_backup)?;
     remove_backup(markdown_backup)?;
-    let parent = json_path
-        .parent()
-        .context("published artifacts have no parent")?;
-    fs::File::open(parent)
-        .with_context(|| format!("failed to open artifact directory {}", parent.display()))?
-        .sync_all()
-        .with_context(|| format!("failed to sync artifact directory {}", parent.display()))?;
+    // Windows cannot open a directory with `File::open`, so the artifact
+    // directory is only synced on the hosts that can open one.
+    #[cfg(unix)]
+    {
+        let parent = json_path
+            .parent()
+            .context("published artifacts have no parent")?;
+        fs::File::open(parent)
+            .with_context(|| format!("failed to open artifact directory {}", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("failed to sync artifact directory {}", parent.display()))?;
+    }
     Ok(())
 }
 
@@ -1946,6 +2000,80 @@ mod tests {
         let hard_link = directory.path().join("report.md");
         fs::hard_link(&json, &hard_link)?;
         assert!(normalize_artifact_pair(&json, &hard_link).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_alias_checks_fail_closed() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let json = directory.path().join("report.json");
+        let markdown = directory.path().join("report.md");
+
+        // Two targets that do not exist yet are not aliases of each other.
+        assert!(normalize_artifact_pair(&json, &markdown).is_ok());
+
+        // Two distinct existing files are not aliases of each other.
+        fs::write(&json, b"json")?;
+        fs::write(&markdown, b"markdown")?;
+        assert!(normalize_artifact_pair(&json, &markdown).is_ok());
+
+        // A hard-linked pair is refused.
+        let hard_link = directory.path().join("alias.md");
+        fs::hard_link(&json, &hard_link)?;
+        let error = normalize_artifact_pair(&json, &hard_link)
+            .expect_err("a hard-linked pair must be refused");
+        assert!(
+            format!("{error:#}").contains("hard-link aliases"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_pair_is_refused_without_read_permission() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir()?;
+        let json = directory.path().join("report.json");
+        let markdown = directory.path().join("report.md");
+        fs::write(&json, b"json")?;
+        fs::hard_link(&json, &markdown)?;
+        // The identity of a file does not need read permission, so the pair is
+        // still refused when neither name can be opened.
+        fs::set_permissions(&json, fs::Permissions::from_mode(0o000))?;
+        fs::set_permissions(&markdown, fs::Permissions::from_mode(0o000))?;
+        let error = normalize_artifact_pair(&json, &markdown)
+            .expect_err("a hard-linked pair must be refused");
+        assert!(
+            format!("{error:#}").contains("hard-link aliases"),
+            "{error:#}"
+        );
+        // Restore the mode before the temporary directory is dropped.
+        fs::set_permissions(&json, fs::Permissions::from_mode(0o600))?;
+        fs::set_permissions(&markdown, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn an_existing_pair_that_cannot_be_opened_is_refused() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir()?;
+        let json = directory.path().join("report.json");
+        let markdown = directory.path().join("report.md");
+        fs::write(&json, b"json")?;
+        fs::write(&markdown, b"markdown")?;
+        // The held file is open for reading and writing and shares nothing, so
+        // the comparison of the two targets fails and the pair is refused.
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&json)?;
+        assert!(normalize_artifact_pair(&json, &markdown).is_err());
+        drop(held);
         Ok(())
     }
 

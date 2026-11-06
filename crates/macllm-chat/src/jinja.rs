@@ -661,17 +661,28 @@ fn raise_exception(message: JinjaValue) -> Result<JinjaValue, Error> {
 /// `strftime_now` uses the host's local wall clock, like Python's
 /// `datetime.now().strftime`. The resulting datetime is naive: zone directives
 /// are empty even though its calendar fields come from local time.
+///
+/// The Windows host has no POSIX `strftime`, so it renders the same contract
+/// with `chrono` for an allowlist of directives and refuses the rest.
 fn strftime_now(format: &str) -> Result<String, Error> {
+    #[cfg(windows)]
+    {
+        windows_clock::strftime_now(format)
+    }
     #[cfg(all(
+        not(windows),
         target_pointer_width = "64",
         any(target_os = "linux", target_os = "macos")
     ))]
     {
         posix_clock::strftime_now(format)
     }
-    #[cfg(not(all(
-        target_pointer_width = "64",
-        any(target_os = "linux", target_os = "macos")
+    #[cfg(not(any(
+        windows,
+        all(
+            target_pointer_width = "64",
+            any(target_os = "linux", target_os = "macos")
+        )
     )))]
     {
         let _ = format;
@@ -682,9 +693,10 @@ fn strftime_now(format: &str) -> Result<String, Error> {
     }
 }
 
-// The runtime supports Linux and macOS. Both use this POSIX `tm` layout and
-// a signed-long `time_t` on their supported 64-bit architectures. Keep the FFI
-// and its ABI assumptions behind this safe, platform-specific wrapper.
+// This path covers Linux and macOS; Windows uses `windows_clock`. Both use
+// this POSIX `tm` layout and a signed-long `time_t` on their supported 64-bit
+// architectures. Keep the FFI and its ABI assumptions behind this safe,
+// platform-specific wrapper.
 #[cfg(all(
     target_pointer_width = "64",
     any(target_os = "linux", target_os = "macos")
@@ -874,6 +886,34 @@ mod posix_clock {
         }
 
         #[test]
+        fn renders_the_shared_week_table() -> Result<(), Error> {
+            for &(year, month, day, weekday, ordinal, expected) in
+                super::super::tests::STRFTIME_WEEK_CASES
+            {
+                let calendar = calendar(year, month, day, weekday, ordinal);
+                assert_eq!(
+                    format_time(calendar, 0, super::super::tests::STRFTIME_WEEK_FORMAT)?,
+                    expected,
+                    "{year}-{month}-{day}"
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn renders_the_shared_strftime_table() -> Result<(), Error> {
+            let calendar = calendar(1970, 1, 1, 4, 1);
+            for (format, expected) in super::super::tests::STRFTIME_CASES {
+                assert_eq!(
+                    format_time(calendar, 12_345, format)?,
+                    *expected,
+                    "{format}"
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
         fn preserves_empty_nul_and_escaped_formats_and_naive_zones() -> Result<(), Error> {
             let calendar = calendar(1970, 1, 1, 4, 1);
             assert_eq!(format_time(calendar, 12_345, "")?, "");
@@ -895,10 +935,290 @@ mod posix_clock {
     }
 }
 
+// Windows has no POSIX `strftime`, so the same contract is rendered by
+// `chrono`, which implements the directives on every supported host. The
+// module is compiled on every host under the test build, so the Mac test run
+// exercises the Windows path as well.
+#[cfg(any(windows, test))]
+mod windows_clock {
+    use std::fmt::Write;
+    use std::iter::Peekable;
+    use std::str::Chars;
+
+    use chrono::NaiveDateTime;
+    use minijinja::{Error, ErrorKind};
+
+    /// The directives that `chrono` renders for the Windows path.
+    ///
+    /// The list is an allowlist: every other directive is refused, because a
+    /// prompt that silently renders differently from the POSIX host is worse
+    /// than a prompt that fails.
+    ///
+    /// The letters are stored without separators, so the list holds the
+    /// directives alone. A separator would let a directive that is not a
+    /// letter, such as `% `, reach `chrono`, which renders it as an error
+    /// instead of a directive of its own.
+    const CHRONO_DIRECTIVES: &str = "aAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyY";
+
+    /// The local wall clock of the host, rendered like the POSIX host does.
+    #[cfg(windows)]
+    pub(super) fn strftime_now(format: &str) -> Result<String, Error> {
+        format_time(chrono::Local::now().naive_local(), format)
+    }
+
+    /// Renders one format for one naive local datetime.
+    ///
+    /// The result follows the POSIX contract: the microseconds have six
+    /// digits, the zone directives are empty, and an embedded NUL is kept.
+    pub(super) fn format_time(time: NaiveDateTime, format: &str) -> Result<String, Error> {
+        let mut output = String::with_capacity(format.len());
+        // Python permits embedded NULs in the format, so every part between
+        // two NULs is rendered on its own and the delimiters are retained.
+        for (index, part) in format.split('\0').enumerate() {
+            if index > 0 {
+                output.push('\0');
+            }
+            output.push_str(&format_part(time, part)?);
+        }
+        Ok(output)
+    }
+
+    fn format_part(time: NaiveDateTime, format: &str) -> Result<String, Error> {
+        let mut output = String::with_capacity(format.len());
+        let mut characters = format.chars().peekable();
+        while let Some(character) = characters.next() {
+            if character != '%' {
+                output.push(character);
+                continue;
+            }
+            let directive = collect_directive(&mut characters);
+            match directive.as_str() {
+                "%%" => output.push('%'),
+                "%f" => write!(output, "{:06}", time.and_utc().timestamp_subsec_micros())
+                    .expect("write to String"),
+                "%z" | "%Z" | "%:z" => (),
+                _ => {
+                    if !is_chrono_directive(&directive) {
+                        return Err(Error::new(
+                            ErrorKind::InvalidOperation,
+                            format!("strftime_now cannot render the directive {directive}"),
+                        ));
+                    }
+                    // `chrono` reports a format that it cannot render as an
+                    // error, which is refused like any other unknown
+                    // directive instead of panicking.
+                    write!(output, "{}", time.format(&directive)).map_err(|error| {
+                        Error::new(
+                            ErrorKind::InvalidOperation,
+                            format!(
+                                "strftime_now cannot render the directive {directive}: {error}"
+                            ),
+                        )
+                    })?;
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    /// Collects the directive that follows a `%`, including its flags, its
+    /// width and its modifier, so that a refused directive can be named.
+    fn collect_directive(characters: &mut Peekable<Chars<'_>>) -> String {
+        let mut directive = String::from("%");
+        while let Some(&next) = characters.peek() {
+            if next.is_ascii_digit() || matches!(next, '-' | '_' | '0' | '^' | '#') {
+                directive.push(next);
+                characters.next();
+            } else {
+                break;
+            }
+        }
+        if let Some(':' | 'E' | 'O') = characters.peek() {
+            directive.push(characters.next().expect("peeked"));
+        }
+        if let Some(next) = characters.next() {
+            directive.push(next);
+        }
+        directive
+    }
+
+    /// Reports whether one directive is a single letter of the allowlist.
+    fn is_chrono_directive(directive: &str) -> bool {
+        let mut letters = directive.strip_prefix('%').unwrap_or_default().chars();
+        match (letters.next(), letters.next()) {
+            (Some(letter), None) => CHRONO_DIRECTIVES.contains(letter),
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chat::ChatToolArguments;
+    use chrono::Datelike;
+
+    /// The formats and the outputs that every clock path must render.
+    ///
+    /// The instant is 1970-01-01 00:00:00.012345, which the POSIX path
+    /// renders with the fixed calendar of its own tests and the Windows path
+    /// renders with `chrono`.
+    pub(super) const STRFTIME_CASES: &[(&str, &str)] = &[
+        ("%a", "Thu"),
+        ("%A", "Thursday"),
+        ("%b", "Jan"),
+        ("%B", "January"),
+        ("%c", "Thu Jan  1 00:00:00 1970"),
+        ("%C", "19"),
+        ("%d", "01"),
+        ("%D", "01/01/70"),
+        ("%e", " 1"),
+        ("%F", "1970-01-01"),
+        ("%g", "70"),
+        ("%G", "1970"),
+        ("%h", "Jan"),
+        ("%H", "00"),
+        ("%I", "12"),
+        ("%j", "001"),
+        ("%m", "01"),
+        ("%M", "00"),
+        ("%n", "\n"),
+        ("%p", "AM"),
+        ("%r", "12:00:00 AM"),
+        ("%R", "00:00"),
+        ("%S", "00"),
+        ("%t", "\t"),
+        ("%T", "00:00:00"),
+        ("%u", "4"),
+        ("%U", "00"),
+        ("%V", "01"),
+        ("%w", "4"),
+        ("%W", "00"),
+        ("%x", "01/01/70"),
+        ("%X", "00:00:00"),
+        ("%y", "70"),
+        ("%Y", "1970"),
+        ("%B %d, %Y", "January 01, 1970"),
+        ("%d %b %Y", "01 Jan 1970"),
+        ("%d %B %Y", "01 January 1970"),
+        ("%f", "012345"),
+        ("%z|%Z|%:z", "||"),
+        ("%%", "%"),
+        ("%%f", "%f"),
+        ("a\0%Y\0%f", "a\x001970\x00012345"),
+    ];
+
+    /// The format of the shared week table.
+    ///
+    /// The format holds the calendar fields of one date, the day of the year
+    /// and the week numbers that the two clock paths must agree on.
+    pub(super) const STRFTIME_WEEK_FORMAT: &str = "%Y-%m-%d %w %u %j %U %W %G %g %V";
+
+    /// The week boundaries that every clock path must render.
+    ///
+    /// Each row holds the year, the month, the day, the weekday, the ordinal
+    /// day of the year and the output that the format above must render for
+    /// midnight on that date.
+    pub(super) const STRFTIME_WEEK_CASES: &[(i32, i32, i32, i32, i32, &str)] = &[
+        (1970, 1, 1, 4, 1, "1970-01-01 4 4 001 00 00 1970 70 01"),
+        (2021, 1, 1, 5, 1, "2021-01-01 5 5 001 00 00 2020 20 53"),
+        (2019, 12, 30, 1, 364, "2019-12-30 1 1 364 52 52 2020 20 01"),
+        (2023, 1, 1, 0, 1, "2023-01-01 0 7 001 01 00 2022 22 52"),
+        (2024, 1, 1, 1, 1, "2024-01-01 1 1 001 00 01 2024 24 01"),
+        (2000, 2, 29, 2, 60, "2000-02-29 2 2 060 09 09 2000 00 09"),
+    ];
+
+    /// The instant that the shared table renders.
+    fn epoch_microsecond() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+            .expect("the epoch day exists")
+            .and_hms_micro_opt(0, 0, 0, 12_345)
+            .expect("the epoch instant exists")
+    }
+
+    #[test]
+    fn windows_clock_renders_the_shared_strftime_table() -> Result<(), Error> {
+        let time = epoch_microsecond();
+        for (format, expected) in STRFTIME_CASES {
+            assert_eq!(
+                windows_clock::format_time(time, format)?,
+                *expected,
+                "{format}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn windows_clock_renders_the_shared_week_table() -> Result<(), Error> {
+        for &(year, month, day, weekday, ordinal, expected) in STRFTIME_WEEK_CASES {
+            let month =
+                u32::try_from(month).expect("the month of the shared week table is not negative");
+            let day = u32::try_from(day).expect("the day of the shared week table is not negative");
+            let date = chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidOperation,
+                    "the date of the shared week table does not exist",
+                )
+            })?;
+            let weekday = u32::try_from(weekday)
+                .expect("the weekday of the shared week table is not negative");
+            let ordinal = u32::try_from(ordinal)
+                .expect("the ordinal of the shared week table is not negative");
+            assert_eq!(
+                date.weekday().num_days_from_sunday(),
+                weekday,
+                "{year}-{month}-{day}"
+            );
+            assert_eq!(date.ordinal(), ordinal, "{year}-{month}-{day}");
+            let time = date.and_hms_opt(0, 0, 0).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidOperation,
+                    "the instant of the shared week table does not exist",
+                )
+            })?;
+            assert_eq!(
+                windows_clock::format_time(time, STRFTIME_WEEK_FORMAT)?,
+                expected,
+                "{year}-{month}-{day}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn windows_clock_refuses_the_directives_it_cannot_render() {
+        let time = epoch_microsecond();
+        for format in [
+            "%Q", "%", "abc%", "%-d", "%5Y", "%:", "%:a", "%E", "%O", "% ",
+        ] {
+            let error = windows_clock::format_time(time, format)
+                .expect_err("the directive must be refused");
+            assert_eq!(error.kind(), ErrorKind::InvalidOperation, "{format}");
+            assert!(
+                error
+                    .detail()
+                    .is_some_and(|detail| detail.contains("cannot render the directive")),
+                "{format}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_clock_refuses_a_directive_that_is_not_a_letter() {
+        // The allowlist of the Windows clock holds the directive letters alone,
+        // so a directive that is not a letter, such as `% `, is refused by the
+        // allowlist and is named in the error.
+        let time = epoch_microsecond();
+        let error = windows_clock::format_time(time, "% ")
+            .expect_err("a directive that is not a letter must be refused");
+        assert_eq!(error.kind(), ErrorKind::InvalidOperation);
+        assert_eq!(
+            error.detail(),
+            Some("strftime_now cannot render the directive % "),
+            "{error:?}"
+        );
+    }
 
     fn tools() -> Vec<serde_json::Value> {
         vec![serde_json::json!({
@@ -1206,6 +1526,38 @@ mod tests {
         assert!(year >= 2025, "{rendered}");
         assert_eq!(rendered.as_bytes()[4], b'-');
 
+        // Both clock paths print the microseconds and drop the zone
+        // directives; the POSIX host asserts them here and the Windows host
+        // asserts them in its own test.
+        #[cfg(all(
+            target_pointer_width = "64",
+            any(target_os = "linux", target_os = "macos")
+        ))]
+        {
+            let microseconds = render_template("{{ strftime_now('%f') }}", None)?;
+            assert_eq!(microseconds.len(), 6);
+            assert!(microseconds.bytes().all(|byte| byte.is_ascii_digit()));
+            assert_eq!(
+                render_template("{{ strftime_now('%z|%Z|%:z') }}", None)?,
+                "||"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn formats_the_current_time_with_strftime_on_windows() -> Result<()> {
+        let rendered = render_template("{{ strftime_now('%Y') }}", None)?;
+        assert_eq!(rendered.len(), 4, "{rendered}");
+        assert!(
+            rendered.bytes().all(|byte| byte.is_ascii_digit()),
+            "{rendered}"
+        );
+        assert!(render_template("{{ strftime_now('%Q') }}", None).is_err());
+
+        // The Windows clock prints the microseconds and drops the zone
+        // directives, exactly like the POSIX clock does.
         let microseconds = render_template("{{ strftime_now('%f') }}", None)?;
         assert_eq!(microseconds.len(), 6);
         assert!(microseconds.bytes().all(|byte| byte.is_ascii_digit()));

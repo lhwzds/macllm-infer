@@ -34,8 +34,22 @@ use macllm_infer::{
 };
 use serde::Serialize;
 
+/// Default `--device` value for this build.
+///
+/// Builds with the `metal` feature select the Metal backend. Builds without
+/// it select the CPU backend, because such a binary cannot create a Metal
+/// device and would otherwise fail while loading the model.
+const DEFAULT_DEVICE: &str = if cfg!(feature = "metal") {
+    "metal"
+} else {
+    "cpu"
+};
+
 #[derive(Debug, Parser)]
 #[command(name = "macllm")]
+// The public command name is fixed so that Windows reports `macllm` instead
+// of the executable file name `macllm.exe`.
+#[command(bin_name = "macllm")]
 #[command(about = "An Apple Silicon-first Rust LLM inference runtime")]
 struct Cli {
     #[command(subcommand)]
@@ -98,7 +112,11 @@ fn dtype_kind_parser() -> impl TypedValueParser<Value = DTypeKind> {
 struct RuntimeArgs {
     #[arg(short, long)]
     model: PathBuf,
-    #[arg(long, value_parser = device_kind_parser(), default_value = "metal")]
+    #[arg(
+        long,
+        value_parser = device_kind_parser(),
+        default_value = DEFAULT_DEVICE
+    )]
     device: DeviceKind,
     /// Activation dtype. Defaults to F32 for CPU or quantized GGUF, F16 otherwise.
     #[arg(long, value_parser = dtype_kind_parser())]
@@ -1688,7 +1706,12 @@ mod tests {
         );
         assert_eq!(rerank.query, "question");
         assert_eq!(rerank.document, ["first", "second"]);
-        assert_eq!(rerank.runtime.device, DeviceKind::Metal);
+        let expected_device = if cfg!(feature = "metal") {
+            DeviceKind::Metal
+        } else {
+            DeviceKind::Cpu
+        };
+        assert_eq!(rerank.runtime.device, expected_device);
     }
 
     #[test]
@@ -2444,8 +2467,17 @@ mod tests {
     #[test]
     fn automatic_blocking_prefill_quantum_is_metal_and_dtype_aware() {
         let metal = run_args(
-            Cli::try_parse_from(["macllm", "run", "--model", "model-dir", "--prompt", "hello"])
-                .unwrap(),
+            Cli::try_parse_from([
+                "macllm",
+                "run",
+                "--model",
+                "model-dir",
+                "--device",
+                "metal",
+                "--prompt",
+                "hello",
+            ])
+            .unwrap(),
         );
         let cpu = run_args(
             Cli::try_parse_from([
@@ -2466,12 +2498,18 @@ mod tests {
                 "run",
                 "--model",
                 "model-dir",
+                "--device",
+                "metal",
                 "--dtype",
                 "bf16",
                 "--prompt",
                 "hello",
             ])
             .unwrap(),
+        );
+        let default = run_args(
+            Cli::try_parse_from(["macllm", "run", "--model", "model-dir", "--prompt", "hello"])
+                .unwrap(),
         );
 
         assert_eq!(
@@ -2485,6 +2523,23 @@ mod tests {
         assert_eq!(
             resolve_blocking_prefill_token_quantum(&metal_bf16.runtime, None),
             NonZeroUsize::MAX
+        );
+        // The default device follows the feature selection of this build, so
+        // the automatic quantum follows it as well.
+        let expected_device = if cfg!(feature = "metal") {
+            DeviceKind::Metal
+        } else {
+            DeviceKind::Cpu
+        };
+        assert_eq!(default.runtime.device, expected_device);
+        let expected_default = if expected_device == DeviceKind::Metal {
+            NonZeroUsize::new(128).unwrap()
+        } else {
+            NonZeroUsize::MAX
+        };
+        assert_eq!(
+            resolve_blocking_prefill_token_quantum(&default.runtime, None),
+            expected_default
         );
     }
 }

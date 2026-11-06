@@ -2185,6 +2185,7 @@ name = "macllm-chat"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "minijinja",
  "minijinja-contrib",
  "serde",
@@ -2205,6 +2206,7 @@ dependencies = [
  "candle-metal-kernels",
  "candle-nn",
  "candle-transformers",
+ "chrono",
  "clap",
  "futures-util",
  "hf-hub",
@@ -2217,6 +2219,7 @@ dependencies = [
  "objc2-metal",
  "rand 0.9.5",
  "rand_chacha",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.10.9",

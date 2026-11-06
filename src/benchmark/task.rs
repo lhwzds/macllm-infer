@@ -11,8 +11,6 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use std::os::unix::fs::MetadataExt;
-
 use crate::{
     backend::{DTypeKind, DeviceKind},
     generation::{FinishReason, GenerationMetrics},
@@ -21,6 +19,7 @@ use crate::{
     weights::{ModelFiles, ModelFormat},
 };
 
+use super::file_stamp::file_stamp;
 use super::provenance::parse_snapshot_provenance;
 use super::{
     FileProvenance, FileProvenanceGuard, GREEDY_SEED, GreedySamplingSpec, MacllmProvenanceGuard,
@@ -458,14 +457,15 @@ fn checkpoint_directory_stamp(path: &Path) -> Result<TaskCheckpointDirectoryStam
         "checkpoint directory path is not canonical: {}",
         path.display()
     );
+    let stamp = file_stamp(&metadata);
     Ok(TaskCheckpointDirectoryStamp {
         path: path.to_owned(),
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        modified_seconds: metadata.mtime(),
-        modified_nanoseconds: metadata.mtime_nsec(),
-        changed_seconds: metadata.ctime(),
-        changed_nanoseconds: metadata.ctime_nsec(),
+        device: stamp.device,
+        inode: stamp.inode,
+        modified_seconds: stamp.modified_seconds,
+        modified_nanoseconds: stamp.modified_nanoseconds,
+        changed_seconds: stamp.changed_seconds,
+        changed_nanoseconds: stamp.changed_nanoseconds,
     })
 }
 
@@ -660,6 +660,9 @@ impl TaskBenchmarkGuard {
                 && matches!(env!("MACLLM_BUILD_OPT_LEVEL"), "1" | "2" | "3" | "s" | "z"),
             "task benchmarks require an optimized build"
         );
+        // The host is collected first, so a host that cannot publish a
+        // benchmark refuses before the model is hashed.
+        let host = collect_macos_host()?;
         let build = MacllmProvenanceGuard::capture_publishable()?;
         let (checkpoint, checkpoint_guard) = TaskCheckpointProvenance::capture(&config.model)?;
         Ok(Self {
@@ -669,7 +672,7 @@ impl TaskBenchmarkGuard {
                     .context("system time precedes the Unix epoch")?
                     .as_millis(),
             )?,
-            host: collect_macos_host()?,
+            host,
             build,
             checkpoint,
             checkpoint_guard,
@@ -1239,6 +1242,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn checkpoint_guard_tracks_nested_selected_weight_parent() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1264,6 +1268,31 @@ mod tests {
         fs::rename(&parts, shards.join("replacement-parts"))?;
         fs::rename(saved, parts)?;
         assert!(guard.verify().is_err());
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn checkpoint_guard_keeps_the_nested_weight_parent_in_place() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        write_task_checkpoint(directory.path())?;
+        fs::remove_file(directory.path().join("model.safetensors"))?;
+        let shards = directory.path().join("shards");
+        let parts = shards.join("parts");
+        fs::create_dir_all(&parts)?;
+        let weight = parts.join("model-00001-of-00001.safetensors");
+        fs::write(&weight, b"weights")?;
+        fs::write(
+            directory.path().join("model.safetensors.index.json"),
+            br#"{"weight_map":{"model.weight":"shards/parts/model-00001-of-00001.safetensors"}}"#,
+        )?;
+        let (_, guard) = TaskCheckpointProvenance::capture(directory.path())?;
+        // The guard keeps the nested weight open, and Windows refuses to
+        // rename a directory that holds an open file. The tracked parent
+        // directory therefore stays where it was captured, so the checkpoint
+        // layout is unchanged while the guard is alive.
+        assert!(fs::rename(&parts, shards.join("saved-parts")).is_err());
+        guard.verify()?;
         Ok(())
     }
 

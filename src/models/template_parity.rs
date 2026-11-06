@@ -399,29 +399,12 @@ mod parity {
     /// clock-dependent templates print: a run that spans local midnight
     /// renders the new date, so the days around today are masked as well.
     fn clock_dates() -> Vec<String> {
-        let now = unsafe { libc::time(std::ptr::null_mut()) };
+        let today = chrono::Local::now().date_naive();
         let mut dates = Vec::new();
         for format in ["%B %d, %Y", "%d %B %Y", "%d %b %Y"] {
             for offset in [-1, 0, 1] {
-                let mut calendar: libc::tm = unsafe { std::mem::zeroed() };
-                unsafe { libc::localtime_r(&raw const now, &raw mut calendar) };
-                calendar.tm_mday += offset;
-                calendar.tm_hour = 12;
-                calendar.tm_isdst = -1;
-                let epoch = unsafe { libc::mktime(&raw mut calendar) };
-                let mut normalized: libc::tm = unsafe { std::mem::zeroed() };
-                unsafe { libc::localtime_r(&raw const epoch, &raw mut normalized) };
-                let format = std::ffi::CString::new(format).expect("a date format without a NUL");
-                let mut buffer = [0_u8; 64];
-                let written = unsafe {
-                    libc::strftime(
-                        buffer.as_mut_ptr().cast(),
-                        buffer.len(),
-                        format.as_ptr(),
-                        &raw const normalized,
-                    )
-                };
-                dates.push(String::from_utf8_lossy(&buffer[..written]).into_owned());
+                let day = today + chrono::Duration::days(offset);
+                dates.push(day.format(format).to_string());
             }
         }
         dates

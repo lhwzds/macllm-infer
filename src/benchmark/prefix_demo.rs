@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeSet, HashMap, hash_map::Entry},
     fs::{self, OpenOptions},
     io::Read,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 #[cfg(unix)]
@@ -1032,15 +1032,31 @@ fn regular_bundle_file(root: &Path, relative: &Path) -> Result<BundleFile> {
         relative.display()
     );
     Ok(BundleFile {
-        relative: relative_text.to_owned(),
+        relative: relative_text,
         absolute,
     })
 }
 
-fn relative_path_text(relative: &Path) -> Result<&str> {
-    relative
-        .to_str()
-        .context("repository bundle path is not valid UTF-8")
+/// Render one bundle-relative path with `/` separators on every host.
+///
+/// The recorded bundle bytes and their digest must not depend on the host,
+/// so the native separator is never part of a bundle path.
+fn relative_path_text(relative: &Path) -> Result<String> {
+    let mut components = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            bail!(
+                "repository bundle path is not a normalized relative path: {}",
+                relative.display()
+            );
+        };
+        components.push(
+            component
+                .to_str()
+                .context("repository bundle path is not valid UTF-8")?,
+        );
+    }
+    Ok(components.join("/"))
 }
 
 fn read_stable_utf8_file(file: &BundleFile) -> Result<String> {

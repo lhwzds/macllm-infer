@@ -153,6 +153,14 @@ pub fn collect_macos_host() -> Result<SanitizedHost> {
 }
 
 /// Apple Silicon scoreboards are intentionally unavailable on other hosts.
+///
+/// This refusal is what keeps benchmark publication off Windows: some
+/// guards run before it, but nothing is published. Before this function gets a
+/// Windows branch, four things must be fixed: the file identity (including
+/// directories, see `file_stamp`), the no-follow bundle reads
+/// (`prefix_demo.rs`), the directory sync that `commit_artifact_pair` skips,
+/// and the `\` separators in checkpoint paths (`LocalFileDigest::capture` in
+/// `task.rs`).
 #[cfg(not(target_os = "macos"))]
 pub fn collect_macos_host() -> Result<SanitizedHost> {
     anyhow::bail!("MacLLM benchmark host collection requires macOS")

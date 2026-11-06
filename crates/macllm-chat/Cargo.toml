@@ -15,6 +15,7 @@ default = []
 
 [dependencies]
 anyhow = { workspace = true }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "alloc"] }
 minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }
 serde = { workspace = true }

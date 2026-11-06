@@ -3,7 +3,6 @@
 use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -12,6 +11,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 
+use super::file_stamp::file_stamp;
 use super::{
     FileProvenance, ImplementationKind, ImplementationProvenance, LlamaBenchKernelEvidence,
     LlamaBenchThroughputResult, LlamaServerExecution, MacllmKernelExecution,
@@ -62,14 +62,15 @@ struct OpenFileIdentity {
 impl OpenFileIdentity {
     fn from_metadata(metadata: &fs::Metadata) -> Result<Self> {
         ensure!(metadata.is_file(), "guarded path is not a regular file");
+        let stamp = file_stamp(metadata);
         Ok(Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            device: stamp.device,
+            inode: stamp.inode,
             size_bytes: metadata.len(),
-            modified_seconds: metadata.mtime(),
-            modified_nanoseconds: metadata.mtime_nsec(),
-            changed_seconds: metadata.ctime(),
-            changed_nanoseconds: metadata.ctime_nsec(),
+            modified_seconds: stamp.modified_seconds,
+            modified_nanoseconds: stamp.modified_nanoseconds,
+            changed_seconds: stamp.changed_seconds,
+            changed_nanoseconds: stamp.changed_nanoseconds,
         })
     }
 }
@@ -837,15 +838,9 @@ fn git_stdout(repository: &Path, arguments: &[&str]) -> Result<String> {
 }
 
 fn run_identity(profile: &str) -> Result<(String, String)> {
-    let date = Command::new("/bin/date")
-        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
-        .output()
-        .context("failed to collect scoreboard UTC timestamp")?;
-    ensure!(date.status.success(), "UTC date command failed");
-    let recorded_at_utc = std::str::from_utf8(&date.stdout)
-        .context("UTC date output was not UTF-8")?
-        .trim()
-        .to_owned();
+    // The timestamp is formatted in-process so that every host reports the
+    // same UTC text without depending on an external `date` command.
+    let recorded_at_utc = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     ensure!(!recorded_at_utc.is_empty(), "UTC date output was empty");
     let epoch_millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
