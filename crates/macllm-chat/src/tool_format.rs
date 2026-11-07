@@ -146,6 +146,12 @@ pub struct ToolCallParser {
     scan: ScanState,
     untagged: bool,
     llama_separator: bool,
+    /// Whether the parser is right after a completed call.
+    ///
+    /// The whitespace that follows a completed call is held until the next
+    /// call or the next text decides what it is. The flag is cleared once
+    /// that is decided.
+    after_call: bool,
 }
 impl ToolCallParser {
     #[must_use]
@@ -161,6 +167,7 @@ impl ToolCallParser {
             scan: ScanState::default(),
             untagged: false,
             llama_separator: false,
+            after_call: false,
         }
     }
     /// Attach tool declarations for untagged detection and XML conversion.
@@ -266,6 +273,36 @@ impl ToolCallParser {
                         return self.push("");
                     }
                 }
+                // The whitespace that follows a completed call separates it
+                // from the next call. Hold it until the next call or the
+                // next text decides what it is.
+                if self.after_call && !self.pending.is_empty() {
+                    let run = self.pending.len()
+                        - self
+                            .pending
+                            .trim_start_matches(|c: char| c.is_ascii_whitespace())
+                            .len();
+                    if run > MAX_LEADING_WHITESPACE_BYTES {
+                        // The run is longer than the limit: it is content.
+                        out.content.push_str(&self.pending[..run]);
+                        self.pending.drain(..run);
+                        self.after_call = false;
+                    } else {
+                        let rest = &self.pending[run..];
+                        if rest.starts_with(marker) {
+                            // The whitespace separates two calls: drop it.
+                            self.pending.drain(..run);
+                            self.after_call = false;
+                        } else if marker.starts_with(rest) {
+                            // The next call may still start: hold the
+                            // whitespace until the text decides.
+                            break;
+                        } else {
+                            // Text follows the whitespace: both are content.
+                            self.after_call = false;
+                        }
+                    }
+                }
                 let found = self.pending.find(marker);
                 if let Some(pos) = found {
                     out.content.push_str(&self.pending[..pos]);
@@ -322,7 +359,12 @@ impl ToolCallParser {
                 let body = self.pending[..pos].to_owned();
                 self.pending.drain(..pos + end_marker.len());
                 match self.parse_body(&body) {
-                    Ok(calls) => out.calls.extend(calls),
+                    Ok(calls) => {
+                        // A call has completed: the whitespace that
+                        // follows it separates it from the next one.
+                        self.after_call = true;
+                        out.calls.extend(calls);
+                    }
                     Err(e) => {
                         self.error = Some(e);
                         self.pending.clear();
@@ -367,7 +409,14 @@ impl ToolCallParser {
                 }
                 let body = self.pending[..end].to_owned();
                 match self.parse_body(&body) {
-                    Ok(calls) => out.calls.extend(calls),
+                    Ok(calls) => {
+                        if self.format != ToolCallFormat::Llama3Json {
+                            // A call has completed: the whitespace that
+                            // follows it separates it from the next one.
+                            self.after_call = true;
+                        }
+                        out.calls.extend(calls);
+                    }
                     Err(error) => {
                         self.error = Some(error);
                         self.pending.clear();
@@ -486,8 +535,16 @@ impl ToolCallParser {
                     calls,
                 });
             }
+            // The whitespace that follows the last call separates it from
+            // the end of the turn: it is not content.
+            let content =
+                if self.after_call && self.pending.bytes().all(|byte| byte.is_ascii_whitespace()) {
+                    String::new()
+                } else {
+                    self.pending
+                };
             Ok(ParsedEnd {
-                content: self.pending,
+                content,
                 calls: Vec::new(),
             })
         }
@@ -2555,6 +2612,124 @@ mod tests {
                 decode(ToolCallFormat::Pythonic, &[&text]).is_err(),
                 "{source}"
             );
+        }
+    }
+
+    /// A call in each format the generic path understands.
+    fn sample_calls() -> [(ToolCallFormat, &'static str); 5] {
+        [
+            (
+                ToolCallFormat::Hermes,
+                "<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>",
+            ),
+            (
+                ToolCallFormat::QwenXml,
+                "<tool_call>\n<function=f>\n<parameter=x>\nv\n</parameter>\n</function>\n</tool_call>",
+            ),
+            (
+                ToolCallFormat::Pythonic,
+                "<|tool_call_start|>[f()]<|tool_call_end|>",
+            ),
+            (ToolCallFormat::MistralJson, "[TOOL_CALLS]f[ARGS]{}"),
+            (
+                ToolCallFormat::GraniteJson,
+                "<|tool_call|>[{\"name\":\"f\",\"arguments\":{}}]",
+            ),
+        ]
+    }
+
+    #[test]
+    fn whitespace_after_a_call_separates_calls_from_content() {
+        for (format, call) in sample_calls() {
+            // Two calls separated by a newline: the newline separates them.
+            let text = format!("{call}\n{call}");
+            let expected = decode(format, &[&text]).unwrap();
+            assert_eq!(expected.content, "", "{format:?}");
+            assert_eq!(expected.calls.len(), 2, "{format:?}");
+            assert_all_splits(format, &text, &expected);
+
+            // A call and a trailing newline: the newline separates the call
+            // from the end of the turn.
+            let text = format!("{call}\n");
+            let expected = decode(format, &[&text]).unwrap();
+            assert_eq!(expected.content, "", "{format:?}");
+            assert_eq!(expected.calls.len(), 1, "{format:?}");
+            assert_all_splits(format, &text, &expected);
+
+            // Text after the newline: the newline and the text are content.
+            let text = format!("{call}\ndone");
+            let expected = decode(format, &[&text]).unwrap();
+            assert_eq!(expected.content, "\ndone", "{format:?}");
+            assert_eq!(expected.calls.len(), 1, "{format:?}");
+            assert_all_splits(format, &text, &expected);
+
+            // A partial marker after the newline: the newline and the
+            // partial marker are content, because no call follows them.
+            let marker = ToolCallParser::new(format).marker();
+            let partial = &marker[..marker.len() - 1];
+            let text = format!("{call}\n{partial}");
+            let expected = decode(format, &[&text]).unwrap();
+            assert_eq!(expected.content, format!("\n{partial}"), "{format:?}");
+            assert_eq!(expected.calls.len(), 1, "{format:?}");
+            assert_all_splits(format, &text, &expected);
+        }
+    }
+
+    #[test]
+    fn a_whitespace_run_past_the_limit_after_a_call_is_content() {
+        for (format, call) in sample_calls() {
+            let whitespace = " ".repeat(MAX_LEADING_WHITESPACE_BYTES + 1);
+            let text = format!("{call}{whitespace}{call}");
+            let expected = decode(format, &[&text]).unwrap();
+            assert_eq!(expected.content, whitespace, "{format:?}");
+            assert_eq!(expected.calls.len(), 2, "{format:?}");
+            assert_all_splits(format, &text, &expected);
+        }
+    }
+
+    #[test]
+    fn llama_whitespace_between_calls_is_never_content() {
+        let call = "<|python_tag|>{\"name\":\"f\",\"arguments\":{}}";
+        // Two calls separated by a newline: the newline separates them.
+        let text = format!("{call}\n{call}");
+        let expected = decode(ToolCallFormat::Llama3Json, &[&text]).unwrap();
+        assert_eq!(expected.content, "", "llama");
+        assert_eq!(expected.calls.len(), 2, "llama");
+        assert_all_splits(ToolCallFormat::Llama3Json, &text, &expected);
+
+        // A call and a trailing newline: the newline separates the call
+        // from the end of the turn.
+        let text = format!("{call}\n");
+        let expected = decode(ToolCallFormat::Llama3Json, &[&text]).unwrap();
+        assert_eq!(expected.content, "", "llama");
+        assert_eq!(expected.calls.len(), 1, "llama");
+        assert_all_splits(ToolCallFormat::Llama3Json, &text, &expected);
+
+        // A run of newlines past the limit is still a separator.
+        let whitespace = "\n".repeat(MAX_LEADING_WHITESPACE_BYTES + 1);
+        let text = format!("{call}{whitespace}{call}");
+        let expected = decode(ToolCallFormat::Llama3Json, &[&text]).unwrap();
+        assert_eq!(expected.content, "", "llama");
+        assert_eq!(expected.calls.len(), 2, "llama");
+        assert_all_splits(ToolCallFormat::Llama3Json, &text, &expected);
+    }
+
+    #[test]
+    fn text_without_calls_is_unchanged() {
+        for format in [
+            ToolCallFormat::Hermes,
+            ToolCallFormat::QwenXml,
+            ToolCallFormat::MistralJson,
+            ToolCallFormat::GraniteJson,
+            ToolCallFormat::Pythonic,
+            ToolCallFormat::Llama3Json,
+        ] {
+            for text in ["  leading", "plain text", "  ", "\n\t "] {
+                let expected = decode(format, &[text]).unwrap();
+                assert_eq!(expected.content, text, "{format:?} {text:?}");
+                assert!(expected.calls.is_empty(), "{format:?} {text:?}");
+                assert_all_splits(format, text, &expected);
+            }
         }
     }
 }
