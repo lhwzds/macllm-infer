@@ -5067,6 +5067,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_generic_template_default_decides_the_sampling() {
+        use crate::models::ModelAdapter;
+        // A template that keeps the reasoning block closed unless the option
+        // asks for it, so its own default is off.
+        const TEMPLATE: &str = "{% if enable_thinking is defined and enable_thinking %}<think>{% endif %}{{ messages[0].content }}";
+        let config: crate::models::qwen3::Qwen3Config = serde_json::from_value(json!({
+            "model_type":"qwen3", "vocab_size":128, "hidden_size":64,
+            "intermediate_size":128, "num_hidden_layers":1, "num_attention_heads":4,
+            "num_key_value_heads":2, "head_dim":16, "max_position_embeddings":128,
+            "tie_word_embeddings":true, "rms_norm_eps":0.000_001, "hidden_act":"silu"
+        }))
+        .unwrap();
+        let spec = config.to_spec().unwrap();
+        let mut adapter =
+            crate::models::qwen3::Qwen3Adapter::from_decoder_spec(spec, Some(TEMPLATE)).unwrap();
+        adapter
+            .attach_prompt_tokens(crate::models::GgufPromptTokens {
+                chat_template: Some(TEMPLATE),
+                ..Default::default()
+            })
+            .unwrap();
+        // The default of the template is the value the server serves.
+        assert_eq!(
+            adapter.chat_template_defaults().enable_thinking,
+            Some(false)
+        );
+        for (request, thinking) in [(None, false), (Some(true), true)] {
+            let mut fake = FakeEngine::healthy(vec![
+                text_event("Need ls.", 11, 1, 3),
+                EngineEvent::Finished(metrics(FinishReason::Stop)),
+            ]);
+            fake.metadata.family = "qwen3".into();
+            fake.metadata.chat_template_defaults = adapter.chat_template_defaults();
+            let engine = Arc::new(fake);
+            let mut body = json!({
+                "model":"test-model", "messages":[{"role":"user", "content":"hello"}]
+            });
+            if let Some(enabled) = request {
+                body["chat_template_kwargs"] = json!({"enable_thinking": enabled});
+            }
+            let response = router_with_options(
+                engine.clone(),
+                ServerOptions {
+                    sampling_profile: SamplingProfile::Qwen3,
+                    ..ServerOptions::default()
+                },
+            )
+            .oneshot(chat_request(&body))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let lowered = engine.last_request.lock().unwrap().take().unwrap();
+            let (temperature, top_p, top_k) = if thinking {
+                (0.6, 0.95, 20)
+            } else {
+                (0.7, 0.8, 20)
+            };
+            assert_eq!(
+                (
+                    lowered.sampling.temperature,
+                    lowered.sampling.top_p,
+                    lowered.sampling.top_k
+                ),
+                (temperature, top_p, top_k),
+                "{request:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn pinned_qwen_rejects_multiple_calls_with_original_error_bytes() {
         let body = json!({
             "model":"test-model", "tool_choice":"none", "tools":[shell_tool()],

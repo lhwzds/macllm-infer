@@ -131,7 +131,14 @@ impl ModelAdapter for Qwen35Adapter {
             enable_thinking: match self.chat_template {
                 Some(Qwen35ChatTemplate::Official) => Some(true),
                 Some(Qwen35ChatTemplate::Unsloth) => Some(false),
-                Some(Qwen35ChatTemplate::OfficialTextSubset) | None => None,
+                // The pinned text subset refuses the option, so it has no
+                // default of its own.
+                Some(Qwen35ChatTemplate::OfficialTextSubset) => None,
+                // A generic template has the default its own renders show.
+                None => self
+                    .jinja
+                    .as_ref()
+                    .and_then(|jinja| jinja.chat_template_defaults().enable_thinking),
             },
         }
     }

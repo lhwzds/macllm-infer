@@ -43,8 +43,9 @@ pub struct EngineMetadata {
     pub max_context: usize,
     pub device: String,
     pub dtype: String,
-    /// Template options the worker applies to requests that leave them
-    /// unset, so protocol defaults can follow the effective template mode.
+    /// Effective template options: the server override merged with the
+    /// template's own default, used for sampling. The worker applies only the
+    /// server override to requests that leave template options unset.
     pub chat_template_defaults: ChatTemplateOptions,
     /// Whether the model's chat template leaves the reasoning block open for
     /// the model to continue when thinking is enabled.

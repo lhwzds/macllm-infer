@@ -108,6 +108,19 @@ impl ModelAdapter for Qwen3MoeAdapter {
         }
     }
 
+    fn chat_template_defaults(&self) -> ChatTemplateOptions {
+        match self.chat_template {
+            // A pinned template keeps the defaults it has today.
+            Some(_) => ChatTemplateOptions::default(),
+            // A generic template has the default its own renders show.
+            None => self
+                .jinja
+                .as_ref()
+                .map(JinjaChatFallback::chat_template_defaults)
+                .unwrap_or_default(),
+        }
+    }
+
     fn tool_call_format(&self) -> Option<macllm_chat::tool_format::ToolCallFormat> {
         self.jinja
             .as_ref()

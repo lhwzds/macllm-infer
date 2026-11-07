@@ -223,6 +223,23 @@ impl JinjaChatFallback {
     pub(crate) fn tool_call_format(&self) -> Option<ToolCallFormat> {
         self.format
     }
+
+    /// The template defaults the generic path serves.
+    ///
+    /// The default comes from the template's own renders: a template that
+    /// honors the option has a default of its own, and a template that does
+    /// not compile has none. The default decides the sampling defaults; the
+    /// production renders do not use it, because a render leaves the option
+    /// out and the template applies its own default.
+    pub(crate) fn chat_template_defaults(&self) -> ChatTemplateOptions {
+        ChatTemplateOptions {
+            enable_thinking: self
+                .template
+                .as_ref()
+                .ok()
+                .and_then(JinjaChatTemplate::default_enable_thinking),
+        }
+    }
     pub(crate) fn format_agent_prompt(
         &self,
         prompt: &AgentPrompt,
@@ -509,6 +526,17 @@ pub(crate) fn jinja_fallback(
     .map_err(|error| format!("the {family} chat template is not a valid Jinja program: {error:#}"));
     let format = tool_format::detect(source);
     eprintln!("tool call format: family={family} format={format:?}");
+    // A pinned chat path does not serve the default of the template, so the
+    // line belongs to the generic chat path alone.
+    if paths.chat {
+        // The default the template applies when the request leaves the option
+        // out: the value the sampling defaults use.
+        let thinking = template
+            .as_ref()
+            .ok()
+            .and_then(JinjaChatTemplate::default_enable_thinking);
+        eprintln!("thinking default: family={family} default={thinking:?}");
+    }
     // The strings the generic path refuses in untrusted content: the
     // tokenizer's special tokens, and the marker-like tokens of the
     // tokenizer that the rule of `reserved_marker_tokens` reserves. That
@@ -593,8 +621,11 @@ impl ModelAdapter for FallbackAdapter {
         self.adapter.build_model(weights)
     }
     fn format_chat_messages(&self, messages: &[ChatMessage]) -> Result<String> {
+        // The render leaves the option out, so the template applies its own
+        // default on every turn. The default of the template is the value
+        // the sampling defaults use.
         self.fallback
-            .format_chat_messages(messages, self.chat_template_defaults())
+            .format_chat_messages(messages, ChatTemplateOptions::default())
     }
     fn format_chat_messages_with(
         &self,
@@ -604,7 +635,7 @@ impl ModelAdapter for FallbackAdapter {
         self.fallback.format_chat_messages(messages, options)
     }
     fn chat_template_defaults(&self) -> ChatTemplateOptions {
-        self.adapter.chat_template_defaults()
+        self.fallback.chat_template_defaults()
     }
     fn attach_prompt_tokens(&mut self, tokens: GgufPromptTokens<'_>) -> Result<()> {
         self.adapter.attach_prompt_tokens(tokens)
@@ -625,8 +656,11 @@ impl ModelAdapter for FallbackAdapter {
         self.adapter.agent_template_profile()
     }
     fn format_agent_prompt(&self, prompt: &AgentPrompt) -> Result<String> {
+        // The render leaves the option out, so the template applies its own
+        // default on every turn. The default of the template is the value
+        // the sampling defaults use.
         self.fallback
-            .format_agent_prompt(prompt, self.chat_template_defaults())
+            .format_agent_prompt(prompt, ChatTemplateOptions::default())
     }
     fn format_agent_prompt_with(
         &self,
@@ -1835,6 +1869,192 @@ mod generic_agent_tests {
                 )?,
                 "hi"
             );
+            Ok(())
+        }
+    }
+
+    /// The thinking default of the generic path.
+    mod generic_thinking_default_tests {
+        use super::*;
+        use crate::models::{
+            qwen3::Qwen3Adapter, qwen3_moe::Qwen3MoeAdapter, qwen35::Qwen35Adapter,
+        };
+
+        /// The source of one template fixture.
+        fn fixture(name: &str) -> String {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/chat_templates/templates")
+                .join(format!("{name}.jinja"));
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+        }
+
+        /// The fallback of one template.
+        fn compile_fallback(template: &str) -> JinjaChatFallback {
+            jinja_fallback(
+                "test",
+                GenericPaths {
+                    chat: true,
+                    agent: true,
+                },
+                GgufPromptTokens {
+                    chat_template: Some(template),
+                    ..Default::default()
+                },
+            )
+            .expect("the fallback compiles")
+        }
+
+        /// A decoder geometry for one family.
+        fn spec(architecture: &str) -> DecoderSpec {
+            let config: crate::models::qwen3::Qwen3Config =
+                serde_json::from_value(serde_json::json!({
+                    "model_type":"qwen3", "vocab_size":128, "hidden_size":64,
+                    "intermediate_size":128, "num_hidden_layers":1, "num_attention_heads":4,
+                    "num_key_value_heads":2, "head_dim":16, "max_position_embeddings":128,
+                    "tie_word_embeddings":true, "rms_norm_eps":0.000_001, "hidden_act":"silu"
+                }))
+                .expect("the config parses");
+            let mut spec = config.to_spec().expect("the config is a decoder spec");
+            spec.architecture = architecture.to_owned();
+            spec
+        }
+
+        /// A template that keeps the reasoning block closed unless the option
+        /// asks for it, so its own default is off.
+        const DEFAULT_OFF: &str = "{% if enable_thinking is defined and enable_thinking %}<think>{% endif %}{{ messages[0].content }}";
+
+        #[test]
+        fn the_real_template_fixtures_report_their_own_default() {
+            for (name, expected) in [
+                ("qwen35-unsloth", Some(false)),
+                ("qwen35-official", Some(true)),
+                ("qwen3-current", Some(true)),
+                ("qwen3-gguf", Some(true)),
+            ] {
+                let source = fixture(name);
+                let fallback = compile_fallback(&source);
+                assert_eq!(
+                    fallback.chat_template_defaults().enable_thinking,
+                    expected,
+                    "{name}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_qwen35_fixtures_agree_with_the_pinned_adapter() -> Result<()> {
+            for (name, expected) in [
+                ("qwen35-official", Some(true)),
+                ("qwen35-unsloth", Some(false)),
+            ] {
+                let source = fixture(name);
+                let generic = compile_fallback(&source)
+                    .chat_template_defaults()
+                    .enable_thinking;
+                let pinned = Qwen35Adapter::from_decoder_spec(spec("qwen35"), Some(&source))?
+                    .chat_template_defaults()
+                    .enable_thinking;
+                assert_eq!(generic, expected, "{name}");
+                assert_eq!(pinned, expected, "{name}");
+                assert_eq!(generic, pinned, "{name}");
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn the_adapters_report_the_default_of_their_own_template() -> Result<()> {
+            let tokens = GgufPromptTokens {
+                chat_template: Some(DEFAULT_OFF),
+                ..Default::default()
+            };
+            // The shared fallback of a checkpoint without a pinned template.
+            let fallback = with_jinja_fallback(
+                Box::new(Qwen3Adapter::from_decoder_spec(spec("qwen3"), None)?),
+                tokens,
+            );
+            assert_eq!(
+                fallback.chat_template_defaults().enable_thinking,
+                Some(false)
+            );
+            // An unpinned Qwen3 adapter.
+            let mut adapter = Qwen3Adapter::from_decoder_spec(spec("qwen3"), Some(DEFAULT_OFF))?;
+            adapter.attach_prompt_tokens(tokens)?;
+            assert_eq!(
+                adapter.chat_template_defaults().enable_thinking,
+                Some(false)
+            );
+            // An unpinned Qwen3 MoE adapter.
+            let mut adapter =
+                Qwen3MoeAdapter::from_decoder_spec(spec("qwen3moe"), Some(DEFAULT_OFF))?;
+            adapter.attach_prompt_tokens(tokens)?;
+            assert_eq!(
+                adapter.chat_template_defaults().enable_thinking,
+                Some(false)
+            );
+            // An unpinned Qwen3.5 adapter.
+            let mut adapter = Qwen35Adapter::from_decoder_spec(spec("qwen35"), Some(DEFAULT_OFF))?;
+            adapter.attach_prompt_tokens(tokens)?;
+            assert_eq!(
+                adapter.chat_template_defaults().enable_thinking,
+                Some(false)
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn the_pinned_text_subset_reports_no_default() -> Result<()> {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/chat_templates/templates/pinned")
+                .join("qwen35-official-text-subset.jinja");
+            let source = std::fs::read_to_string(&path)?;
+            let adapter = Qwen35Adapter::from_decoder_spec(spec("qwen35"), Some(&source))?;
+            assert_eq!(adapter.chat_template_defaults().enable_thinking, None);
+            Ok(())
+        }
+
+        #[test]
+        fn a_template_that_does_not_compile_reports_no_default() {
+            let fallback = jinja_fallback(
+                "test",
+                GenericPaths {
+                    chat: true,
+                    agent: true,
+                },
+                GgufPromptTokens {
+                    chat_template: Some("{% for message in messages %}"),
+                    ..Default::default()
+                },
+            )
+            .expect("a failed compilation is kept for the render");
+            assert_eq!(fallback.chat_template_defaults().enable_thinking, None);
+        }
+
+        #[test]
+        fn a_render_without_the_option_leaves_it_out() -> Result<()> {
+            // The template reads as default off in the probe, and it shows
+            // the difference only with a longer history: the option is
+            // defined, so the history prints its marker.
+            const SOURCE: &str = "{% if enable_thinking is defined and enable_thinking %}on{% else %}off{% endif %}{% if enable_thinking is defined and messages|length > 1 %}X{% endif %}";
+            let fallback = compile_fallback(SOURCE);
+            assert_eq!(
+                fallback.chat_template_defaults().enable_thinking,
+                Some(false)
+            );
+            // The adapter of a checkpoint without a pinned template renders
+            // the request without the option, so the template applies its
+            // own default on every turn.
+            let adapter = with_jinja_fallback(
+                Box::new(Qwen3Adapter::from_decoder_spec(spec("qwen3"), None)?),
+                GgufPromptTokens {
+                    chat_template: Some(SOURCE),
+                    ..Default::default()
+                },
+            );
+            let messages = [ChatMessage::system("be brief"), ChatMessage::user("hello")];
+            let rendered = adapter.format_chat_messages(&messages)?;
+            assert!(!rendered.contains('X'), "{rendered}");
+            assert!(rendered.contains("off"), "{rendered}");
             Ok(())
         }
     }

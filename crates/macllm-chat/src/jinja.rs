@@ -96,6 +96,29 @@ const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 /// before the indentation is built.
 const MAX_JSON_INDENT: usize = 16;
 
+/// What the template's own renders show about the `enable_thinking` option.
+///
+/// The probe of [`JinjaChatTemplate::new`] fills it in: the template honors
+/// the option when its source names it and its two renders differ, and its
+/// default is the value its render without the option equals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnableThinkingProbe {
+    /// The template honors the option.
+    honors: bool,
+    /// The default the template applies when the option is left out.
+    default: Option<bool>,
+}
+
+impl EnableThinkingProbe {
+    /// A template that says nothing about the option.
+    const fn unknown() -> Self {
+        Self {
+            honors: false,
+            default: None,
+        }
+    }
+}
+
 /// A compiled Hugging Face-style chat template.
 ///
 /// The template is parsed once by [`JinjaChatTemplate::new`], which fails on
@@ -106,6 +129,7 @@ pub struct JinjaChatTemplate {
     bos_token: String,
     eos_token: String,
     honors_enable_thinking: bool,
+    default_enable_thinking: Option<bool>,
 }
 
 impl JinjaChatTemplate {
@@ -152,12 +176,17 @@ impl JinjaChatTemplate {
             bos_token: bos_token.to_owned(),
             eos_token: eos_token.to_owned(),
             honors_enable_thinking: false,
+            default_enable_thinking: None,
         };
         // A template that honors the option is the only one that may take it.
         // The answer comes from the template's own source and its own
         // renders, not from a guess about the program: a template that reads
-        // the option into a variable of its own still honors it.
-        template.honors_enable_thinking = template.probe_honors_enable_thinking(source);
+        // the option into a variable of its own still honors it. The same
+        // probe shows the default the template applies when the option is
+        // left out.
+        let probe = template.probe_enable_thinking(source);
+        template.honors_enable_thinking = probe.honors;
+        template.default_enable_thinking = probe.default;
         Ok(template)
     }
 
@@ -180,8 +209,27 @@ impl JinjaChatTemplate {
         self.honors_enable_thinking
     }
 
-    /// Whether the template's own source and renders show that it honors the
-    /// option.
+    /// The default the template applies when the option is left out.
+    ///
+    /// The answer comes from the template's own renders: the same
+    /// conversation is rendered with the option omitted, with the option
+    /// true and with the option false. The default is `Some(true)` when the
+    /// render without the option equals the render with the option true,
+    /// `Some(false)` when it equals the render with the option false, and
+    /// `None` when the template does not honor the option, when the render
+    /// without the option fails, or when it equals neither of the two.
+    ///
+    /// Two limits: the probe renders a single user turn, so a template that
+    /// reads the option only on other turns, such as tool turns, has no
+    /// default here; and a template that prints a clock that varies between
+    /// renders usually has no default, but the omitted render can match one
+    /// of the two renders when the clock does not change between them.
+    #[must_use]
+    pub fn default_enable_thinking(&self) -> Option<bool> {
+        self.default_enable_thinking
+    }
+
+    /// What the template's own source and renders show about the option.
     ///
     /// The source has to name the option, and the probe renders one user
     /// turn with the generation prompt, once with the option true and once
@@ -189,30 +237,55 @@ impl JinjaChatTemplate {
     /// names it and both renders succeed and differ. A render that fails
     /// says nothing about the template, so a template whose probe render
     /// fails does not honor the option.
-    fn probe_honors_enable_thinking(&self, source: &str) -> bool {
+    ///
+    /// The default of the template is the render it makes when the option is
+    /// omitted: the default is the value that render equals, and a render
+    /// that fails or matches neither of the two renders leaves the default
+    /// unknown.
+    fn probe_enable_thinking(&self, source: &str) -> EnableThinkingProbe {
         // A template that never names the option cannot honor it, whatever
         // its renders print.
         if !source.contains("enable_thinking") {
-            return false;
+            return EnableThinkingProbe::unknown();
         }
         let messages = [ChatMessage::user("hello")];
-        let render = |thinking: bool| {
+        let render = |thinking: Option<bool>| {
             // The probe renders without the option check: a render that
             // refuses the option would say nothing about the template.
             self.render_unchecked(
                 &messages,
                 None,
                 ChatTemplateOptions {
-                    enable_thinking: Some(thinking),
+                    enable_thinking: thinking,
                 },
                 true,
                 false,
             )
         };
-        let (Ok(enabled), Ok(disabled)) = (render(true), render(false)) else {
-            return false;
+        let (Ok(enabled), Ok(disabled)) = (render(Some(true)), render(Some(false))) else {
+            return EnableThinkingProbe::unknown();
         };
-        enabled != disabled
+        if enabled == disabled {
+            return EnableThinkingProbe::unknown();
+        }
+        // The render without the option is the template's own default.
+        let Ok(omitted) = render(None) else {
+            return EnableThinkingProbe {
+                honors: true,
+                default: None,
+            };
+        };
+        let default = if omitted == enabled {
+            Some(true)
+        } else if omitted == disabled {
+            Some(false)
+        } else {
+            None
+        };
+        EnableThinkingProbe {
+            honors: true,
+            default,
+        }
     }
 
     /// Render a conversation through the compiled template.
@@ -2183,6 +2256,83 @@ mod tests {
             format!("{error:#}").contains("enable_thinking"),
             "{error:#}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_that_closes_the_block_unless_the_option_is_true_defaults_to_off() -> Result<()> {
+        // The template keeps the reasoning block closed unless the option
+        // asks for it, so its own default is off.
+        let source = "{% if enable_thinking is defined and enable_thinking %}<think>{% endif %}";
+        let template = JinjaChatTemplate::new(source, "", "")?;
+        assert!(template.honors_enable_thinking(), "{source}");
+        assert_eq!(template.default_enable_thinking(), Some(false), "{source}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_that_keeps_the_block_open_unless_the_option_is_false_defaults_to_on() -> Result<()>
+    {
+        // The template keeps the reasoning block open unless the option
+        // closes it, so its own default is on.
+        let source = "{% if enable_thinking is not defined or enable_thinking %}<think>{% endif %}";
+        let template = JinjaChatTemplate::new(source, "", "")?;
+        assert!(template.honors_enable_thinking(), "{source}");
+        assert_eq!(template.default_enable_thinking(), Some(true), "{source}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_that_defaults_the_option_to_true_reports_it() -> Result<()> {
+        // The template names its own default, so the render without the
+        // option is the render with the option true.
+        let source = "{% if enable_thinking | default(true) %}<think>{% endif %}";
+        let template = JinjaChatTemplate::new(source, "", "")?;
+        assert!(template.honors_enable_thinking(), "{source}");
+        assert_eq!(template.default_enable_thinking(), Some(true), "{source}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_that_never_names_the_option_has_no_default() -> Result<()> {
+        let source = "{{ messages[0].content }}";
+        let template = JinjaChatTemplate::new(source, "", "")?;
+        assert!(!template.honors_enable_thinking(), "{source}");
+        assert_eq!(template.default_enable_thinking(), None, "{source}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_that_prints_the_same_text_either_way_has_no_default() -> Result<()> {
+        // The template reads the option, but the renders are the same, so
+        // the option changes nothing and the template has no default.
+        let source = "{{ 'same' if enable_thinking is defined else 'same' }}";
+        let template = JinjaChatTemplate::new(source, "", "")?;
+        assert!(!template.honors_enable_thinking(), "{source}");
+        assert_eq!(template.default_enable_thinking(), None, "{source}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_that_raises_when_the_option_is_omitted_has_no_default() -> Result<()> {
+        // The template honors the option, but its render without the option
+        // fails, so the default is unknown.
+        let source = "{% if enable_thinking is defined %}{{ 'on' if enable_thinking else 'off' }}{% else %}{{ raise_exception('the option is required') }}{% endif %}";
+        let template = JinjaChatTemplate::new(source, "", "")?;
+        assert!(template.honors_enable_thinking(), "{source}");
+        assert_eq!(template.default_enable_thinking(), None, "{source}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_that_prints_a_third_text_when_the_option_is_omitted_has_no_default() -> Result<()>
+    {
+        // The template honors the option, but the render without the option
+        // is neither of the two renders, so the default is unknown.
+        let source = "{% if enable_thinking is defined %}{{ 'on' if enable_thinking else 'off' }}{% else %}unset{% endif %}";
+        let template = JinjaChatTemplate::new(source, "", "")?;
+        assert!(template.honors_enable_thinking(), "{source}");
+        assert_eq!(template.default_enable_thinking(), None, "{source}");
         Ok(())
     }
 

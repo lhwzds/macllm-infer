@@ -185,7 +185,6 @@ mod parity {
     /// the engine input is rendered. Every stage may refuse the request.
     fn run(adapter: &dyn ModelAdapter, body: &[u8], clock: &[String]) -> Arm {
         let format = adapter.tool_call_format();
-        let defaults = adapter.chat_template_defaults();
         let Ok(mut request) = ChatCompletionRequest::from_json(body) else {
             return REFUSED;
         };
@@ -206,7 +205,8 @@ mod parity {
         ) else {
             return REFUSED;
         };
-        let options = engine_request.chat_template.or(defaults);
+        // The engine renders with the request's own option and no adapter default.
+        let options = engine_request.chat_template;
         let chat = |messages: &[ChatMessage]| adapter.format_chat_messages_with(messages, options);
         let agent = |prompt: &AgentPrompt| adapter.format_agent_prompt_with(prompt, options);
         let (route, rendered) = match &engine_request.input {
