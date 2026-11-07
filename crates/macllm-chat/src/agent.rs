@@ -127,14 +127,13 @@ impl AgentPrompt {
         .validate()
     }
 
-    /// Reject format delimiters and tokenizer-added strings in untrusted history.
-    pub fn reject_generic_controls(&self, markers: &[&str], tokens: &[String]) -> Result<()> {
+    /// Reject the reserved control strings in untrusted history.
+    ///
+    /// The reserved list holds the strings a client must not forge: the
+    /// tokenizer's special tokens and the markers of the template.
+    pub fn reject_generic_controls(&self, reserved: &[String]) -> Result<()> {
         let check = |label: &str, value: &str| -> Result<()> {
-            for control in markers
-                .iter()
-                .copied()
-                .chain(tokens.iter().map(String::as_str))
-            {
+            for control in reserved.iter().map(String::as_str) {
                 if !control.is_empty() && value.contains(control) {
                     bail!("{label} contains reserved native control string `{control}`");
                 }
@@ -437,7 +436,7 @@ mod tests {
             };
             assert!(
                 prompt
-                    .reject_generic_controls(&[], &[marker.to_owned()])
+                    .reject_generic_controls(&[marker.to_owned()])
                     .is_err()
             );
         }
@@ -446,7 +445,11 @@ mod tests {
     #[test]
     fn generic_checks_all_declaration_strings_and_both_history_ids() {
         let marker = "[INST]";
-        let check = |prompt: &AgentPrompt| prompt.reject_generic_controls(&[marker], &[]).is_err();
+        let check = |prompt: &AgentPrompt| {
+            prompt
+                .reject_generic_controls(&[marker.to_owned()])
+                .is_err()
+        };
         let base = AgentPrompt {
             messages: vec![AgentMessage::User {
                 content: "ok".into(),
@@ -517,14 +520,18 @@ mod tests {
         // arguments of a call.
         let mut prompt = base.clone();
         prompt.tools[0].parameters = serde_json::json!({"nested":[{"key":marker}]});
-        let error = prompt.reject_generic_controls(&[marker], &[]).unwrap_err();
+        let error = prompt
+            .reject_generic_controls(&[marker.to_owned()])
+            .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("tool declaration"), "{message}");
         assert!(!message.contains("tool arguments"), "{message}");
 
         let mut prompt = base.clone();
         prompt.tools[0].declaration = Some(serde_json::json!({marker:"x"}));
-        let error = prompt.reject_generic_controls(&[marker], &[]).unwrap_err();
+        let error = prompt
+            .reject_generic_controls(&[marker.to_owned()])
+            .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("tool declaration"), "{message}");
 
@@ -538,7 +545,9 @@ mod tests {
                 arguments: serde_json::json!({"key":marker}).to_string(),
             }),
         }];
-        let error = prompt.reject_generic_controls(&[marker], &[]).unwrap_err();
+        let error = prompt
+            .reject_generic_controls(&[marker.to_owned()])
+            .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("tool arguments"), "{message}");
         assert!(!message.contains("tool declaration"), "{message}");

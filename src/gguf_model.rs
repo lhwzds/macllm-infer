@@ -20,114 +20,44 @@ use crate::{
     },
 };
 
-/// Tokenizer control tokens and marker-like added tokens printed by the template.
-pub(crate) fn prompt_control_tokens(
-    tokenizer: &Tokenizer,
-    chat_template: Option<&str>,
-) -> Vec<String> {
-    let literal = chat_template.map(template_literal_text);
-    tokenizer
-        .get_added_tokens_decoder()
-        .into_values()
-        .filter(|token| {
-            let content = &token.content;
-            token.special
-                || (content.len() >= 3
-                    && !content.chars().any(char::is_whitespace)
-                    && content.contains(['<', '>', '[', ']', '|'])
-                    && literal.as_ref().is_some_and(|text| text.contains(content)))
-        })
-        .map(|token| token.content)
-        .collect()
+/// The tokenizer's control tokens, split by how the generic path reserves
+/// them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PromptControlTokens {
+    /// The tokens the tokenizer marks special: always reserved.
+    pub special: Vec<String>,
+    /// The marker-like added tokens: the generic path reserves every one of
+    /// them but the markers of NAMED_MARKERS and the plain markup tags the
+    /// template neither names nor prints; without a valid template or with a
+    /// failed probe render every plain markup tag stays reserved.
+    pub markers: Vec<String>,
 }
 
-// Remove only closed comments outside tags and raw blocks. Retaining tags
-// deliberately reserves markers appearing in expressions and string literals.
-fn template_literal_text(template: &str) -> String {
-    let bytes = template.as_bytes();
-    let mut result = String::new();
-    let mut index = 0;
-    let mut kept = 0;
-    let mut raw = false;
-    while index + 1 < bytes.len() {
-        if raw {
-            if bytes[index..].starts_with(b"{%") {
-                let mut tag = &template[index + 2..];
-                tag = tag.strip_prefix(['-', '+']).unwrap_or(tag);
-                tag = tag.trim_start_matches(|c: char| c.is_ascii_whitespace());
-                if let Some(tail) = tag.strip_prefix("endraw") {
-                    let tail = tail.trim_start_matches(|c: char| c.is_ascii_whitespace());
-                    let tail = tail.strip_prefix(['-', '+']).unwrap_or(tail);
-                    if let Some(after) = tail.strip_prefix("%}") {
-                        index = template.len() - after.len();
-                        raw = false;
-                        continue;
-                    }
-                }
-            }
-            index += 1;
+/// The tokenizer's special tokens and its marker-like added tokens.
+///
+/// A marker-like token is an added token that looks like a marker: it is at
+/// least three characters long, it holds no whitespace and it holds one of
+/// `<`, `>`, `[`, `]` or `|`. The list does not depend on the chat template,
+/// so a marker a template assembles from pieces is in it too.
+pub(crate) fn prompt_control_tokens(tokenizer: &Tokenizer) -> PromptControlTokens {
+    let mut control = PromptControlTokens::default();
+    for token in tokenizer.get_added_tokens_decoder().into_values() {
+        let content = &token.content;
+        if token.special {
+            control.special.push(content.clone());
             continue;
         }
-        if bytes[index..].starts_with(b"{#") {
-            if let Some(end) = template[index + 2..].find("#}") {
-                result.push_str(&template[kept..index]);
-                result.push(' ');
-                index += end + 4;
-                kept = index;
-                continue;
-            }
-            break;
-        }
-        let statement = bytes[index..].starts_with(b"{%");
-        if statement || (!raw && bytes[index..].starts_with(b"{{")) {
-            let start = index;
-            let close = if statement { b"%}" } else { b"}}" };
-            index += 2;
-            let mut quote = None;
-            let mut escaped = false;
-            let mut depth = 0_usize;
-            while index + 1 < bytes.len() {
-                let byte = bytes[index];
-                if let Some(delimiter) = quote {
-                    if escaped {
-                        escaped = false;
-                    } else if byte == b'\\' {
-                        escaped = true;
-                    } else if byte == delimiter {
-                        quote = None;
-                    }
-                } else if byte == b'\'' || byte == b'"' {
-                    quote = Some(byte);
-                } else if !statement && byte == b'{' {
-                    depth += 1;
-                } else if !statement && byte == b'}' && depth > 0 {
-                    depth -= 1;
-                } else if bytes[index..].starts_with(close) && depth == 0 {
-                    if statement {
-                        let tag = template[start + 2..index]
-                            .trim_matches(|c: char| c.is_ascii_whitespace())
-                            .trim_matches(['-', '+'])
-                            .trim_matches(|c: char| c.is_ascii_whitespace());
-                        if !raw && tag == "raw" {
-                            raw = true;
-                        } else if raw && tag == "endraw" {
-                            raw = false;
-                        }
-                    }
-                    index += 2;
-                    break;
-                }
-                index += 1;
-            }
-            if index + 1 >= bytes.len() {
-                break;
-            }
-        } else {
-            index += 1;
+        // The length is a count of characters, not of bytes: a token of two
+        // characters is three bytes long when one of them is not ASCII, and
+        // a byte count would call it a marker.
+        if content.chars().count() >= 3
+            && !content.chars().any(char::is_whitespace)
+            && content.contains(['<', '>', '[', ']', '|'])
+        {
+            control.markers.push(content.clone());
         }
     }
-    result.push_str(&template[kept..]);
-    result
+    control
 }
 
 const MAX_GGUF_CONTEXT_LENGTH: usize = 1 << 20;
@@ -377,6 +307,9 @@ pub struct GgufModel {
     chat_template: Option<String>,
     bos_token: Option<String>,
     eos_token: Option<String>,
+    /// The effective policy of the tokenizer: whether it adds its BOS token
+    /// to every prompt.
+    add_bos_token: bool,
 }
 
 impl GgufModel {
@@ -406,6 +339,7 @@ impl GgufModel {
             chat_template,
             bos_token,
             eos_token,
+            add_bos_token,
         } = embedded_tokenizer(file.metadata(), &spec)?;
         Ok(Self {
             file,
@@ -415,6 +349,7 @@ impl GgufModel {
             chat_template,
             bos_token,
             eos_token,
+            add_bos_token,
         })
     }
 
@@ -432,12 +367,14 @@ impl GgufModel {
         // Prompt tokens ride along so an unpinned template can still render
         // chat through the generic Jinja renderer.
         let mut adapter = self.architecture_adapter()?;
-        let special_tokens = prompt_control_tokens(&self.tokenizer, self.chat_template.as_deref());
+        let control = prompt_control_tokens(&self.tokenizer);
         let tokens = GgufPromptTokens {
-            special_tokens: &special_tokens,
+            special_tokens: &control.special,
+            marker_tokens: &control.markers,
             chat_template: self.chat_template.as_deref(),
             bos_token: self.bos_token.as_deref(),
             eos_token: self.eos_token.as_deref(),
+            add_bos_token: self.add_bos_token,
         };
         if matches!(
             self.architecture,
@@ -3288,6 +3225,9 @@ struct EmbeddedTokenizer {
     chat_template: Option<String>,
     bos_token: Option<String>,
     eos_token: Option<String>,
+    /// The effective policy of the tokenizer: whether it adds its BOS token
+    /// to every prompt.
+    add_bos_token: bool,
 }
 
 fn embedded_tokenizer(metadata: &GgufMetadata, spec: &DecoderSpec) -> Result<EmbeddedTokenizer> {
@@ -3339,34 +3279,44 @@ fn embedded_tokenizer(metadata: &GgufMetadata, spec: &DecoderSpec) -> Result<Emb
     let bos_string = special_token(bos_token_id);
     let eos_string = special_token(eos_token_id);
 
-    let tokenizer = match model {
-        "gpt2" => EmbeddedBpeTokenizer {
-            model: model.to_owned(),
-            pre_tokenizer: pre_tokenizer.to_owned(),
-            tokens,
-            token_types,
-            merges: require_string_array(metadata, "tokenizer.ggml.merges")?,
-            add_space_prefix,
-            add_bos_token: bos_policy,
-            add_eos_token: eos_policy,
-            bos_token_id,
-            eos_token_id,
+    // The tokenizer owns the policy: the metadata key is optional, and a
+    // profile that adds its BOS token by default keeps that default when the
+    // key is missing. The prompt path takes the same effective policy, so
+    // the render and the tokenizer agree.
+    let (tokenizer, add_bos_token) = match model {
+        "gpt2" => {
+            let embedded = EmbeddedBpeTokenizer {
+                model: model.to_owned(),
+                pre_tokenizer: pre_tokenizer.to_owned(),
+                tokens,
+                token_types,
+                merges: require_string_array(metadata, "tokenizer.ggml.merges")?,
+                add_space_prefix,
+                add_bos_token: bos_policy,
+                add_eos_token: eos_policy,
+                bos_token_id,
+                eos_token_id,
+            };
+            let add_bos_token = embedded.effective_add_bos_token()?;
+            (embedded.build()?, add_bos_token)
         }
-        .build()?,
-        "llama" => EmbeddedSentencePieceTokenizer {
-            model: model.to_owned(),
-            pre_tokenizer: pre_tokenizer.to_owned(),
-            tokens,
-            scores: require_f32_array(metadata, "tokenizer.ggml.scores")?,
-            token_types,
-            add_space_prefix,
-            add_bos_token: bos_policy,
-            add_eos_token: eos_policy,
-            bos_token_id,
-            eos_token_id,
-            unknown_token_id: optional_u32(metadata, "tokenizer.ggml.unknown_token_id")?,
+        "llama" => {
+            let embedded = EmbeddedSentencePieceTokenizer {
+                model: model.to_owned(),
+                pre_tokenizer: pre_tokenizer.to_owned(),
+                tokens,
+                scores: require_f32_array(metadata, "tokenizer.ggml.scores")?,
+                token_types,
+                add_space_prefix,
+                add_bos_token: bos_policy,
+                add_eos_token: eos_policy,
+                bos_token_id,
+                eos_token_id,
+                unknown_token_id: optional_u32(metadata, "tokenizer.ggml.unknown_token_id")?,
+            };
+            let add_bos_token = embedded.effective_add_bos_token();
+            (embedded.build()?, add_bos_token)
         }
-        .build()?,
         unsupported => bail!("unsupported embedded tokenizer model `{unsupported}`"),
     };
     let chat_template = optional_string(metadata, "tokenizer.chat_template")?.map(str::to_owned);
@@ -3375,6 +3325,7 @@ fn embedded_tokenizer(metadata: &GgufMetadata, spec: &DecoderSpec) -> Result<Emb
         chat_template,
         bos_token: bos_string,
         eos_token: eos_string,
+        add_bos_token,
     })
 }
 
@@ -4092,6 +4043,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_bos_policy_comes_from_the_tokenizer_metadata() -> Result<()> {
+        // A checkpoint whose tokenizer adds its BOS token to every prompt
+        // renders a prompt that starts with it, even when its template never
+        // prints it. The policy is the one of the tokenizer: a profile that
+        // adds its BOS token by default keeps that default when the metadata
+        // does not name the policy.
+        let original = synthetic_llama_gguf(None)?;
+        let original = GgufFile::open(original.path())?;
+        for (profile, policy, template, expected) in [
+            // The Llama 3 profile inserts a BOS token.
+            (
+                "llama-bpe",
+                Some(true),
+                "{{ messages[0].content }}",
+                "<|stop|>Hello",
+            ),
+            (
+                "llama-bpe",
+                Some(false),
+                "{{ messages[0].content }}",
+                "Hello",
+            ),
+            // A checkpoint that does not name the policy keeps the default of
+            // its profile, and the Llama 3 profile adds its BOS token.
+            (
+                "llama-bpe",
+                None,
+                "{{ messages[0].content }}",
+                "<|stop|>Hello",
+            ),
+            // The Qwen 2 profile adds no BOS token, so a checkpoint that does
+            // not name the policy gets none.
+            ("qwen2", None, "{{ messages[0].content }}", "Hello"),
+            // A render that carries whitespace before the BOS token keeps its
+            // bytes: the token is in the render already.
+            (
+                "llama-bpe",
+                None,
+                " {{ bos_token }}{{ messages[0].content }}",
+                " <|stop|>Hello",
+            ),
+        ] {
+            let mut metadata: Vec<_> = original
+                .metadata()
+                .iter()
+                .map(|(key, value)| (key, value.clone()))
+                .collect();
+            metadata.retain(|(key, _)| {
+                *key != "tokenizer.ggml.add_bos_token"
+                    && *key != "tokenizer.chat_template"
+                    && *key != "tokenizer.ggml.pre"
+            });
+            metadata.push(("tokenizer.ggml.pre", GgufValue::String(profile.into())));
+            if let Some(policy) = policy {
+                metadata.push(("tokenizer.ggml.add_bos_token", GgufValue::Bool(policy)));
+            }
+            metadata.push(("tokenizer.ggml.bos_token_id", GgufValue::U32(0)));
+            metadata.push((
+                "tokenizer.chat_template",
+                GgufValue::String(template.into()),
+            ));
+            let tensors = original
+                .tensors()
+                .iter()
+                .map(|(name, info)| (name.as_str(), info.shape.iter().rev().copied().collect()))
+                .collect();
+            let fixture = write_synthetic_gguf(metadata, tensors)?;
+            let model = GgufModel::open(fixture.path())?;
+            let adapter = model.adapter()?;
+            let messages = [crate::chat::ChatMessage::user("Hello")];
+            assert_eq!(
+                adapter.format_chat_messages(&messages)?,
+                expected,
+                "{profile} {policy:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn prompt_control_tokens_exclude_user_defined_added_tokens() {
         use tokenizers::{AddedToken, models::bpe::BPE};
         let mut tokenizer = Tokenizer::new(BPE::default());
@@ -4101,89 +4132,38 @@ mod tests {
         tokenizer
             .add_special_tokens([AddedToken::from("[INST]", true)])
             .unwrap();
-        let tokens = prompt_control_tokens(&tokenizer, None);
-        assert!(tokens.contains(&"[INST]".to_owned()));
-        assert!(!tokens.contains(&"<table>".to_owned()));
-        let prompt = crate::agent::AgentPrompt {
-            messages: vec![crate::agent::AgentMessage::User {
-                content: "<table>".into(),
-            }],
-            tools: vec![],
-            directive: crate::agent::AgentDirective::TextOnly,
+        let control = prompt_control_tokens(&tokenizer);
+        // The tokenizer's own special token is a control token of its own.
+        assert!(control.special.contains(&"[INST]".to_owned()));
+        // A user-defined added token is not one of them.
+        assert!(!control.special.contains(&"<table>".to_owned()));
+        // The generic path reserves a marker only when the template's own
+        // source names it or its plain render prints it, so a template that
+        // names nothing keeps the user-defined token ordinary text.
+        let template = "{{ messages[0].content }}";
+        let fallback = crate::models::jinja_fallback(
+            "test",
+            crate::models::GenericPaths {
+                chat: true,
+                agent: true,
+            },
+            crate::models::GgufPromptTokens {
+                chat_template: Some(template),
+                special_tokens: &control.special,
+                marker_tokens: &control.markers,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let render = |content: &str| {
+            fallback.format_chat_messages(
+                &[crate::chat::ChatMessage::user(content)],
+                crate::chat::ChatTemplateOptions::default(),
+            )
         };
-        assert!(prompt.reject_generic_controls(&[], &tokens).is_ok());
-    }
-
-    #[test]
-    fn template_tokens_only_reserve_literal_markers() {
-        use tokenizers::{AddedToken, models::bpe::BPE};
-        let mut tokenizer = Tokenizer::new(BPE::default());
-        for token in [
-            "\n\n", "  ", "user", "<table>", "<|user|>", "<|end|>", "<|x|>",
-        ] {
-            tokenizer
-                .add_tokens([AddedToken::from(token, false)])
-                .unwrap();
-        }
-        let template = "\n\n  user {{ '<|user|>' }}<|end|>{# <|x|> #}";
-        let tokens = prompt_control_tokens(&tokenizer, Some(template));
-        for content in ["\n\n", "  ", "user", "<table>", "<|x|>"] {
-            let prompt = crate::agent::AgentPrompt {
-                messages: vec![crate::agent::AgentMessage::User {
-                    content: content.into(),
-                }],
-                tools: vec![],
-                directive: crate::agent::AgentDirective::TextOnly,
-            };
-            assert!(
-                prompt.reject_generic_controls(&[], &tokens).is_ok(),
-                "{content:?}"
-            );
-        }
-        assert!(tokens.contains(&"<|user|>".to_owned()));
-        assert!(tokens.contains(&"<|end|>".to_owned()));
-    }
-
-    #[test]
-    fn template_tokens_include_quoted_tags_and_raw_blocks() {
-        use tokenizers::{AddedToken, models::bpe::BPE};
-        let mut tokenizer = Tokenizer::new(BPE::default());
-        for token in [
-            "<|user|>", "<fake>", "<|end|>", "<|a|>", "<|e|>", "<|x|>", "<|y|>",
-        ] {
-            tokenizer
-                .add_tokens([AddedToken::from(token, false)])
-                .unwrap();
-        }
-        for (template, marker) in [
-            ("{{ '{% <|user|> %}' }}", "<|user|>"),
-            ("{% set x = '%} <fake>' %}", "<fake>"),
-            ("{{ '{#' }}<|end|>{{ '#}' }}", "<|end|>"),
-            ("{% raw %}<|a|>{% endraw %}", "<|a|>"),
-            (
-                "{% raw %}{% ' {% endraw %}{{ \" ' %}{% endraw %}{# <|x|> #}\" }}",
-                "<|x|>",
-            ),
-            ("{{ {'k': '<|y|>'} }}{# <|x|> #}<|end|>", "<|y|>"),
-            ("{{ {'a':{'b':1}} ~ '{# <|x|> #}' }}", "<|x|>"),
-            ("{%- raw -%}{# <|x|> #}{%- endraw -%}", "<|x|>"),
-            ("{%+ raw +%}{# <|x|> #}{%+ endraw +%}", "<|x|>"),
-            ("{% set eos = '<|e|>' %}{{ eos }}", "<|e|>"),
-            ("{# <|x|>", "<|x|>"),
-            ("{{ '<|e|>", "<|e|>"),
-        ] {
-            assert!(
-                prompt_control_tokens(&tokenizer, Some(template)).contains(&marker.to_owned()),
-                "{template}"
-            );
-        }
-        assert!(
-            !prompt_control_tokens(&tokenizer, Some("{# <|x|> #}")).contains(&"<|x|>".to_owned())
-        );
-        let tokens =
-            prompt_control_tokens(&tokenizer, Some("{{ {'k': '<|y|>'} }}{# <|x|> #}<|end|>"));
-        assert!(tokens.contains(&"<|end|>".to_owned()));
-        assert!(!tokens.contains(&"<|x|>".to_owned()));
+        assert!(render("<table>").is_ok());
+        // The tokenizer's own special token stays reserved.
+        assert!(render("[INST]").is_err());
     }
 
     #[test]
@@ -4203,32 +4183,54 @@ mod tests {
             .unwrap();
         let template =
             "{% for message in messages %}<|user|>{{ message.content }}<|end|>{% endfor %}";
-        let tokens = prompt_control_tokens(&tokenizer, Some(template));
-        assert!(tokens.contains(&"<|user|>".to_owned()));
-        assert!(tokens.contains(&"<|end|>".to_owned()));
-        // A user-defined token the template never prints stays ordinary text.
-        assert!(!tokens.contains(&"<table>".to_owned()));
-        for content in ["<|user|>", "<|end|>"] {
-            let prompt = crate::agent::AgentPrompt {
-                messages: vec![crate::agent::AgentMessage::User {
-                    content: content.into(),
-                }],
-                tools: vec![],
-                directive: crate::agent::AgentDirective::TextOnly,
-            };
-            assert!(
-                prompt.reject_generic_controls(&[], &tokens).is_err(),
-                "{content}"
-            );
-        }
-        let prompt = crate::agent::AgentPrompt {
-            messages: vec![crate::agent::AgentMessage::User {
-                content: "<table>".into(),
-            }],
-            tools: vec![],
-            directive: crate::agent::AgentDirective::TextOnly,
+        let control = prompt_control_tokens(&tokenizer);
+        assert!(control.markers.contains(&"<|user|>".to_owned()));
+        assert!(control.markers.contains(&"<|end|>".to_owned()));
+        // The role markers delimit a turn of the template's own render, so
+        // the generic path reserves them.
+        let fallback = crate::models::jinja_fallback(
+            "test",
+            crate::models::GenericPaths {
+                chat: true,
+                agent: true,
+            },
+            crate::models::GgufPromptTokens {
+                chat_template: Some(template),
+                special_tokens: &control.special,
+                marker_tokens: &control.markers,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let render = |content: &str| {
+            fallback.format_chat_messages(
+                &[crate::chat::ChatMessage::user(content)],
+                crate::chat::ChatTemplateOptions::default(),
+            )
         };
-        assert!(prompt.reject_generic_controls(&[], &tokens).is_ok());
+        for content in ["<|user|>", "<|end|>"] {
+            assert!(render(content).is_err(), "{content}");
+        }
+        // A user-defined token the template never prints stays ordinary text.
+        assert!(render("<table>").is_ok());
+    }
+
+    #[test]
+    fn prompt_control_tokens_count_characters_and_not_bytes() {
+        use tokenizers::{AddedToken, models::bpe::BPE};
+        let mut tokenizer = Tokenizer::new(BPE::default());
+        // Two characters and three bytes: a byte count would call it a
+        // marker, a character count does not.
+        tokenizer
+            .add_tokens([AddedToken::from("<\u{e9}", false)])
+            .unwrap();
+        // Three characters and four bytes: a marker.
+        tokenizer
+            .add_tokens([AddedToken::from("<\u{e9}>", false)])
+            .unwrap();
+        let control = prompt_control_tokens(&tokenizer);
+        assert!(!control.markers.contains(&"<\u{e9}".to_owned()));
+        assert!(control.markers.contains(&"<\u{e9}>".to_owned()));
     }
 
     #[test]
@@ -4338,7 +4340,7 @@ mod tests {
                 .collect();
             metadata.push(("tokenizer.ggml.bos_token_id", GgufValue::U32(1)));
             metadata.push(("tokenizer.chat_template", GgufValue::String(
-                "{{ bos_token }}{% for m in messages %}{{ m.role }}:{{ m.content }}{% endfor %}{% if add_generation_prompt %}assistant:{% endif %}{{ 'unset' if enable_thinking is not defined else 'direct' }}{{ eos_token }}".into(),
+                "{{ bos_token }}{% for m in messages %}{{ m.role }}:{{ m.content }}{% endfor %}{% if add_generation_prompt %}assistant:{% endif %}{{ 'unset' if enable_thinking is not defined else ('on' if enable_thinking else 'off') }}{{ eos_token }}".into(),
             )));
             let tensors = original
                 .tensors()
@@ -4360,7 +4362,7 @@ mod tests {
                         enable_thinking: Some(false)
                     },
                 )?,
-                "auser:Helloassistant:direct<|stop|>"
+                "auser:Helloassistant:off<|stop|>"
             );
             let prompt = crate::agent::AgentPrompt {
                 messages: vec![crate::agent::AgentMessage::User {
@@ -6463,6 +6465,80 @@ mod tests {
                 128_009, 128_006, 882, 128_007, 271, 9_906, 128_009, 128_006, 78_191, 128_007, 271,
             ]
         );
+        Ok(())
+    }
+
+    /// The BOS token of a real checkpoint leads the encoded prompt exactly
+    /// once, the way the server encodes a rendered prompt.
+    #[test]
+    #[ignore = "requires MACLLM_BOS_ID_GGUF pointing at a GGUF checkpoint"]
+    fn a_real_checkpoint_encodes_its_bos_token_id_once_at_the_front() -> Result<()> {
+        let path = std::env::var("MACLLM_BOS_ID_GGUF")
+            .map_err(|_| anyhow::anyhow!("MACLLM_BOS_ID_GGUF must point at a GGUF checkpoint"))?;
+        let model = GgufModel::open(&path)?;
+        let adapter = model.adapter()?;
+        // The generic path is the path under test, so the test builds it for
+        // the checkpoint itself: a checkpoint whose template the loader pins
+        // still renders through the generic Jinja engine, and that is the
+        // path the test measures.
+        let control = prompt_control_tokens(&model.tokenizer);
+        let tokens = GgufPromptTokens {
+            special_tokens: &control.special,
+            marker_tokens: &control.markers,
+            chat_template: model.chat_template.as_deref(),
+            bos_token: model.bos_token.as_deref(),
+            eos_token: model.eos_token.as_deref(),
+            add_bos_token: model.add_bos_token,
+        };
+        let fallback = crate::models::jinja_fallback(
+            adapter.family(),
+            crate::models::GenericPaths {
+                chat: true,
+                agent: true,
+            },
+            tokens,
+        )
+        .context("the checkpoint must hold a chat template")?;
+        let rendered = fallback.format_chat_messages(
+            &[crate::chat::ChatMessage::user("Hello")],
+            crate::chat::ChatTemplateOptions::default(),
+        )?;
+        // The server encodes a rendered prompt without the special tokens of
+        // the tokenizer, so the prompt has to carry its own BOS token.
+        let ids = model
+            .tokenizer
+            .encode(rendered.clone(), false)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            .get_ids()
+            .to_vec();
+        println!("the rendered prompt: {rendered:?}");
+        println!("the encoded ids: {ids:?}");
+        let Some(bos) = model.bos_token.as_deref() else {
+            println!("the checkpoint has no BOS token");
+            return Ok(());
+        };
+        let bos_id = model
+            .tokenizer
+            .token_to_id(bos)
+            .context("the tokenizer must hold an id for the BOS token")?;
+        let prints_bos = rendered.contains(bos);
+        if model.add_bos_token || prints_bos {
+            assert_eq!(
+                ids.first(),
+                Some(&bos_id),
+                "the prompt must lead with the BOS id"
+            );
+            assert_eq!(
+                ids.iter().filter(|id| **id == bos_id).count(),
+                1,
+                "the BOS id must appear exactly once"
+            );
+        } else {
+            assert!(
+                !ids.contains(&bos_id),
+                "the prompt must not carry the BOS id"
+            );
+        }
         Ok(())
     }
 

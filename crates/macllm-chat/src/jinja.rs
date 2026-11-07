@@ -105,6 +105,7 @@ pub struct JinjaChatTemplate {
     environment: Environment<'static>,
     bos_token: String,
     eos_token: String,
+    honors_enable_thinking: bool,
 }
 
 impl JinjaChatTemplate {
@@ -117,6 +118,10 @@ impl JinjaChatTemplate {
             source.len() <= MAX_TEMPLATE_BYTES,
             "the chat template is larger than the {MAX_TEMPLATE_BYTES} byte limit"
         );
+        // The transformers-only `{% generation %}` markers have no MiniJinja
+        // equivalent, so they become ordinary blocks before the parser sees
+        // them.
+        let program = rewrite_generation_tags(source);
         let mut environment = Environment::new();
         environment.set_trim_blocks(true);
         environment.set_lstrip_blocks(true);
@@ -140,13 +145,74 @@ impl JinjaChatTemplate {
         // the one below: `include` and `import` reach neither the filesystem
         // nor another template.
         environment
-            .add_template_owned(TEMPLATE_NAME, source.to_owned())
+            .add_template_owned(TEMPLATE_NAME, program)
             .with_context(|| "chat template is not a valid Jinja program")?;
-        Ok(Self {
+        let mut template = Self {
             environment,
             bos_token: bos_token.to_owned(),
             eos_token: eos_token.to_owned(),
-        })
+            honors_enable_thinking: false,
+        };
+        // A template that honors the option is the only one that may take it.
+        // The answer comes from the template's own source and its own
+        // renders, not from a guess about the program: a template that reads
+        // the option into a variable of its own still honors it.
+        template.honors_enable_thinking = template.probe_honors_enable_thinking(source);
+        Ok(template)
+    }
+
+    /// Whether the template honors the `enable_thinking` option.
+    ///
+    /// The answer comes from the template's own source and its own renders:
+    /// the source has to name the option, and the same conversation is
+    /// rendered with the option true and with the option false. The template
+    /// honors the option when the source names it and both renders succeed
+    /// and differ. A request that sets the option is refused when the
+    /// template does not honor it, instead of being silently ignored.
+    ///
+    /// Two limits: the probe renders a single user turn, so a template that
+    /// reads the option only on other turns, such as tool turns, is treated
+    /// as not honoring it; and a template that names the option without
+    /// using it and prints a clock that varies between renders reads as
+    /// honoring it.
+    #[must_use]
+    pub fn honors_enable_thinking(&self) -> bool {
+        self.honors_enable_thinking
+    }
+
+    /// Whether the template's own source and renders show that it honors the
+    /// option.
+    ///
+    /// The source has to name the option, and the probe renders one user
+    /// turn with the generation prompt, once with the option true and once
+    /// with the option false. The template honors the option when the source
+    /// names it and both renders succeed and differ. A render that fails
+    /// says nothing about the template, so a template whose probe render
+    /// fails does not honor the option.
+    fn probe_honors_enable_thinking(&self, source: &str) -> bool {
+        // A template that never names the option cannot honor it, whatever
+        // its renders print.
+        if !source.contains("enable_thinking") {
+            return false;
+        }
+        let messages = [ChatMessage::user("hello")];
+        let render = |thinking: bool| {
+            // The probe renders without the option check: a render that
+            // refuses the option would say nothing about the template.
+            self.render_unchecked(
+                &messages,
+                None,
+                ChatTemplateOptions {
+                    enable_thinking: Some(thinking),
+                },
+                true,
+                false,
+            )
+        };
+        let (Ok(enabled), Ok(disabled)) = (render(true), render(false)) else {
+            return false;
+        };
+        enabled != disabled
     }
 
     /// Render a conversation through the compiled template.
@@ -177,6 +243,27 @@ impl JinjaChatTemplate {
     }
 
     fn render_inner(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+        options: ChatTemplateOptions,
+        add_generation_prompt: bool,
+        none_tools: bool,
+    ) -> Result<String> {
+        if options.enable_thinking.is_some() && !self.honors_enable_thinking {
+            anyhow::bail!(
+                "the chat template does not use `enable_thinking`; the option is not supported"
+            );
+        }
+        self.render_unchecked(messages, tools, options, add_generation_prompt, none_tools)
+    }
+
+    /// Render a conversation without the option check.
+    ///
+    /// The probe of [`Self::honors_enable_thinking`] renders through this
+    /// path: a render that went through the check would refuse the option
+    /// before the template had a chance to show that it honors it.
+    fn render_unchecked(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[serde_json::Value]>,
@@ -231,6 +318,181 @@ impl JinjaChatTemplate {
             .into_text()
             .context("the rendered chat template is not valid UTF-8")
     }
+}
+
+/// Rewrite the transformers-only `{% generation %}` markers.
+///
+/// A transformers template marks the assistant's generated text with a
+/// `{% generation %}` block that MiniJinja cannot compile. The block becomes
+/// an `if true` block, so its content and its whitespace control survive the
+/// rewrite unchanged.
+///
+/// The rewrite touches neither a comment, nor an expression, nor a raw block:
+/// their text is literal. It renames only a tag whose first word is exactly
+/// `generation` or `endgeneration`, so a tag that merely starts with
+/// `generation` is a different tag.
+fn rewrite_generation_tags(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut index = 0;
+    while index < source.len() {
+        let tail = &source[index..];
+        let Some(offset) = tail.find('{') else {
+            out.push_str(tail);
+            break;
+        };
+        let start = index + offset;
+        out.push_str(&source[index..start]);
+        let tail = &source[start..];
+        if tail.starts_with("{#") {
+            // A comment is literal text.
+            let end = comment_end(tail).unwrap_or(tail.len());
+            out.push_str(&tail[..end]);
+            index = start + end;
+            continue;
+        }
+        if tail.starts_with("{{") {
+            // An expression is literal text: a string may hold any tag.
+            let end = expression_end(tail).unwrap_or(tail.len());
+            out.push_str(&tail[..end]);
+            index = start + end;
+            continue;
+        }
+        if tail.starts_with("{%") {
+            let Some(end) = tag_end(tail) else {
+                out.push_str(tail);
+                break;
+            };
+            let tag = &tail[..end];
+            index = start + end;
+            match tag_word(tag) {
+                "raw" => {
+                    // A raw block holds literal text until its end tag.
+                    out.push_str(tag);
+                    let block = &source[index..];
+                    if let Some(end) = raw_block_end(block) {
+                        out.push_str(&block[..end]);
+                        index += end;
+                    } else {
+                        out.push_str(block);
+                        index = source.len();
+                    }
+                }
+                "generation" => out.push_str(&rewrite_tag(tag, "if true")),
+                "endgeneration" => out.push_str(&rewrite_tag(tag, "endif")),
+                _ => out.push_str(tag),
+            }
+            continue;
+        }
+        // A lone brace is literal text.
+        out.push('{');
+        index = start + 1;
+    }
+    out
+}
+
+/// The end of the comment that starts `source`, including its `#}`.
+fn comment_end(source: &str) -> Option<usize> {
+    source[2..].find("#}").map(|end| end + 4)
+}
+
+/// The end of the tag that starts `source`, including its closing `%}`.
+///
+/// A `%}` inside a string literal does not end the tag.
+fn tag_end(source: &str) -> Option<usize> {
+    construct_end(source, b"%}")
+}
+
+/// The end of the expression that starts `source`, including its `}}`.
+fn expression_end(source: &str) -> Option<usize> {
+    construct_end(source, b"}}")
+}
+
+/// The end of the construct that starts `source`, including its closing
+/// delimiter.
+///
+/// A delimiter inside a string literal does not end the construct.
+fn construct_end(source: &str, close: &[u8]) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut index = 2;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    while index + 1 < bytes.len() {
+        let byte = bytes[index];
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+        } else if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+        } else if bytes[index..].starts_with(close) {
+            return Some(index + close.len());
+        }
+        index += 1;
+    }
+    None
+}
+
+/// The end of a raw block: the offset just after its `{% endraw %}` tag.
+///
+/// The text of a raw block is literal, so only its end tag ends it.
+fn raw_block_end(source: &str) -> Option<usize> {
+    let mut index = 0;
+    while let Some(offset) = source[index..].find("{%") {
+        let start = index + offset;
+        let end = tag_end(&source[start..])?;
+        if tag_word(&source[start..start + end]) == "endraw" {
+            return Some(start + end);
+        }
+        index = start + 2;
+    }
+    None
+}
+
+/// The first word of a tag, without its whitespace control characters.
+fn tag_word(tag: &str) -> &str {
+    let body = tag
+        .strip_prefix("{%")
+        .and_then(|body| body.strip_suffix("%}"))
+        .unwrap_or(tag);
+    let body = body.trim_start_matches(['-', '+']).trim_start();
+    // A tag may end with its whitespace-control marker, so `{% generation-%}`
+    // names the `generation` tag and not a word called `generation-`.
+    let body = match body.strip_suffix('-') {
+        Some(stripped) => stripped,
+        None => body.strip_suffix('+').unwrap_or(body),
+    };
+    body.split_whitespace().next().unwrap_or("")
+}
+
+/// One tag with a new body, keeping its whitespace control characters.
+///
+/// The trimming of a tag depends on the `-` and `+` markers around it, so a
+/// rewritten tag keeps them: `{%- generation -%}` becomes `{%- if true -%}`.
+fn rewrite_tag(tag: &str, replacement: &str) -> String {
+    let body = tag
+        .strip_prefix("{%")
+        .and_then(|body| body.strip_suffix("%}"))
+        .unwrap_or(tag);
+    let mut leading = "";
+    let mut trailing = "";
+    let mut rest = body;
+    if let Some(first) = rest.chars().next()
+        && (first == '-' || first == '+')
+    {
+        leading = &rest[..first.len_utf8()];
+        rest = &rest[first.len_utf8()..];
+    }
+    let rest = rest.trim_end();
+    if let Some(last) = rest.chars().last()
+        && (last == '-' || last == '+')
+    {
+        trailing = &rest[rest.len() - last.len_utf8()..];
+    }
+    format!("{{%{leading} {replacement} {trailing}%}}")
 }
 
 /// A buffer that refuses to grow past a limit.
@@ -1390,20 +1652,67 @@ mod tests {
 
     #[test]
     fn enable_thinking_is_visible_only_when_it_is_set() -> Result<()> {
-        let source = "{{ 'explicit' if enable_thinking is defined else 'default' }}";
+        // The template tells whether the option is there and what it says,
+        // so the variable is absent without the option and the two renders
+        // with it differ.
+        let source = "{{ 'explicit' if enable_thinking is defined else 'default' }}{{ 'on' if enable_thinking is defined and enable_thinking else 'off' }}";
         let template = JinjaChatTemplate::new(source, "", "")?;
         let unset = ChatTemplateOptions::default();
         assert_eq!(
             template.render(&[ChatMessage::user("hi")], None, &unset, true)?,
-            "default"
+            "defaultoff"
         );
-        for (thinking, expected) in [(false, "explicit"), (true, "explicit")] {
+        for (thinking, expected) in [(false, "explicitoff"), (true, "expliciton")] {
             let options = ChatTemplateOptions {
                 enable_thinking: Some(thinking),
             };
             assert_eq!(
                 template.render(&[ChatMessage::user("hi")], None, &options, true)?,
                 expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_that_only_asks_whether_the_option_is_defined_does_not_honor_it() -> Result<()> {
+        // The template asks whether the option is there, not what it says:
+        // both renders are the same, so the option changes nothing.
+        let source = "{{ 'set' if enable_thinking is defined else 'unset' }}";
+        let template = JinjaChatTemplate::new(source, "", "")?;
+        assert!(!template.honors_enable_thinking(), "{source}");
+        let options = ChatTemplateOptions {
+            enable_thinking: Some(false),
+        };
+        let error = template
+            .render(&[ChatMessage::user("hi")], None, &options, true)
+            .expect_err("the option must be refused");
+        assert!(
+            format!("{error:#}").contains("enable_thinking"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_whose_probe_render_fails_does_not_honor_the_option() -> Result<()> {
+        // The template raises on one of the two renders: the failed render
+        // says nothing about the option, so the template does not honor it.
+        for source in [
+            "{% if enable_thinking %}{{ raise_exception('thinking is not allowed') }}{% else %}plain{% endif %}",
+            "{% if enable_thinking %}plain{% else %}{{ raise_exception('thinking is required') }}{% endif %}",
+        ] {
+            let template = JinjaChatTemplate::new(source, "", "")?;
+            assert!(!template.honors_enable_thinking(), "{source}");
+            let options = ChatTemplateOptions {
+                enable_thinking: Some(false),
+            };
+            let error = template
+                .render(&[ChatMessage::user("hi")], None, &options, true)
+                .expect_err("the option must be refused");
+            assert!(
+                format!("{error:#}").contains("enable_thinking"),
+                "{error:#}"
             );
         }
         Ok(())
@@ -1685,6 +1994,231 @@ mod tests {
             format!("{error:#}").contains("recursion limit"),
             "{error:#}"
         );
+        Ok(())
+    }
+
+    /// The path of the pinned SmolLM3 template, the real template that
+    /// carries the transformers-only generation markers.
+    const SMOLLM3_TEMPLATE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/chat_templates/templates/pinned/smollm3-official-system-override-text-subset.jinja"
+    );
+
+    #[test]
+    fn the_generation_markers_of_the_real_template_compile_and_render() -> Result<()> {
+        let source = std::fs::read_to_string(SMOLLM3_TEMPLATE)?;
+        let template = JinjaChatTemplate::new(&source, "", "")?;
+        let options = ChatTemplateOptions::default();
+        let rendered = template.render(&[ChatMessage::user("hello")], None, &options, true)?;
+        assert!(rendered.contains("hello"), "{rendered}");
+        assert!(rendered.contains("assistant"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_generation_markers_keep_their_whitespace_control() {
+        assert_eq!(rewrite_generation_tags("{% generation %}"), "{% if true %}");
+        assert_eq!(
+            rewrite_generation_tags("{% endgeneration %}"),
+            "{% endif %}"
+        );
+        assert_eq!(
+            rewrite_generation_tags("{%- generation -%}"),
+            "{%- if true -%}"
+        );
+        assert_eq!(
+            rewrite_generation_tags("{%- endgeneration -%}"),
+            "{%- endif -%}"
+        );
+        assert_eq!(
+            rewrite_generation_tags("{%+ generation +%}"),
+            "{%+ if true +%}"
+        );
+        assert_eq!(
+            rewrite_generation_tags("{% generation-%}"),
+            "{% if true -%}"
+        );
+        assert_eq!(
+            rewrite_generation_tags("{%-generation-%}"),
+            "{%- if true -%}"
+        );
+        assert_eq!(
+            rewrite_generation_tags("{%- endgeneration-%}"),
+            "{%- endif -%}"
+        );
+        assert_eq!(
+            rewrite_generation_tags("{% generation_x-%}"),
+            "{% generation_x-%}"
+        );
+    }
+
+    #[test]
+    fn a_rewritten_marker_renders_like_the_block_it_becomes() -> Result<()> {
+        let rewritten =
+            JinjaChatTemplate::new("a {%- generation -%}b{%- endgeneration -%} c", "", "")?;
+        let explicit = JinjaChatTemplate::new("a {%- if true -%}b{%- endif -%} c", "", "")?;
+        let options = ChatTemplateOptions::default();
+        let messages = [ChatMessage::user("hi")];
+        assert_eq!(
+            rewritten.render(&messages, None, &options, true)?,
+            explicit.render(&messages, None, &options, true)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_comment_a_raw_block_and_another_tag_keep_their_text() {
+        assert_eq!(
+            rewrite_generation_tags("{# {% generation %} #}"),
+            "{# {% generation %} #}"
+        );
+        assert_eq!(
+            rewrite_generation_tags("{% raw %}{% generation %}{% endgeneration %}{% endraw %}"),
+            "{% raw %}{% generation %}{% endgeneration %}{% endraw %}"
+        );
+        assert_eq!(
+            rewrite_generation_tags("{% generation_x %}"),
+            "{% generation_x %}"
+        );
+        assert_eq!(
+            rewrite_generation_tags("{% endgeneration_x %}"),
+            "{% endgeneration_x %}"
+        );
+        assert_eq!(
+            rewrite_generation_tags("{{ '{% generation %}' }}"),
+            "{{ '{% generation %}' }}"
+        );
+    }
+
+    #[test]
+    fn a_template_that_uses_the_option_receives_it() -> Result<()> {
+        let source = "{{ enable_thinking }}";
+        let template = JinjaChatTemplate::new(source, "", "")?;
+        assert!(template.honors_enable_thinking());
+        let options = ChatTemplateOptions {
+            enable_thinking: Some(false),
+        };
+        assert_eq!(
+            template.render(&[ChatMessage::user("hi")], None, &options, true)?,
+            "False"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_that_reads_the_option_into_a_variable_of_its_own_honors_it() -> Result<()> {
+        // The static analysis of the program cannot see that this template
+        // reads the option: it assigns the target before it visits the
+        // expression. The renders of the template show that it honors it.
+        let source = "{% set enable_thinking = enable_thinking | default(true) %}{% if enable_thinking %}<think>{% endif %}";
+        let template = JinjaChatTemplate::new(source, "", "")?;
+        assert!(template.honors_enable_thinking(), "{source}");
+        let options = ChatTemplateOptions {
+            enable_thinking: Some(false),
+        };
+        assert_eq!(
+            template.render(&[ChatMessage::user("hi")], None, &options, true)?,
+            ""
+        );
+        let options = ChatTemplateOptions {
+            enable_thinking: Some(true),
+        };
+        assert_eq!(
+            template.render(&[ChatMessage::user("hi")], None, &options, true)?,
+            "<think>"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_that_reads_the_option_in_an_expression_honors_it() -> Result<()> {
+        let source = "{{ enable_thinking if enable_thinking is defined else true }}";
+        let template = JinjaChatTemplate::new(source, "", "")?;
+        assert!(template.honors_enable_thinking(), "{source}");
+        let options = ChatTemplateOptions {
+            enable_thinking: Some(false),
+        };
+        assert_eq!(
+            template.render(&[ChatMessage::user("hi")], None, &options, true)?,
+            "False"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_that_prints_the_same_text_either_way_does_not_honor_the_option() -> Result<()> {
+        // The template reads the option, but the renders are the same, so
+        // the option changes nothing.
+        let source = "{{ 'same' if enable_thinking is defined else 'same' }}";
+        let template = JinjaChatTemplate::new(source, "", "")?;
+        assert!(!template.honors_enable_thinking(), "{source}");
+        let options = ChatTemplateOptions {
+            enable_thinking: Some(false),
+        };
+        let error = template
+            .render(&[ChatMessage::user("hi")], None, &options, true)
+            .expect_err("the option must be refused");
+        assert!(
+            format!("{error:#}").contains("enable_thinking"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_that_prints_a_clock_does_not_honor_the_option() -> Result<()> {
+        // The template never names the option, so the two renders of the
+        // probe may differ by the clock alone. The template does not honor
+        // the option, whatever the clock prints.
+        let source = "{{ strftime_now('%f') }}{{ messages[0].content }}";
+        let template = JinjaChatTemplate::new(source, "", "")?;
+        assert!(!template.honors_enable_thinking(), "{source}");
+        let options = ChatTemplateOptions {
+            enable_thinking: Some(false),
+        };
+        let error = template
+            .render(&[ChatMessage::user("hi")], None, &options, true)
+            .expect_err("the option must be refused");
+        assert!(
+            format!("{error:#}").contains("enable_thinking"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_template_that_never_uses_the_option_refuses_it() -> Result<()> {
+        let source = "{{ messages[0].content }}";
+        let template = JinjaChatTemplate::new(source, "", "")?;
+        assert!(!template.honors_enable_thinking());
+        let options = ChatTemplateOptions {
+            enable_thinking: Some(false),
+        };
+        let error = template
+            .render(&[ChatMessage::user("hi")], None, &options, true)
+            .expect_err("the option must be refused");
+        assert!(
+            format!("{error:#}").contains("enable_thinking"),
+            "{error:#}"
+        );
+        // The option the template never reads changes nothing else.
+        let unset = ChatTemplateOptions::default();
+        assert_eq!(
+            template.render(&[ChatMessage::user("hi")], None, &unset, true)?,
+            "hi"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_mention_of_the_option_in_a_comment_or_a_string_does_not_count() -> Result<()> {
+        for source in [
+            "{# enable_thinking #}{{ messages[0].content }}",
+            "{{ 'enable_thinking' }}{{ messages[0].content }}",
+        ] {
+            let template = JinjaChatTemplate::new(source, "", "")?;
+            assert!(!template.honors_enable_thinking(), "{source}");
+        }
         Ok(())
     }
 

@@ -1219,6 +1219,23 @@ fn refresh_prefix_cache_snapshot(
     let _ = sample_prefix_cache_snapshot(model, shared, active_sequences, observation);
 }
 
+/// The startup probe of the server-wide chat template options.
+///
+/// A server-wide option that the model's own template cannot honor stops the
+/// server before it serves a request: a template whose renders do not differ
+/// between true and false refuses the option instead of ignoring it.
+fn check_server_chat_template_defaults(
+    adapter: &dyn crate::models::ModelAdapter,
+    defaults: ChatTemplateOptions,
+) -> Result<()> {
+    if defaults.is_default() {
+        return Ok(());
+    }
+    adapter
+        .format_chat_messages_with(&[ChatMessage::user("health check")], defaults)
+        .map(|_| ())
+}
+
 /// Whether the model's chat template leaves the reasoning block open.
 ///
 /// A template that ends its prompt inside `<think>` makes every token the
@@ -1292,12 +1309,10 @@ fn worker_main(
             return;
         }
     };
-    if !scheduler_config.chat_template_defaults.is_default()
-        && let Err(error) = runtime.adapter.format_chat_messages_with(
-            &[ChatMessage::user("health check")],
-            scheduler_config.chat_template_defaults,
-        )
-    {
+    if let Err(error) = check_server_chat_template_defaults(
+        runtime.adapter.as_ref(),
+        scheduler_config.chat_template_defaults,
+    ) {
         status.store(EngineStatus::Stopped as u8, Ordering::Release);
         let _ = ready.send(Err(format!(
             "model cannot honor the server chat template options: {error:#}"
@@ -4243,6 +4258,49 @@ mod tests {
         raw_job.request.input = EngineInput::RawPrompt("a b".to_owned());
         assert!(prepare_request(&runtime, &mut raw_job, disabled).is_some());
         Ok(())
+    }
+
+    #[test]
+    fn the_startup_probe_refuses_options_the_template_cannot_honor() {
+        let spec = RuntimeSpec {
+            vocab_size: 6,
+            max_context: 64,
+            stop_token_ids: vec![5],
+        };
+        let disabled = ChatTemplateOptions {
+            enable_thinking: Some(false),
+        };
+        // A generic template that never reads the option refuses it, so a
+        // server that asks for it fails to start.
+        let adapter = crate::models::with_jinja_fallback(
+            Box::new(FakeAdapter { spec: spec.clone() }),
+            crate::models::GgufPromptTokens {
+                chat_template: Some("{{ messages[0].content }}"),
+                ..Default::default()
+            },
+        );
+        let error = check_server_chat_template_defaults(adapter.as_ref(), disabled)
+            .expect_err("the startup probe must refuse the option");
+        assert!(
+            format!("{error:#}").contains("enable_thinking"),
+            "{error:#}"
+        );
+        // A template that reads the option honors it.
+        let adapter = crate::models::with_jinja_fallback(
+            Box::new(FakeAdapter { spec: spec.clone() }),
+            crate::models::GgufPromptTokens {
+                chat_template: Some(
+                    "{{ messages[0].content }}{{ 'thinking' if enable_thinking else '' }}",
+                ),
+                ..Default::default()
+            },
+        );
+        assert!(check_server_chat_template_defaults(adapter.as_ref(), disabled).is_ok());
+        // Server-wide defaults that keep the template default need no probe.
+        assert!(
+            check_server_chat_template_defaults(adapter.as_ref(), ChatTemplateOptions::default())
+                .is_ok()
+        );
     }
 
     #[test]

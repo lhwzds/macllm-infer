@@ -62,7 +62,7 @@ cargo build --release
 请显式传入 `--raw-prompt`。MacLLM 不执行任意 Jinja，也不会静默猜测模板。
 
 面向 agent 客户端时，`serve --default-max-completion-tokens N` 设置未指定输出长度的请求的
-默认上限（默认 128），`--disable-thinking` 以 `enable_thinking=false` 渲染 Qwen3 prompt；
+默认上限（默认 128），`--disable-thinking` 以 `enable_thinking=false` 渲染模板使用该选项的 prompt；
 单个请求也可以发送 `chat_template_kwargs: {"enable_thinking": false}`。`--sampling-profile qwen3`
 按每个请求的 thinking 模式，为未指定的 `temperature`/`top_p`（以及 top-k）填入 Qwen3 推荐值
 （thinking 为 0.6/0.95/20，否则为 0.7/0.8/20）。

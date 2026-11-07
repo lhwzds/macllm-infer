@@ -472,8 +472,8 @@ struct ServeArgs {
     #[arg(long, default_value_t = NonZeroUsize::new(ServerOptions::DEFAULT_MAX_COMPLETION_TOKENS).unwrap())]
     default_max_completion_tokens: NonZeroUsize,
     /// Render chat and tool prompts with `enable_thinking=false` unless a
-    /// request sets `chat_template_kwargs.enable_thinking`. Only Qwen3, Qwen3.5 and
-    /// `Qwen3MoE` templates support it; other models fail to start.
+    /// request sets `chat_template_kwargs.enable_thinking`. Needs a chat
+    /// template that uses `enable_thinking`; startup fails otherwise.
     #[arg(long)]
     disable_thinking: bool,
     /// Sampling defaults for omitted temperature, `top_p` and `presence_penalty`

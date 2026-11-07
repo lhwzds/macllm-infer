@@ -163,14 +163,19 @@ mod tests {
             adapter.format_chat_messages(&[ChatMessage::user("hello")])?,
             "<bos>hello<eos>"
         );
-        assert_eq!(
-            adapter.format_chat_messages_with(
+        // The template never reads the option, so a request that sets it is
+        // refused instead of silently ignored.
+        let error = adapter
+            .format_chat_messages_with(
                 &[ChatMessage::user("hello")],
                 crate::chat::ChatTemplateOptions {
-                    enable_thinking: Some(false)
+                    enable_thinking: Some(false),
                 },
-            )?,
-            "<bos>hello<eos>"
+            )
+            .expect_err("the option must be refused");
+        assert!(
+            format!("{error:#}").contains("enable_thinking"),
+            "{error:#}"
         );
         let prompt = crate::agent::AgentPrompt {
             messages: vec![crate::agent::AgentMessage::User {

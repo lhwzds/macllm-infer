@@ -2548,16 +2548,22 @@ mod tests {
                 return Err(error);
             }
             let generic_error = self.generic_fallback.as_ref().and_then(|fallback| {
-                if let EngineInput::Agent { prompt, .. } = &request.input {
-                    fallback
+                let failure = |error: anyhow::Error| EnginePreflightError {
+                    // The engine reports the whole error chain, so the client
+                    // sees the reason the template refused the request.
+                    message: format!("{error:#}"),
+                    kind: EngineFailureKind::InvalidRequest,
+                };
+                match &request.input {
+                    EngineInput::Agent { prompt, .. } => fallback
                         .format_agent_prompt(prompt, request.chat_template)
                         .err()
-                        .map(|error| EnginePreflightError {
-                            message: error.to_string(),
-                            kind: EngineFailureKind::InvalidRequest,
-                        })
-                } else {
-                    None
+                        .map(failure),
+                    EngineInput::Chat(messages) => fallback
+                        .format_chat_messages(messages, request.chat_template)
+                        .err()
+                        .map(failure),
+                    _ => None,
                 }
             });
             *self.last_request.lock().unwrap() = Some(request);
@@ -2716,6 +2722,8 @@ mod tests {
                 0 => tool["function"]["description"] = json!(llama),
                 1 => tool["function"]["description"] = json!(mistral),
                 2 => {
+                    // A tool-format marker is ordinary text now, so the
+                    // declaration is accepted instead of refused.
                     tool["function"]["parameters"]["properties"] =
                         json!({"command":{"type":"string"}, "[CALL_ID]key":{"type":"string"}});
                 }
@@ -2736,6 +2744,18 @@ mod tests {
                 })))
                 .await
                 .unwrap();
+            if case == 2 {
+                // `[CALL_ID]` is a tool-format marker, not a turn delimiter, so
+                // it no longer reserves anything.
+                assert_ne!(response.status(), StatusCode::BAD_REQUEST, "case {case}");
+                assert!(
+                    !body_text(response)
+                        .await
+                        .contains("reserved native control"),
+                    "case {case}"
+                );
+                continue;
+            }
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "case {case}");
             assert!(
                 body_text(response)
@@ -2744,6 +2764,77 @@ mod tests {
                 "case {case}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_template_that_never_reads_the_option_refuses_the_request() {
+        // The generic path refuses a template option its template never
+        // reads, so the request never reaches the model.
+        let fallback = crate::models::jinja_fallback(
+            "test",
+            crate::models::GenericPaths {
+                chat: true,
+                agent: true,
+            },
+            crate::models::GgufPromptTokens {
+                chat_template: Some("{{ messages[0].content }}"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut engine = FakeEngine::healthy(vec![]);
+        engine.generic_fallback = Some(fallback);
+        let response = router(Arc::new(engine))
+            .oneshot(chat_request(&json!({
+                "model":"test-model",
+                "messages":[{"role":"user","content":"go"}],
+                "chat_template_kwargs":{"enable_thinking": false}
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("enable_thinking"));
+    }
+
+    #[tokio::test]
+    async fn a_tool_format_marker_alone_is_not_a_control_injection() {
+        // The generic path reserves the strings that can forge a turn of the
+        // render. A tool-format marker is ordinary text, so a declaration
+        // that holds one is not a control injection.
+        let tokens = vec!["[INST]".to_owned()];
+        let fallback = crate::models::jinja_fallback(
+            "test",
+            crate::models::GenericPaths {
+                chat: true,
+                agent: true,
+            },
+            crate::models::GgufPromptTokens {
+                chat_template: Some("[TOOL_CALLS]"),
+                special_tokens: &tokens,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut tool = shell_tool();
+        tool["function"]["parameters"]["properties"] =
+            json!({"command":{"type":"string"}, "[CALL_ID]key":{"type":"string"}});
+        let mut engine = FakeEngine::healthy(vec![]);
+        engine.metadata.tool_call_format = Some(ToolCallFormat::MistralJson);
+        engine.generic_fallback = Some(fallback);
+        let response = router(Arc::new(engine))
+            .oneshot(chat_request(&json!({
+                "model":"test-model",
+                "messages":json!([{"role":"user","content":"go"}]),
+                "tools":[tool]
+            })))
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !body_text(response)
+                .await
+                .contains("reserved native control")
+        );
     }
 
     #[tokio::test]

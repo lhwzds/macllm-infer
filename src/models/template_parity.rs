@@ -122,6 +122,9 @@ mod parity {
         user: String,
         thinking: Vec<String>,
         agent: bool,
+        /// The effective policy of the checkpoint's tokenizer: whether it
+        /// adds its BOS token to every prompt.
+        add_bos: bool,
     }
 
     /// The variant table of the measurement.
@@ -326,12 +329,18 @@ mod parity {
                     .expect("a user-defined token is added");
             }
         }
-        let special = prompt_control_tokens(&tokenizer, Some(&source));
+        let control = prompt_control_tokens(&tokenizer);
+        // The `add_bos` field of the variant table is the effective policy of
+        // the checkpoint's tokenizer: gemma and gemma2 had no local GGUF, so
+        // their `true` is the SentencePiece default, while the others come
+        // from files.
         let tokens = GgufPromptTokens {
             chat_template: Some(&source),
             bos_token: Some(&variant.bos),
             eos_token: Some(&variant.eos),
-            special_tokens: &special,
+            special_tokens: &control.special,
+            marker_tokens: &control.markers,
+            add_bos_token: variant.add_bos,
         };
         let mut pinned = adapter(variant, Some(&source))?;
         // The GGUF loader attaches the prompt tokens, so the pinned arm sees it.
@@ -469,8 +478,8 @@ mod parity {
     }
 
     /// The SmolLM3 template differs from its pinned renderer only by its
-    /// generation markers: the engine renders the template without the
-    /// markers, which print nothing, and the two renders agree.
+    /// generation markers: the engine compiles the markers as ordinary
+    /// blocks, which print nothing, and the two renders agree.
     #[test]
     fn the_smollm3_template_differs_from_its_pinned_renderer_only_by_its_generation_markers()
     -> Result<()> {
@@ -478,12 +487,7 @@ mod parity {
         let variant = variants.variants.iter().find(|v| v.family == "smollm3");
         let variant = variant.context("the variant table names no SmolLM3 variant")?;
         let source = template_source(variant)?;
-        let compiled = JinjaChatTemplate::new(&source, &variant.bos, &variant.eos);
-        assert!(compiled.is_err(), "the engine refuses the real source");
-        let stripped = source
-            .replace("{% generation %}", "")
-            .replace("{% endgeneration %}", "");
-        let template = JinjaChatTemplate::new(&stripped, &variant.bos, &variant.eos)?;
+        let template = JinjaChatTemplate::new(&source, &variant.bos, &variant.eos)?;
         let adapter = adapter(variant, Some(&source))?;
         let options = ChatTemplateOptions::default();
         let cases = cases()?;

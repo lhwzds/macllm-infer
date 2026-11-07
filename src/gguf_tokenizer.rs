@@ -157,6 +157,19 @@ pub struct EmbeddedBpeTokenizer {
 }
 
 impl EmbeddedBpeTokenizer {
+    /// The effective policy of the tokenizer's BOS token.
+    ///
+    /// The metadata key is optional: a profile that adds its BOS token by
+    /// default keeps that default when the key is missing. The policy is the
+    /// one the tokenizer itself applies, so the prompt path and the tokenizer
+    /// agree on every checkpoint.
+    pub fn effective_add_bos_token(&self) -> Result<bool> {
+        let profile = BpeProfile::from_metadata(&self.model, &self.pre_tokenizer)?;
+        Ok(self
+            .add_bos_token
+            .unwrap_or_else(|| profile.default_add_bos()))
+    }
+
     pub fn build(self) -> Result<Tokenizer> {
         let profile = BpeProfile::from_metadata(&self.model, &self.pre_tokenizer)?;
         ensure!(
@@ -267,9 +280,7 @@ impl EmbeddedBpeTokenizer {
     }
 
     fn special_token_ids(&self, profile: BpeProfile) -> Result<(Option<u32>, Option<u32>)> {
-        let prepend_beginning = self
-            .add_bos_token
-            .unwrap_or_else(|| profile.default_add_bos());
+        let prepend_beginning = self.effective_add_bos_token()?;
         let append_ending = self.add_eos_token.unwrap_or(false);
         ensure!(
             matches!(profile, BpeProfile::Llama3 | BpeProfile::Lfm2)
@@ -316,6 +327,16 @@ pub struct EmbeddedSentencePieceTokenizer {
 }
 
 impl EmbeddedSentencePieceTokenizer {
+    /// The effective policy of the tokenizer's BOS token.
+    ///
+    /// The metadata key is optional: a `SentencePiece` tokenizer adds its BOS
+    /// token to every prompt, and keeps that default when the key is
+    /// missing.
+    #[must_use]
+    pub fn effective_add_bos_token(&self) -> bool {
+        self.add_bos_token.unwrap_or(true)
+    }
+
     pub fn build(self) -> Result<Tokenizer> {
         let unknown_index = self.validate_profile()?;
 
@@ -436,8 +457,7 @@ impl EmbeddedSentencePieceTokenizer {
 
     fn special_token_ids(&self) -> Result<(Option<u32>, Option<u32>)> {
         let beginning = self
-            .add_bos_token
-            .unwrap_or(true)
+            .effective_add_bos_token()
             .then(|| {
                 self.bos_token_id
                     .context("llama/default add_bos_token=true requires a BOS token ID")

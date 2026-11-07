@@ -156,6 +156,19 @@ pub trait ModelAdapter {
     }
 }
 
+/// The markers the template-derived reserved list never holds.
+///
+/// The named list holds the markers of the reasoning and the tool-call
+/// formats. They stay ordinary text by decision: text and reasoning that
+/// mention them keep working, and user text that contains one tokenizes to
+/// the same token the template prints.
+///
+/// The list applies to the reserved list the template derives, which the chat
+/// route uses. The agent route also refuses the tool-call markers of this list
+/// on its own: they are part of NATIVE_CONTROL_STRINGS in
+/// crates/macllm-chat/src/agent.rs.
+const NAMED_MARKERS: &[&str] = &["<think>", "</think>", "<tool_call>", "</tool_call>"];
+
 /// The prompt tokens a GGUF checkpoint embeds for chat rendering: the Jinja
 /// program in `tokenizer.chat_template` plus the special tokens it may print.
 ///
@@ -166,7 +179,25 @@ pub struct GgufPromptTokens<'a> {
     pub chat_template: Option<&'a str>,
     pub bos_token: Option<&'a str>,
     pub eos_token: Option<&'a str>,
+    /// The tokenizer's special tokens: the ones it marks special. The
+    /// generic path reserves them all.
     pub special_tokens: &'a [String],
+    /// The tokenizer's marker-like added tokens: every added token that
+    /// looks like a marker.
+    ///
+    /// The generic path reserves every one of them but two kinds. The
+    /// markers of NAMED_MARKERS stay ordinary text by decision. A plain
+    /// markup tag stays ordinary text only when there is a valid template,
+    /// when the template's own source does not name it and when no plain
+    /// render of the template prints it; it is reserved otherwise, so an
+    /// invalid template and a template that fails to render its probe keep
+    /// it reserved. Every other marker shape is reserved without looking at
+    /// the template.
+    pub marker_tokens: &'a [String],
+    /// The effective policy of the tokenizer: whether it adds its BOS token
+    /// to every prompt. The tokenizer owns the policy, so a checkpoint whose
+    /// metadata does not name it keeps the default of its own profile.
+    pub add_bos_token: bool,
 }
 
 /// A checkpoint's embedded template, compiled for the generic renderer.
@@ -180,7 +211,12 @@ pub(crate) struct JinjaChatFallback {
     family: &'static str,
     template: std::result::Result<JinjaChatTemplate, String>,
     format: Option<ToolCallFormat>,
-    special_tokens: Vec<String>,
+    /// The strings an untrusted request must not carry.
+    reserved: Vec<String>,
+    /// The tokenizer's BOS string, empty when the checkpoint declares none.
+    bos_token: String,
+    /// Whether the tokenizer adds its BOS token to every prompt.
+    add_bos_token: bool,
 }
 
 impl JinjaChatFallback {
@@ -203,8 +239,7 @@ impl JinjaChatFallback {
             "forced or required tool choice is unsupported for generic templates"
         );
         prompt.validate_generic()?;
-        let markers = self.format.unwrap().markers();
-        prompt.reject_generic_controls(markers, &self.special_tokens)?;
+        prompt.reject_generic_controls(&self.reserved)?;
         let messages: Vec<_> = prompt
             .messages
             .iter()
@@ -268,7 +303,8 @@ impl JinjaChatFallback {
                 })
             })
             .collect();
-        self.template
+        let rendered = self
+            .template
             .as_ref()
             .map_err(|error| anyhow::anyhow!("{error}"))?
             .render_agent(
@@ -276,7 +312,28 @@ impl JinjaChatFallback {
                 matches!(prompt.directive, AgentDirective::Auto).then_some(&tools),
                 &options,
                 true,
-            )
+            )?;
+        Ok(self.with_bos_token(rendered))
+    }
+
+    /// The prompt the tokenizer's own BOS policy expects.
+    ///
+    /// A tokenizer that adds its BOS token to every prompt needs the rendered
+    /// prompt to start with it. A render that already carries the token
+    /// keeps its bytes, whitespace before the token included: a template may
+    /// print whitespace before its own BOS token, and the render carries it
+    /// then.
+    fn with_bos_token(&self, rendered: String) -> String {
+        if !self.add_bos_token || self.bos_token.is_empty() {
+            return rendered;
+        }
+        if rendered.trim_start().starts_with(&self.bos_token) {
+            return rendered;
+        }
+        let mut prompt = String::with_capacity(rendered.len() + self.bos_token.len());
+        prompt.push_str(&self.bos_token);
+        prompt.push_str(&rendered);
+        prompt
     }
 
     /// Render a validated chat history through the embedded template.
@@ -290,9 +347,10 @@ impl JinjaChatFallback {
     ) -> Result<String> {
         validate_chat_messages(messages)?;
         for message in messages {
-            reject_generic_content(&message.content, self.format, &self.special_tokens)?;
+            reject_generic_content(&message.content, &self.reserved)?;
         }
-        self.template
+        let rendered = self
+            .template
             .as_ref()
             .map_err(|error| anyhow::anyhow!("{error}"))?
             .render(messages, None, &options, true)
@@ -301,25 +359,117 @@ impl JinjaChatFallback {
                     "the {} chat template could not render the conversation",
                     self.family
                 )
-            })
+            })?;
+        Ok(self.with_bos_token(rendered))
     }
 }
 
-fn reject_generic_content(
-    content: &str,
-    format: Option<ToolCallFormat>,
-    tokens: &[String],
-) -> Result<()> {
-    for control in format
-        .into_iter()
-        .flat_map(|format| format.markers().iter().copied())
-        .chain(tokens.iter().map(String::as_str))
-    {
+fn reject_generic_content(content: &str, reserved: &[String]) -> Result<()> {
+    for control in reserved.iter().map(String::as_str) {
         if !control.is_empty() && content.contains(control) {
             anyhow::bail!("content contains reserved native control string `{control}`");
         }
     }
     Ok(())
+}
+
+/// Whether a marker-shaped token is a plain markup tag.
+///
+/// A plain markup tag is an opening angle bracket, an optional slash, one or
+/// more ASCII lowercase letters or digits, and a closing angle bracket.
+/// Nothing else belongs to the shape: a name with an underscore, with a bar
+/// or with an upper case letter is a marker of its own kind.
+fn is_plain_markup_tag(token: &str) -> bool {
+    let Some(body) = token.strip_prefix('<') else {
+        return false;
+    };
+    let Some(body) = body.strip_suffix('>') else {
+        return false;
+    };
+    let body = body.strip_prefix('/').unwrap_or(body);
+    !body.is_empty()
+        && body
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+/// The marker-like tokens the generic path reserves.
+///
+/// A marker-like token is reserved when a client that forges one would write
+/// a part of the prompt of its own. Real tokenizers hold ordinary HTML tags
+/// as added tokens: Gemma 3 holds dozens of them, a table tag and a code tag
+/// among them, and text that contains one must keep working. A token shaped
+/// like a plain markup tag is therefore reserved only when the template's
+/// source names it or when a plain render of the template prints it. The
+/// source counts, so a mention of the tag in a template comment reserves it
+/// as well; that fails closed.
+///
+/// Every other marker shape is reserved without looking at the template, so
+/// a template cannot hide one by assembling it from pieces or by printing it
+/// only on some turns.
+///
+/// The markers of the named list are never reserved: that is the decision
+/// stated on NAMED_MARKERS.
+///
+/// The probe renders a plain conversation without a generation prompt: three
+/// turns of plain text, and the same conversation with a plain system turn
+/// in front of it. A template that refuses a system message cannot print
+/// its system markers, so the second render is skipped when it fails.
+///
+/// A template that cannot render the probe keeps every plain markup tag
+/// reserved.
+///
+/// One limit remains: a turn marker shaped like a plain markup tag, assembled
+/// from pieces and printed only on a conditional turn, is not reserved.
+fn reserved_marker_tokens(
+    template: Option<&JinjaChatTemplate>,
+    source: &str,
+    marker_tokens: &[String],
+) -> Vec<String> {
+    let options = ChatTemplateOptions::default();
+    let plain = [
+        ChatMessage::user("hello"),
+        ChatMessage::assistant("hi"),
+        ChatMessage::user("again"),
+    ];
+    let with_system = [
+        ChatMessage::system("hello"),
+        ChatMessage::user("hello"),
+        ChatMessage::assistant("hi"),
+        ChatMessage::user("again"),
+    ];
+    // The renders of the probe, when the template renders them. A template
+    // that cannot render the probe keeps every plain markup tag reserved.
+    let probe = template.and_then(|template| {
+        let first = template.render(&plain, None, &options, false).ok()?;
+        // A template that refuses a system message cannot print a system
+        // marker, so the second render is skipped when it fails.
+        let second = template.render(&with_system, None, &options, false).ok();
+        Some((first, second))
+    });
+    marker_tokens
+        .iter()
+        .filter(|marker| !NAMED_MARKERS.contains(&marker.as_str()))
+        .filter(|marker| {
+            // Every marker shape but a plain markup tag is reserved without
+            // looking at the template.
+            if !is_plain_markup_tag(marker.as_str()) {
+                return true;
+            }
+            // A plain markup tag is reserved when the template's own source
+            // names it or a plain render prints it. A template that cannot
+            // render the probe keeps it reserved.
+            let Some((first, second)) = probe.as_ref() else {
+                return true;
+            };
+            source.contains(marker.as_str())
+                || first.contains(marker.as_str())
+                || second
+                    .as_ref()
+                    .is_some_and(|render| render.contains(marker.as_str()))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Resolve the chat prompt path of a checkpoint and compile the generic
@@ -359,11 +509,29 @@ pub(crate) fn jinja_fallback(
     .map_err(|error| format!("the {family} chat template is not a valid Jinja program: {error:#}"));
     let format = tool_format::detect(source);
     eprintln!("tool call format: family={family} format={format:?}");
+    // The strings the generic path refuses in untrusted content: the
+    // tokenizer's special tokens, and the marker-like tokens of the
+    // tokenizer that the rule of `reserved_marker_tokens` reserves. That
+    // rule keeps the markers of NAMED_MARKERS ordinary, reserves every
+    // marker shape but a plain markup tag without looking at the template,
+    // and reserves a plain markup tag when the template's own source names
+    // it, when a plain render of the template prints it, or when there is
+    // no valid template or the probe render fails. A client that forges one
+    // of them would write a part of the prompt of its own.
+    let markers = reserved_marker_tokens(template.as_ref().ok(), source, tokens.marker_tokens);
+    let mut reserved = tokens.special_tokens.to_vec();
+    for token in markers {
+        if !reserved.contains(&token) {
+            reserved.push(token);
+        }
+    }
     Some(JinjaChatFallback {
         family,
         template,
         format,
-        special_tokens: tokens.special_tokens.to_vec(),
+        reserved,
+        bos_token: tokens.bos_token.unwrap_or_default().to_owned(),
+        add_bos_token: tokens.add_bos_token,
     })
 }
 
@@ -708,7 +876,7 @@ mod generic_agent_tests {
     use crate::agent::{AgentDirective, AgentMessage, ToolDefinition};
 
     #[test]
-    fn generic_rejects_markers_and_tokenizer_tokens_and_omits_tools() {
+    fn generic_omits_tools_and_reserves_only_the_control_strings() {
         for (source, marker) in [
             ("<tool_call> \"name\": \"arguments\":", "<tool_call>"),
             ("<tool_call> <function=", "<function="),
@@ -720,7 +888,7 @@ mod generic_agent_tests {
             let template = format!(
                 "{{# {source} #}}{{% if tools is not none %}}present{{% else %}}absent{{% endif %}}"
             );
-            let special = vec!["<|eot_id|>".to_owned()];
+            let special = vec!["<|endoftext|>".to_owned()];
             let fallback = jinja_fallback(
                 "test",
                 GenericPaths {
@@ -747,16 +915,37 @@ mod generic_agent_tests {
                     .unwrap(),
                 "absent"
             );
-            for invalid in [marker, "<|eot_id|>"] {
-                prompt.messages = vec![AgentMessage::User {
-                    content: invalid.into(),
-                }];
-                assert!(
-                    fallback
-                        .format_agent_prompt(&prompt, ChatTemplateOptions::default())
-                        .is_err()
-                );
-            }
+            // A tool-format marker is ordinary text: the generic path
+            // reserves only the strings that can forge a turn of the render.
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user(marker)],
+                        ChatTemplateOptions::default()
+                    )
+                    .is_ok(),
+                "{marker}"
+            );
+            // The tokenizer's own special tokens stay reserved.
+            let reserved = "<|endoftext|>";
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user(reserved)],
+                        ChatTemplateOptions::default()
+                    )
+                    .is_err(),
+                "{reserved}"
+            );
+            prompt.messages = vec![AgentMessage::User {
+                content: reserved.into(),
+            }];
+            assert!(
+                fallback
+                    .format_agent_prompt(&prompt, ChatTemplateOptions::default())
+                    .is_err(),
+                "{reserved}"
+            );
         }
     }
 
@@ -944,6 +1133,710 @@ mod generic_agent_tests {
                 {"role":"tool", "content":"a", "tool_call_id":"a"},
             ])
         );
+    }
+
+    /// The reserved control strings and the BOS token of the generic path.
+    mod generic_reserved_tests {
+        use super::*;
+        use crate::agent::{AgentDirective, AgentMessage, ToolCall, ToolDefinition};
+
+        /// A Qwen-style template: the ChatML markers are the tokenizer's special
+        /// tokens, and the role marker is a plain token the template prints once
+        /// per turn.
+        const TEMPLATE: &str = "{% for message in messages %}<|im_start|><start_of_turn>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}{% if tools is not none %}<|tool_call|>{% endif %}";
+
+        /// The fallback of one template with the given control tokens.
+        fn compile_fallback(
+            template: &str,
+            special: &[String],
+            markers: &[String],
+        ) -> JinjaChatFallback {
+            jinja_fallback(
+                "test",
+                GenericPaths {
+                    chat: true,
+                    agent: true,
+                },
+                GgufPromptTokens {
+                    chat_template: Some(template),
+                    special_tokens: special,
+                    marker_tokens: markers,
+                    ..Default::default()
+                },
+            )
+            .expect("the fallback compiles")
+        }
+
+        #[test]
+        fn the_special_tokens_of_the_tokenizer_are_always_reserved() {
+            let special = vec!["<|im_start|>".to_owned(), "<|im_end|>".to_owned()];
+            let fallback = compile_fallback(TEMPLATE, &special, &[]);
+            for content in ["<|im_start|>", "<|im_end|>"] {
+                let error = fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user(content)],
+                        ChatTemplateOptions::default(),
+                    )
+                    .expect_err("a special token must be refused");
+                assert!(
+                    format!("{error:#}").contains("reserved native control string"),
+                    "{error:#}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_marker_that_delimits_a_turn_is_reserved() {
+            // The role marker is not a special token, but the template prints it
+            // once per turn, so a client that forges it would write a turn.
+            let markers = vec!["<start_of_turn>".to_owned()];
+            let fallback = compile_fallback(TEMPLATE, &[], &markers);
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<start_of_turn>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+            // A marker the template never prints is ordinary text.
+            let other = vec!["<table>".to_owned()];
+            let fallback = compile_fallback(TEMPLATE, &[], &other);
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<table>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn the_tool_format_markers_are_ordinary_text() {
+            let special = vec!["<|im_start|>".to_owned(), "<|im_end|>".to_owned()];
+            let markers = vec![
+                "<think>".to_owned(),
+                "</think>".to_owned(),
+                "<tool_call>".to_owned(),
+            ];
+            let fallback = compile_fallback(TEMPLATE, &special, &markers);
+            for content in ["<think>", "</think>", "<tool_call>"] {
+                assert!(
+                    fallback
+                        .format_chat_messages(
+                            &[ChatMessage::user(content)],
+                            ChatTemplateOptions::default(),
+                        )
+                        .is_ok(),
+                    "{content}"
+                );
+                // The template-derived reserved list holds no tool-format
+                // marker, so this check passes; validate_generic applies the
+                // fixed list of NATIVE_CONTROL_STRINGS on its own.
+                let prompt = AgentPrompt {
+                    messages: vec![AgentMessage::User {
+                        content: content.into(),
+                    }],
+                    tools: vec![],
+                    directive: AgentDirective::TextOnly,
+                };
+                assert!(
+                    prompt.reject_generic_controls(&fallback.reserved).is_ok(),
+                    "{content}"
+                );
+            }
+            // The agent path renders a history that carries the marker in a tool
+            // result and in the tool arguments.
+            let prompt = AgentPrompt {
+                messages: vec![
+                    AgentMessage::User {
+                        content: "run it".into(),
+                    },
+                    AgentMessage::Assistant {
+                        content: Some(String::new()),
+                        tool_call: Some(ToolCall {
+                            id: "call_1".into(),
+                            name: "shell".into(),
+                            arguments: r#"{"command":"<think>"}"#.into(),
+                        }),
+                    },
+                    AgentMessage::Tool {
+                        content: "<think>done</think>".into(),
+                        tool_call_id: "call_1".into(),
+                    },
+                ],
+                tools: vec![ToolDefinition {
+                    name: "shell".into(),
+                    description: None,
+                    parameters: serde_json::json!({"type": "object"}),
+                    strict: false,
+                    declaration: None,
+                }],
+                directive: AgentDirective::TextOnly,
+            };
+            let rendered = fallback.format_agent_prompt(&prompt, ChatTemplateOptions::default());
+            assert!(rendered.is_ok(), "{rendered:?}");
+        }
+
+        #[test]
+        fn a_template_that_cannot_render_the_probe_keeps_every_marker_reserved() {
+            // The template refuses a conversation of more than one turn, so the
+            // probe fails and every marker-like token stays reserved.
+            let template = "{% if messages | length > 1 %}{{ raise_exception('too many turns') }}{% endif %}{{ messages[0].content }}";
+            let markers = vec!["<table>".to_owned()];
+            let fallback = compile_fallback(template, &[], &markers);
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<table>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+            // A template that renders the probe reserves only its turn delimiters.
+            let rendered = compile_fallback(TEMPLATE, &[], &markers);
+            assert!(
+                rendered
+                    .format_chat_messages(
+                        &[ChatMessage::user("<table>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn a_template_that_does_not_compile_keeps_every_plain_markup_tag_reserved() {
+            // The template is not a valid Jinja program, so there is no
+            // valid template and no probe render: every plain markup tag
+            // stays reserved.
+            let template = "{% for message in messages %}{{ message.content }";
+            let markers = vec!["<table>".to_owned()];
+            let fallback = compile_fallback(template, &[], &markers);
+            assert!(fallback.reserved.contains(&"<table>".to_owned()));
+        }
+
+        #[test]
+        fn a_marker_that_only_a_system_turn_prints_is_reserved() {
+            // The template prints `<|system|>` for a system turn and a marker
+            // for every turn. A client that forges the system marker would
+            // write a system turn of its own.
+            let template = "{% for message in messages %}{% if message.role == 'system' %}<|system|>{% endif %}<start_of_turn>{{ message.role }}\n{{ message.content }}{% endfor %}";
+            let markers = vec!["<|system|>".to_owned(), "<start_of_turn>".to_owned()];
+            let fallback = compile_fallback(template, &[], &markers);
+            // The system marker is refused in untrusted content.
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<|system|>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+            // The marker of every turn stays refused as well.
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<start_of_turn>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+            // Ordinary text still renders.
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("hello")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn a_marker_a_template_assembles_from_pieces_is_reserved() {
+            // The template builds the marker from pieces, so the marker never
+            // appears in its own source. The plain render prints it anyway,
+            // so a client that forges it would write a turn of its own.
+            use tokenizers::{AddedToken, models::bpe::BPE};
+            let template = "{% for message in messages %}{{ '<|syste' ~ 'm|>' }}{{ message.content }}{% endfor %}";
+            let mut tokenizer = tokenizers::Tokenizer::new(BPE::default());
+            tokenizer
+                .add_tokens([AddedToken::from("<|system|>", false)])
+                .unwrap();
+            let control = crate::gguf_model::prompt_control_tokens(&tokenizer);
+            // The marker is not a special token of the tokenizer, but it is a
+            // marker-like added token, so it is in the marker list.
+            assert!(!control.special.contains(&"<|system|>".to_owned()));
+            assert!(control.markers.contains(&"<|system|>".to_owned()));
+            let fallback = compile_fallback(template, &control.special, &control.markers);
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<|system|>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn a_template_that_refuses_a_system_message_keeps_its_turn_delimiter() {
+            // The template refuses a system message, so it cannot print a
+            // system marker. That failure must not reserve every marker.
+            let template = "{% if messages[0].role == 'system' %}{{ raise_exception('no system turn') }}{% endif %}{% for message in messages %}<start_of_turn>{{ message.role }}\n{{ message.content }}{% endfor %}";
+            let markers = vec!["<start_of_turn>".to_owned(), "<think>".to_owned()];
+            let fallback = compile_fallback(template, &[], &markers);
+            // The marker of every turn is still refused.
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<start_of_turn>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+            // A marker the template never prints stays ordinary text.
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<think>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn a_marker_that_a_tool_turn_prints_is_reserved() {
+            // The template prints `<|tool|>` and `<tool_response>` for a
+            // tool turn. Neither marker is a special token of the tokenizer,
+            // but the template's own source names them, so a client that
+            // forges one would write the tool turn of the template.
+            let template = "{% for message in messages %}{% if message.role == 'tool' %}<|tool|><tool_response>{% endif %}<start_of_turn>{{ message.role }}\n{{ message.content }}{% endfor %}";
+            let markers = vec!["<|tool|>".to_owned(), "<tool_response>".to_owned()];
+            let fallback = compile_fallback(template, &[], &markers);
+            // The tool marker is refused in untrusted content.
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<|tool|>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+            // The tool response marker of the same setup is refused as well.
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<tool_response>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn a_default_system_turn_that_prints_a_marker_is_reserved() {
+            // The template prints `<|system|>` for the system turn it makes
+            // up itself. The marker is not a special token of the tokenizer,
+            // but the template prints it in a plain conversation, so a client
+            // that forges it would write the default system turn.
+            let template = "{% if messages[0].role != 'system' %}<|system|>default system prompt{% endif %}{% for message in messages %}<start_of_turn>{{ message.role }}\n{{ message.content }}{% endfor %}";
+            let markers = vec!["<|system|>".to_owned(), "<start_of_turn>".to_owned()];
+            let fallback = compile_fallback(template, &[], &markers);
+            // The system marker is refused in untrusted content.
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<|system|>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+            // Ordinary text still renders.
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("hello")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn a_marker_that_the_generation_prompt_prints_is_reserved() {
+            // The template prints `<|gen|>` only when it asks for the next
+            // turn. A plain conversation never prints it, but the source
+            // names it, so a client that forges it would write the
+            // generation prompt of the template.
+            let template = "{% for message in messages %}<start_of_turn>{{ message.role }}\n{{ message.content }}{% endfor %}{% if add_generation_prompt %}<|gen|><think>{% endif %}";
+            let markers = vec![
+                "<|gen|>".to_owned(),
+                "<think>".to_owned(),
+                "<start_of_turn>".to_owned(),
+            ];
+            let fallback = compile_fallback(template, &[], &markers);
+            // The marker of the generation prompt is refused.
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<|gen|>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+            // The reasoning marker of the same template stays plain text: it
+            // is on the named list.
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<think>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_ok()
+            );
+            // The marker of every turn is still refused.
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<start_of_turn>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn a_marker_that_the_tools_print_is_reserved() {
+            // The template prints `<|tools|>` when tools are declared. A
+            // conversation without tools never prints it, but the source
+            // names it, so the marker is reserved.
+            let template = "{% for message in messages %}<start_of_turn>{{ message.role }}\n{{ message.content }}{% endfor %}{% if tools is not none %}<|tools|>{% endif %}";
+            let markers = vec!["<|tools|>".to_owned()];
+            let fallback = compile_fallback(template, &[], &markers);
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<|tools|>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn the_reasoning_marker_of_a_default_system_prompt_stays_plain_text() {
+            // The template prints `<think>` for the system turn it makes up
+            // itself. The marker is on the named list, so it stays ordinary
+            // text while the tokenizer holds it as a marker-like token.
+            let template = "{% if messages[0].role != 'system' %}<think>default system prompt{% endif %}{% for message in messages %}<start_of_turn>{{ message.role }}\n{{ message.content }}{% endfor %}";
+            let markers = vec!["<think>".to_owned()];
+            let fallback = compile_fallback(template, &[], &markers);
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<think>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_ok()
+            );
+            // A tokenizer that marks the token special reserves it anyway.
+            let special = vec!["<think>".to_owned()];
+            let fallback = compile_fallback(template, &special, &markers);
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<think>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn a_marker_the_template_neither_names_nor_prints_stays_plain_text() {
+            // The marker is a marker-like token of the tokenizer, but the
+            // template neither names nor prints it, so it is ordinary text.
+            let markers = vec!["<table>".to_owned()];
+            let fallback = compile_fallback(TEMPLATE, &[], &markers);
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<table>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn a_marker_a_template_assembles_for_a_tool_turn_is_reserved() {
+            // The template assembles the marker from pieces and prints it
+            // only for a tool turn, so its own source never names it. The
+            // marker is not a plain markup tag, so it is reserved without
+            // looking at the template.
+            let template = "{% for message in messages %}{% if message.role == 'tool' %}{{ '<|to' ~ 'ol|>' }}{% endif %}{{ message.content }}{% endfor %}";
+            let markers = vec!["<|tool|>".to_owned()];
+            let fallback = compile_fallback(template, &[], &markers);
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<|tool|>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn a_marker_of_another_shape_is_reserved_without_the_template() {
+            // The template neither names nor prints the marker, and the
+            // marker is not a plain markup tag, so it is reserved anyway.
+            let template = "{% for message in messages %}<start_of_turn>{{ message.role }}\n{{ message.content }}{% endfor %}";
+            let markers = vec!["<tool_response>".to_owned()];
+            let fallback = compile_fallback(template, &[], &markers);
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<tool_response>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn the_plain_markup_tags_of_the_tokenizer_stay_plain_text() {
+            // The template neither names nor prints the tags, so they stay
+            // ordinary text: a real tokenizer holds them as added tokens.
+            let markers = vec![
+                "<table>".to_owned(),
+                "</td>".to_owned(),
+                "<code>".to_owned(),
+            ];
+            let fallback = compile_fallback(TEMPLATE, &[], &markers);
+            for content in ["<table>", "</td>", "<code>"] {
+                assert!(
+                    fallback
+                        .format_chat_messages(
+                            &[ChatMessage::user(content)],
+                            ChatTemplateOptions::default(),
+                        )
+                        .is_ok(),
+                    "{content}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_plain_markup_tag_the_template_uses_is_reserved() {
+            // The source names the tag, so a client that forges it would
+            // write a turn of the template.
+            let template = "{% for message in messages %}<user>{{ message.role }}\n{{ message.content }}{% endfor %}";
+            let markers = vec!["<user>".to_owned()];
+            let fallback = compile_fallback(template, &[], &markers);
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<user>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+            // A mention of the tag in a comment of the source reserves it as
+            // well, even when no render of the template prints it.
+            let template = "{# <user> #}{% for message in messages %}{{ message.role }}\n{{ message.content }}{% endfor %}";
+            let fallback = compile_fallback(template, &[], &markers);
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<user>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+            // The template assembles the tag from pieces, so its source does
+            // not name it, but a plain render prints it.
+            let template =
+                "{% for message in messages %}{{ '<us' ~ 'er>' }}{{ message.content }}{% endfor %}";
+            let fallback = compile_fallback(template, &[], &markers);
+            assert!(
+                fallback
+                    .format_chat_messages(
+                        &[ChatMessage::user("<user>")],
+                        ChatTemplateOptions::default(),
+                    )
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn a_plain_markup_tag_has_a_shape_of_its_own() {
+            for token in ["<table>", "</td>", "<h1>", "<code>", "<b>"] {
+                assert!(is_plain_markup_tag(token), "{token}");
+            }
+            for token in [
+                "<|tool|>",
+                "<tool_response>",
+                "<start_of_turn>",
+                "[PAD]",
+                "<|\"|>",
+                "<|USER|>",
+            ] {
+                assert!(!is_plain_markup_tag(token), "{token}");
+            }
+        }
+
+        #[test]
+        fn the_render_carries_the_bos_token_the_tokenizer_policy_asks_for() -> Result<()> {
+            let plain = "{{ messages[0].content }}";
+            let with_bos = "{{ bos_token }}{{ messages[0].content }}";
+            let whitespace = " {{ bos_token }}{{ messages[0].content }}";
+            let render = |template: &str, add_bos: bool, bos: Option<&str>| {
+                let fallback = jinja_fallback(
+                    "test",
+                    GenericPaths {
+                        chat: true,
+                        agent: true,
+                    },
+                    GgufPromptTokens {
+                        chat_template: Some(template),
+                        bos_token: bos,
+                        add_bos_token: add_bos,
+                        ..Default::default()
+                    },
+                )
+                .expect("the fallback compiles");
+                fallback.format_chat_messages(
+                    &[ChatMessage::user("hi")],
+                    ChatTemplateOptions::default(),
+                )
+            };
+            // A tokenizer that adds its BOS token to every prompt gets a render
+            // that starts with it.
+            assert_eq!(render(plain, true, Some("<bos>"))?, "<bos>hi");
+            // A render that already starts with the BOS token keeps its bytes.
+            assert_eq!(render(with_bos, true, Some("<bos>"))?, "<bos>hi");
+            // A render that carries whitespace before the BOS token keeps its
+            // bytes as well: the token is in the render already.
+            assert_eq!(render(whitespace, true, Some("<bos>"))?, " <bos>hi");
+            // A tokenizer that does not add its BOS token leaves the render alone.
+            assert_eq!(render(plain, false, Some("<bos>"))?, "hi");
+            // A checkpoint without a BOS string has nothing to prepend.
+            assert_eq!(render(plain, true, None)?, "hi");
+            Ok(())
+        }
+
+        #[test]
+        fn the_agent_render_carries_the_same_bos_token() -> Result<()> {
+            let fallback = fallback_with_bos();
+            let prompt = AgentPrompt {
+                messages: vec![AgentMessage::User {
+                    content: "hi".into(),
+                }],
+                tools: vec![],
+                directive: AgentDirective::TextOnly,
+            };
+            assert_eq!(
+                fallback.format_agent_prompt(&prompt, ChatTemplateOptions::default())?,
+                "<bos>hi"
+            );
+            Ok(())
+        }
+
+        /// A fallback whose tokenizer adds its BOS token to every prompt.
+        fn fallback_with_bos() -> JinjaChatFallback {
+            jinja_fallback(
+                "test",
+                GenericPaths {
+                    chat: true,
+                    agent: true,
+                },
+                GgufPromptTokens {
+                    chat_template: Some(
+                        "{{ messages[0].content }}{% if tools is not none %}<|tool_call|>{% endif %}",
+                    ),
+                    bos_token: Some("<bos>"),
+                    add_bos_token: true,
+                    ..Default::default()
+                },
+            )
+            .expect("the fallback compiles")
+        }
+    }
+
+    /// The template options of the generic path.
+    mod generic_option_tests {
+        use super::*;
+        use crate::agent::{AgentDirective, AgentMessage};
+
+        /// The fallback of one template.
+        fn compile_fallback(template: &str) -> JinjaChatFallback {
+            jinja_fallback(
+                "test",
+                GenericPaths {
+                    chat: true,
+                    agent: true,
+                },
+                GgufPromptTokens {
+                    chat_template: Some(template),
+                    ..Default::default()
+                },
+            )
+            .expect("the fallback compiles")
+        }
+
+        #[test]
+        fn the_generic_path_refuses_an_option_its_template_never_reads() -> Result<()> {
+            let options = ChatTemplateOptions {
+                enable_thinking: Some(false),
+            };
+            let fallback = compile_fallback("{{ messages[0].content }}");
+            let error = fallback
+                .format_chat_messages(&[ChatMessage::user("hi")], options)
+                .expect_err("the option must be refused");
+            assert!(
+                format!("{error:#}").contains("enable_thinking"),
+                "{error:#}"
+            );
+            // The agent path refuses the option as well.
+            let fallback = compile_fallback(
+                "{{ messages[0].content }}{% if tools is not none %}<|tool_call|>{% endif %}",
+            );
+            let prompt = AgentPrompt {
+                messages: vec![AgentMessage::User {
+                    content: "hi".into(),
+                }],
+                tools: vec![],
+                directive: AgentDirective::TextOnly,
+            };
+            let error = fallback
+                .format_agent_prompt(&prompt, options)
+                .expect_err("the option must be refused");
+            assert!(
+                format!("{error:#}").contains("enable_thinking"),
+                "{error:#}"
+            );
+            // A template that reads the option receives it.
+            let fallback = compile_fallback("{{ enable_thinking }}");
+            assert_eq!(
+                fallback.format_chat_messages(&[ChatMessage::user("hi")], options)?,
+                "False"
+            );
+            // A request that does not ask for the option is untouched.
+            let fallback = compile_fallback("{{ messages[0].content }}");
+            assert_eq!(
+                fallback.format_chat_messages(
+                    &[ChatMessage::user("hi")],
+                    ChatTemplateOptions::default()
+                )?,
+                "hi"
+            );
+            Ok(())
+        }
     }
 
     #[test]
