@@ -239,19 +239,25 @@ mod tests {
         prompt.directive = AgentDirective::TextOnly;
         prompt.tools.clear();
         assert_eq!(adapter.format_agent_prompt(&prompt)?, "null unset");
+        // A Hermes template serves the forced turn: the prompt ends inside
+        // the call, so the model generates only the arguments.
+        prompt.tools.push(ToolDefinition {
+            name: "weather".into(),
+            description: Some("forecast".into()),
+            parameters: serde_json::json!({"type":"object"}),
+            strict: false,
+            declaration: None,
+        });
         prompt.directive = AgentDirective::ForcedSingle {
             name: "weather".into(),
         };
-        for error in [
-            adapter.format_agent_prompt(&prompt).unwrap_err(),
-            adapter
-                .format_agent_prompt_with(&prompt, ChatTemplateOptions::default())
-                .unwrap_err(),
+        for forced in [
+            adapter.format_agent_prompt(&prompt)?,
+            adapter.format_agent_prompt_with(&prompt, ChatTemplateOptions::default())?,
         ] {
             assert!(
-                error
-                    .to_string()
-                    .contains("forced or required tool choice is unsupported")
+                forced.ends_with("<tool_call>\n{\"name\":\"weather\",\"arguments\":"),
+                "{forced}"
             );
         }
         Ok(())

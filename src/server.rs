@@ -840,6 +840,23 @@ fn engine_failure_response(kind: EngineFailureKind, message: String) -> Response
     api_error(status, engine_failure_error(kind, message))
 }
 
+/// Whether the request asks for one forced tool call.
+fn forces_a_tool_choice(request: &ChatCompletionRequest) -> bool {
+    matches!(
+        request.tool_choice,
+        Some(ToolChoice::Mode(ToolChoiceMode::Required) | ToolChoice::Function { .. })
+    )
+}
+
+/// The refusal a Qwen3.5 model answers a forced tool choice with.
+fn qwen35_forced_choice_error() -> ApiError {
+    ApiError::invalid_request(
+        "Qwen3.5 supports tool_choice auto or none only; forced named and required tool choices are not supported".to_owned(),
+        Some("tool_choice".to_owned()),
+        Some("invalid_value".to_owned()),
+    )
+}
+
 /// The gates the chat endpoint applies before it routes a request.
 ///
 /// The server refuses a request whose forced tool choice its template cannot
@@ -851,30 +868,20 @@ pub(crate) fn check_chat_completion_gates(
     family: &str,
     tool_call_format: Option<ToolCallFormat>,
 ) -> std::result::Result<(), ApiError> {
-    if tool_call_format.is_some()
-        && matches!(
-            request.tool_choice,
-            Some(ToolChoice::Mode(ToolChoiceMode::Required) | ToolChoice::Function { .. })
-        )
+    if tool_call_format.is_some_and(|format| format != ToolCallFormat::Hermes)
+        && forces_a_tool_choice(request)
     {
         return Err(ApiError::invalid_request(
-            "forced or required tool choice is unsupported for generic templates; use auto or none",
+            "forced or required tool choice is unsupported for this tool-call format; use auto or none",
             Some("tool_choice".to_owned()),
             Some("unsupported_value".to_owned()),
         ));
     }
-    if family == "qwen35"
-        && tool_call_format.is_none()
-        && matches!(
-            request.tool_choice,
-            Some(ToolChoice::Mode(ToolChoiceMode::Required) | ToolChoice::Function { .. })
-        )
-    {
-        return Err(ApiError::invalid_request(
-            "Qwen3.5 supports tool_choice auto or none only; forced named and required tool choices are not supported".to_owned(),
-            Some("tool_choice".to_owned()),
-            Some("invalid_value".to_owned()),
-        ));
+    // Qwen3.5 refuses a forced choice whatever the template's format is: the
+    // family gate stays in force for the generic templates too. The formats
+    // the gate above refuses keep that gate's own answer.
+    if family == "qwen35" && forces_a_tool_choice(request) {
+        return Err(qwen35_forced_choice_error());
     }
     if !supports_reasoning_history(family)
         && let Some(index) = request.messages.iter().position(|message| {
@@ -908,6 +915,8 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         Ok(request) => request,
         Err(error) => return api_error(StatusCode::BAD_REQUEST, error),
     };
+    // Whether the client asks for one forced tool call.
+    let forced_tool_choice = forces_a_tool_choice(&request);
     let metadata = state.engine.metadata();
     if let Err(error) =
         check_chat_completion_gates(&mut request, &metadata.family, metadata.tool_call_format)
@@ -953,6 +962,24 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
     } else {
         PromptThinking::Closed
     };
+    // A forced call cannot follow an open reasoning block: the call would
+    // land inside the reasoning the prompt started, so the request is
+    // refused here instead of reaching the engine. The template's own
+    // render keeps the last guard for the prompts the metadata cannot
+    // describe.
+    if prompt_thinking == PromptThinking::Open
+        && metadata.tool_call_format.is_some()
+        && forced_tool_choice
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            ApiError::invalid_request(
+                "the chat template opens a reasoning block, so a forced tool choice is unsupported; use enable_thinking=false or tool_choice auto".to_owned(),
+                Some("tool_choice".to_owned()),
+                Some("unsupported_value".to_owned()),
+            ),
+        );
+    }
     let (engine_request, output) = match to_engine_request_with_syntax(
         request,
         identity.default_seed,
@@ -1079,12 +1106,19 @@ pub(crate) fn to_engine_request_with_syntax(
         .transpose()?;
     let forced_tool = request.forced_tool().cloned();
     let automatic = matches!(request.tool_choice, ToolChoice::Mode(ToolChoiceMode::Auto));
-    if generic_format.is_some() && forced_tool.is_some() {
-        return Err(ApiError::invalid_request(
-            "forced or required tool choice is unsupported for generic templates".to_owned(),
-            Some("tool_choice".to_owned()),
-            Some("invalid_value".to_owned()),
-        ));
+    if forced_tool.is_some() {
+        if generic_format.is_some_and(|format| format != ToolCallFormat::Hermes) {
+            return Err(ApiError::invalid_request(
+                "forced or required tool choice is unsupported for this tool-call format"
+                    .to_owned(),
+                Some("tool_choice".to_owned()),
+                Some("invalid_value".to_owned()),
+            ));
+        }
+        // Qwen3.5 refuses a forced choice whatever the template's format is.
+        if qwen35 {
+            return Err(qwen35_forced_choice_error());
+        }
     }
     let (input, output) = if let Some(tool) = forced_tool {
         let schema = compile_tool_arguments(&tool)?;
@@ -3628,13 +3662,187 @@ mod tests {
         }
     }
 
+    /// Every tool-call format but Hermes refuses a forced choice: their
+    /// envelopes differ, so the request never reaches the engine.
     #[tokio::test]
-    async fn generic_templates_reject_forced_choice_before_submission() {
+    async fn non_hermes_generic_templates_reject_forced_choice_before_submission() {
+        for format in [ToolCallFormat::QwenXml, ToolCallFormat::MistralJson] {
+            for choice in [
+                json!("required"),
+                json!({"type":"function", "function":{"name":"shell"}}),
+            ] {
+                let mut engine = FakeEngine::healthy(vec![]);
+                engine.metadata.tool_call_format = Some(format);
+                let engine = Arc::new(engine);
+                let response = router(engine.clone())
+                    .oneshot(chat_request(&json!({
+                        "model":"test-model", "messages":[{"role":"user", "content":"go"}],
+                        "tools":[shell_tool()], "tool_choice":choice,
+                    })))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let body = body_json(response).await;
+                assert_eq!(body["error"]["param"], "tool_choice");
+                assert_eq!(body["error"]["code"], "unsupported_value");
+                assert!(
+                    body["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("forced or required tool choice is unsupported")
+                );
+                assert_eq!(engine.submit_count.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
+    /// A Hermes template serves the forced choice: the turn ends inside the
+    /// call, and the response carries the one call the prompt forced.
+    #[tokio::test]
+    async fn a_hermes_template_serves_the_forced_tool_choice() {
+        for choice in [
+            json!("required"),
+            json!({"type":"function", "function":{"name":"lookup"}}),
+        ] {
+            for streaming in [false, true] {
+                let mut engine = FakeEngine::healthy(vec![
+                    text_event("{ \"symbol\" :", 11, 1, 3),
+                    text_event(" \"AAPL\" }", 12, 2, 3),
+                    EngineEvent::Finished(metrics(FinishReason::Stop)),
+                ]);
+                engine.metadata.tool_call_format = Some(ToolCallFormat::Hermes);
+                let response = router(Arc::new(engine))
+                    .oneshot(forced_tool_request_with(choice.clone(), streaming))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                if streaming {
+                    let events = sse_json(&body_text(response).await);
+                    let names: Vec<&str> = events
+                        .iter()
+                        .filter_map(|event| {
+                            event["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
+                                .as_str()
+                        })
+                        .collect();
+                    let arguments: String = events
+                        .iter()
+                        .filter_map(|event| {
+                            event["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                                .as_str()
+                        })
+                        .collect();
+                    assert_eq!(names, vec!["lookup"]);
+                    assert_eq!(arguments, "{ \"symbol\" : \"AAPL\" }");
+                    assert_eq!(
+                        events.last().unwrap()["choices"][0]["finish_reason"],
+                        "tool_calls"
+                    );
+                } else {
+                    let body = body_json(response).await;
+                    assert_eq!(
+                        body["choices"][0]["message"]["tool_calls"][0]["function"],
+                        json!({"name": "lookup", "arguments": "{ \"symbol\" : \"AAPL\" }"})
+                    );
+                    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+                }
+            }
+        }
+    }
+
+    /// A forced choice cannot follow an open reasoning block: the call would
+    /// land inside the reasoning the prompt started, so the server refuses
+    /// the request before the engine sees it.
+    #[tokio::test]
+    async fn a_forced_choice_is_refused_when_the_prompt_opens_a_reasoning_block() {
+        for choice in [
+            json!("required"),
+            json!({"type":"function", "function":{"name":"lookup"}}),
+        ] {
+            let mut engine = FakeEngine::healthy(vec![]);
+            engine.metadata.tool_call_format = Some(ToolCallFormat::Hermes);
+            let engine = Arc::new(engine.with_open_thinking());
+            let response = router(engine.clone())
+                .oneshot(forced_tool_request_with(choice, false))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = body_json(response).await;
+            assert_eq!(body["error"]["param"], "tool_choice");
+            assert_eq!(body["error"]["code"], "unsupported_value");
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(message.contains("opens a reasoning block"), "{message}");
+            assert!(message.contains("enable_thinking=false"), "{message}");
+            assert!(message.contains("tool_choice auto"), "{message}");
+            assert_eq!(engine.submit_count.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    /// The same request serves when the template's thinking is off: the
+    /// prompt closes the reasoning block, so the forced call follows it.
+    #[tokio::test]
+    async fn a_forced_choice_serves_when_the_thinking_is_disabled() {
+        let mut engine = FakeEngine::healthy(vec![
+            text_event("{ \"symbol\" :", 11, 1, 3),
+            text_event(" \"AAPL\" }", 12, 2, 3),
+            EngineEvent::Finished(metrics(FinishReason::Stop)),
+        ]);
+        engine.metadata.tool_call_format = Some(ToolCallFormat::Hermes);
+        let engine = Arc::new(engine.with_open_thinking());
+        let mut body = forced_tool_body(false);
+        body["tool_choice"] = json!({"type":"function", "function":{"name":"lookup"}});
+        body["chat_template_kwargs"] = json!({"enable_thinking": false});
+        let response = router(engine.clone())
+            .oneshot(chat_request(&body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"],
+            json!({"name": "lookup", "arguments": "{ \"symbol\" : \"AAPL\" }"})
+        );
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(engine.submit_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// An automatic choice still serves an open reasoning block: the model
+    /// opens the block itself and the call follows it. The request names the
+    /// automatic choice explicitly, so the served path is the one a client
+    /// asks for by name.
+    #[tokio::test]
+    async fn an_automatic_choice_serves_an_open_reasoning_block() {
+        let mut engine = FakeEngine::healthy(vec![
+            text_event("Listing.", 11, 1, 3),
+            EngineEvent::Finished(metrics(FinishReason::Stop)),
+        ]);
+        engine.metadata.tool_call_format = Some(ToolCallFormat::Hermes);
+        let engine = Arc::new(engine.with_open_thinking());
+        let mut body = auto_body(false);
+        body["tool_choice"] = json!("auto");
+        let response = router(engine.clone())
+            .oneshot(chat_request(&body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let message = &body["choices"][0]["message"];
+        // The prompt opened the block, so the answer is reasoning.
+        assert_eq!(message["reasoning_content"], "Listing.");
+        assert_eq!(message["content"], "");
+        assert_eq!(engine.submit_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// Qwen3.5 refuses a forced choice whatever the template's format is: the
+    /// family gate stays in force for the generic templates too.
+    #[tokio::test]
+    async fn qwen35_refuses_a_forced_choice_with_a_hermes_template() {
         for choice in [
             json!("required"),
             json!({"type":"function", "function":{"name":"shell"}}),
         ] {
             let mut engine = FakeEngine::healthy(vec![]);
+            engine.metadata.family = "qwen35".into();
             engine.metadata.tool_call_format = Some(ToolCallFormat::Hermes);
             let engine = Arc::new(engine);
             let response = router(engine.clone())
@@ -3647,12 +3855,70 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             let body = body_json(response).await;
             assert_eq!(body["error"]["param"], "tool_choice");
+            assert_eq!(body["error"]["code"], "invalid_value");
             assert!(
                 body["error"]["message"]
                     .as_str()
                     .unwrap()
-                    .contains("generic templates")
+                    .contains("forced named and required tool choices are not supported")
             );
+            assert_eq!(engine.submit_count.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    /// The lowering refuses a forced choice for Qwen3.5 too: the family gate
+    /// holds the engine input, not only the request.
+    #[test]
+    fn the_lowering_refuses_a_forced_choice_for_qwen35() {
+        let request = ChatCompletionRequest::from_json(
+            &serde_json::to_vec(&json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "go"}],
+                "tools": [shell_tool()],
+                "tool_choice": "required",
+                "parallel_tool_calls": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .validate_with_generic("test-model", 16, true)
+        .unwrap();
+        let Err(error) = to_engine_request_with_syntax(
+            request,
+            0,
+            SamplingProfile::OpenAi.defaults(true),
+            true,
+            Some(ToolCallFormat::Hermes),
+        ) else {
+            panic!("the lowering served a forced choice for Qwen3.5");
+        };
+        assert_eq!(error.param.as_deref(), Some("tool_choice"));
+        assert_eq!(error.code.as_deref(), Some("invalid_value"));
+        assert!(
+            error
+                .message
+                .contains("forced named and required tool choices are not supported")
+        );
+    }
+
+    /// A forced choice serves exactly one call: parallel calls stay refused.
+    #[tokio::test]
+    async fn a_forced_choice_with_parallel_tool_calls_stays_refused() {
+        for format in [None, Some(ToolCallFormat::Hermes)] {
+            let mut engine = FakeEngine::healthy(vec![]);
+            engine.metadata.tool_call_format = format;
+            let engine = Arc::new(engine);
+            let response = router(engine.clone())
+                .oneshot(chat_request(&json!({
+                    "model":"test-model", "messages":[{"role":"user", "content":"go"}],
+                    "tools":[shell_tool()], "tool_choice":"required", "parallel_tool_calls":true,
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = body_json(response).await;
+            assert_eq!(body["error"]["param"], "parallel_tool_calls");
+            assert_eq!(body["error"]["code"], "unsupported_value");
             assert_eq!(engine.submit_count.load(Ordering::Relaxed), 0);
         }
     }
@@ -3847,7 +4113,24 @@ mod tests {
     }
 
     fn forced_tool_request(streaming: bool, include_usage: bool) -> Request<Body> {
-        let mut value = json!({
+        let mut value = forced_tool_body(streaming);
+        value["tool_choice"] = json!({
+            "type": "function",
+            "function": {"name": "lookup"}
+        });
+        if include_usage {
+            value["stream_options"] = json!({"include_usage": true});
+        }
+        Request::post("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(value.to_string()))
+            .unwrap()
+    }
+
+    /// The body of a forced tool request: one declared tool and the choice
+    /// the caller asks for.
+    fn forced_tool_body(streaming: bool) -> Value {
+        json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "look up AAPL"}],
             "stream": streaming,
@@ -3865,15 +4148,14 @@ mod tests {
                     "strict": true
                 }
             }],
-            "tool_choice": {
-                "type": "function",
-                "function": {"name": "lookup"}
-            },
             "parallel_tool_calls": false
-        });
-        if include_usage {
-            value["stream_options"] = json!({"include_usage": true});
-        }
+        })
+    }
+
+    /// A forced tool request with the choice the caller asks for.
+    fn forced_tool_request_with(choice: Value, streaming: bool) -> Request<Body> {
+        let mut value = forced_tool_body(streaming);
+        value["tool_choice"] = choice;
         Request::post("/v1/chat/completions")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(value.to_string()))
@@ -4737,13 +5019,19 @@ mod tests {
     }
 
     fn auto_request(streaming: bool) -> Request<Body> {
-        chat_request(&json!({
+        chat_request(&auto_body(streaming))
+    }
+
+    /// The body of an automatic tool request: one declared tool and no
+    /// forced choice.
+    fn auto_body(streaming: bool) -> Value {
+        json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "list files"}],
             "tools": [shell_tool()],
             "stream": streaming,
             "stream_options": if streaming { json!({"include_usage": true}) } else { Value::Null }
-        }))
+        })
     }
 
     async fn body_text(response: Response) -> String {

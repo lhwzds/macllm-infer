@@ -27,13 +27,14 @@
 //! the selected envelope only after the model opens a call.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashSet, VecDeque},
     sync::Arc,
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value};
-use tokenizers::{Tokenizer, tokenizer::step_decode_stream};
+use tokenizers::{Tokenizer, decoders::DecoderWrapper, tokenizer::step_decode_stream};
 
 use crate::{
     constraint::LogitsConstraint,
@@ -50,6 +51,22 @@ const MAX_SCHEMA_DEPTH: usize = 64;
 const MAX_SCHEMA_PROPERTIES: usize = 128;
 const MAX_ENUM_VALUES: usize = 256;
 const MAX_ARRAY_ITEMS: usize = 4096;
+
+/// The bytes of a literal U+FFFD, the only complete text a decoder holds
+/// back: the decoder cannot tell it from an unfinished character.
+const REPLACEMENT_CHARACTER_BYTES: &[u8] = b"\xEF\xBF\xBD";
+
+/// The first code unit of the high surrogate range.
+const HIGH_SURROGATE_START: u16 = 0xD800;
+
+/// The last code unit of the high surrogate range.
+const HIGH_SURROGATE_END: u16 = 0xDBFF;
+
+/// The first code unit of the low surrogate range.
+const LOW_SURROGATE_START: u16 = 0xDC00;
+
+/// The last code unit of the low surrogate range.
+const LOW_SURROGATE_END: u16 = 0xDFFF;
 
 /// Whether the current byte prefix can still become a schema-valid JSON value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,11 +155,25 @@ pub struct JsonSchemaGrammar {
 /// the exact context-sensitive text delta rather than a raw vocabulary entry.
 /// Only the selected candidate advances the real decoder and grammar states.
 ///
-/// A non-EOS token that produces `None` or an empty fragment is rejected. This
-/// is deliberately conservative: `None` can mean either a skipped special
-/// token or the first half of a byte-fallback sequence. Supporting the latter
-/// safely would require grammar states over pending non-UTF-8 bytes and
-/// multi-token lookahead; this implementation never claims that support.
+/// Whether a token splits a character is decided from the token's exact bytes,
+/// never from the decoded text. A decoder replaces every byte sequence that is
+/// not valid UTF-8 with U+FFFD, so a decode cannot tell an unfinished
+/// character from bytes that no character can spell. The constraint therefore
+/// keeps a table of the exact bytes every vocabulary entry spells, and holds
+/// back the bytes of the selected tokens whose text the decoder has not
+/// released yet. Bytes that can never spell a character are refused outright, a
+/// token that completes the held-back bytes commits the released text, and a
+/// token that starts a character is held back as well. A literal U+FFFD is
+/// held back too, because the decoder cannot tell it from an unfinished
+/// character. The grammar is probed with the held-back bytes themselves, so
+/// the JSON value stays incomplete while a character is pending and EOS stays
+/// refused. The probe judges the bytes, not a stand-in character: an enum
+/// value or a property key only admits a tail that is a byte prefix of an
+/// allowed literal, while a free string admits any valid tail. A token that
+/// spells no bytes at all is refused too: it would make no progress, and the
+/// held-back bytes would keep waiting for a character that the token cannot
+/// contribute. A token whose complete text the decoder swallows is refused as
+/// well: the held-back bytes would never be released.
 #[derive(Clone)]
 pub struct JsonSchemaTokenConstraint {
     tokenizer: Arc<Tokenizer>,
@@ -150,7 +181,26 @@ pub struct JsonSchemaTokenConstraint {
     selected_token_ids: Vec<u32>,
     decoder: DecoderState,
     grammar: JsonSchemaGrammar,
+    token_bytes: TokenBytes,
+    pending: Vec<u8>,
     finished: bool,
+}
+
+/// How one candidate token relates to the grammar and to the decoder.
+enum Candidate {
+    /// The token produced text that the grammar may accept.
+    Fragment {
+        decoder: DecoderState,
+        fragment: String,
+    },
+    /// The token produced no text: its bytes stay held back until a later
+    /// token completes them.
+    Partial {
+        decoder: DecoderState,
+        bytes: Vec<u8>,
+    },
+    /// The token cannot be selected here.
+    Refused,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -190,12 +240,15 @@ impl JsonSchemaTokenConstraint {
         grammar: JsonSchemaGrammar,
     ) -> Result<Self> {
         let eos = validate_eos_token_ids(&tokenizer, eos_token_ids)?;
+        let token_bytes = build_token_bytes(&tokenizer);
         Ok(Self {
             tokenizer,
             eos_token_ids: eos,
             selected_token_ids: Vec::new(),
             decoder: DecoderState::default(),
             grammar,
+            token_bytes,
+            pending: Vec::new(),
             finished: false,
         })
     }
@@ -226,12 +279,243 @@ impl JsonSchemaTokenConstraint {
         if self.grammar.can_end() {
             return false;
         }
-        self.candidate_step(token_id)
-            .ok()
-            .and_then(|(_, fragment)| fragment)
-            .filter(|fragment| !fragment.is_empty())
-            .is_some_and(|fragment| self.grammar.allows_token_text(&fragment))
+        let Ok((decoder, fragment)) = self.candidate_step(token_id) else {
+            return false;
+        };
+        match self.classify_candidate(token_id, decoder, fragment) {
+            Candidate::Partial { .. } => true,
+            Candidate::Fragment { fragment, .. } => self.grammar.allows_token_text(&fragment),
+            Candidate::Refused => false,
+        }
     }
+
+    /// Classify one candidate so that the mask and the commit cannot disagree.
+    ///
+    /// The exact bytes of the candidate decide whether it splits a character;
+    /// the decoded fragment only says which text the decoder released.
+    fn classify_candidate(
+        &self,
+        token_id: u32,
+        decoder: DecoderState,
+        fragment: Option<String>,
+    ) -> Candidate {
+        let Some(bytes) = self.candidate_bytes(token_id) else {
+            // The exact bytes are unknown, so only released text can be
+            // judged, and held-back bytes can never be completed.
+            if !self.pending.is_empty() {
+                return Candidate::Refused;
+            }
+            return match fragment.filter(|fragment| !fragment.is_empty()) {
+                Some(fragment) => Candidate::Fragment { decoder, fragment },
+                None => Candidate::Refused,
+            };
+        };
+        if bytes.is_empty() {
+            // The token spells no bytes, so it cannot complete the held-back
+            // bytes and it cannot start a character either: accepting it
+            // would burn generation tokens without moving the output forward.
+            return Candidate::Refused;
+        }
+        // The held-back bytes are empty unless a character is pending, so the
+        // common path joins nothing and copies nothing.
+        let joined: Cow<'_, [u8]> = if self.pending.is_empty() {
+            Cow::Borrowed(bytes)
+        } else {
+            let mut joined = self.pending.clone();
+            joined.extend_from_slice(bytes);
+            Cow::Owned(joined)
+        };
+        let complete = match std::str::from_utf8(&joined) {
+            Ok(_) => true,
+            // An unfinished character: more bytes may still complete it.
+            Err(error) if error.error_len().is_none() => false,
+            // These bytes can never spell a character.
+            Err(_) => return Candidate::Refused,
+        };
+        if let Some(fragment) = fragment.filter(|fragment| !fragment.is_empty()) {
+            // The decoder released text: it must spell exactly the bytes
+            // that are still held back plus the candidate's own bytes.
+            if !self.pending.is_empty() && fragment.as_bytes() != joined.as_ref() {
+                return Candidate::Refused;
+            }
+            Candidate::Fragment { decoder, fragment }
+        } else {
+            // The decoder holds the text back: the bytes are an unfinished
+            // character, or a character the decoder keeps because its text
+            // ends in U+FFFD.
+            if complete && !joined.ends_with(REPLACEMENT_CHARACTER_BYTES) {
+                // The bytes spell a complete character that the decoder
+                // swallowed. Holding them back would leave the output stuck:
+                // no later token could release them.
+                return Candidate::Refused;
+            }
+            // The held-back bytes are judged as bytes: an enum value or a
+            // property key only admits a tail that is a byte prefix of an
+            // allowed literal.
+            if !self.grammar.allows_partial_bytes(&joined) {
+                return Candidate::Refused;
+            }
+            Candidate::Partial {
+                decoder,
+                bytes: joined.into_owned(),
+            }
+        }
+    }
+
+    /// The exact bytes one vocabulary entry spells, when they are known.
+    fn candidate_bytes(&self, token_id: u32) -> Option<&[u8]> {
+        let index = usize::try_from(token_id).ok()?;
+        self.token_bytes
+            .get(index)
+            .and_then(|entry| entry.as_deref())
+    }
+}
+
+/// The exact bytes every vocabulary entry spells, when the decoder spells
+/// them from the vocabulary string alone.
+type TokenBytes = Arc<Vec<Option<Box<[u8]>>>>;
+
+/// How a decoder spells a vocabulary entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecoderSpelling {
+    /// The byte-level decoder: every character of the vocabulary entry is one
+    /// byte of the GPT-2 alphabet.
+    ByteLevel,
+    /// The byte-fallback decoder: a `<0xHH>` vocabulary entry is one byte.
+    ByteFallback,
+    /// Any other decoder: the exact bytes are unknown.
+    Unknown,
+}
+
+/// Build the table of the exact bytes every vocabulary entry spells.
+///
+/// The table is indexed by token ID and sized by the highest ID the tokenizer
+/// uses, not by the number of vocabulary entries: a vocabulary may leave gaps
+/// between its IDs, and a token above such a gap still spells bytes. A table
+/// sized by the entry count would leave those tokens without bytes, and the
+/// constraint would refuse them as tokens whose bytes are unknown.
+fn build_token_bytes(tokenizer: &Tokenizer) -> TokenBytes {
+    let spelling = decoder_spelling(tokenizer.get_decoder());
+    if spelling == DecoderSpelling::Unknown {
+        return Arc::new(Vec::new());
+    }
+    let alphabet = ByteAlphabet::new();
+    let added = tokenizer.get_added_tokens_decoder();
+    let vocabulary = tokenizer.get_vocab(false);
+    let mut size = 0_usize;
+    for token_id in vocabulary.values().chain(added.keys()) {
+        let Ok(index) = usize::try_from(*token_id) else {
+            continue;
+        };
+        size = size.max(index + 1);
+    }
+    let mut table: Vec<Option<Box<[u8]>>> = vec![None; size];
+    for (token, token_id) in &vocabulary {
+        let Ok(index) = usize::try_from(*token_id) else {
+            continue;
+        };
+        let Some(slot) = table.get_mut(index) else {
+            continue;
+        };
+        *slot = token_bytes(token, spelling, &alphabet, tokenizer);
+    }
+    for (token_id, token) in &added {
+        let Ok(index) = usize::try_from(*token_id) else {
+            continue;
+        };
+        let Some(slot) = table.get_mut(index) else {
+            continue;
+        };
+        *slot = token_bytes(&token.content, spelling, &alphabet, tokenizer);
+    }
+    Arc::new(table)
+}
+
+/// The exact bytes one vocabulary entry spells.
+fn token_bytes(
+    token: &str,
+    spelling: DecoderSpelling,
+    alphabet: &ByteAlphabet,
+    tokenizer: &Tokenizer,
+) -> Option<Box<[u8]>> {
+    if tokenizer.get_added_vocabulary().is_special_token(token) {
+        return None;
+    }
+    match spelling {
+        DecoderSpelling::ByteLevel => token
+            .chars()
+            .map(|character| alphabet.byte(character))
+            .collect::<Option<Vec<u8>>>()
+            .map(Vec::into_boxed_slice),
+        DecoderSpelling::ByteFallback => byte_fallback_bytes(token),
+        DecoderSpelling::Unknown => None,
+    }
+}
+
+/// How the decoder spells the entries of the vocabulary.
+fn decoder_spelling(decoder: Option<&DecoderWrapper>) -> DecoderSpelling {
+    match decoder {
+        Some(DecoderWrapper::ByteLevel(_)) => DecoderSpelling::ByteLevel,
+        Some(DecoderWrapper::ByteFallback(_)) => DecoderSpelling::ByteFallback,
+        Some(DecoderWrapper::Sequence(sequence)) => sequence_spelling(sequence.get_decoders()),
+        _ => DecoderSpelling::Unknown,
+    }
+}
+
+/// The spelling of the first decoder in a sequence that names one.
+fn sequence_spelling(decoders: &[DecoderWrapper]) -> DecoderSpelling {
+    let mut spelling = DecoderSpelling::Unknown;
+    for decoder in decoders {
+        match decoder_spelling(Some(decoder)) {
+            DecoderSpelling::ByteLevel => return DecoderSpelling::ByteLevel,
+            DecoderSpelling::ByteFallback => spelling = DecoderSpelling::ByteFallback,
+            DecoderSpelling::Unknown => {}
+        }
+    }
+    spelling
+}
+
+/// The GPT-2 byte alphabet in reverse: every character spells one byte.
+struct ByteAlphabet {
+    reverse: [Option<u8>; 0x200],
+}
+
+impl ByteAlphabet {
+    /// Build the alphabet: the bytes `!..=~`, `0xA1..=0xAC`, and `0xAE..=0xFF`
+    /// map to themselves, and every other byte maps to the characters from
+    /// U+0100 upward, in byte order.
+    fn new() -> Self {
+        let mut reverse = [None; 0x200];
+        let mut next = 0x100_u32;
+        for byte in 0..=255_u8 {
+            let direct = matches!(byte, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF);
+            let code = if direct {
+                u32::from(byte)
+            } else {
+                let code = next;
+                next += 1;
+                code
+            };
+            reverse[code as usize] = Some(byte);
+        }
+        Self { reverse }
+    }
+
+    /// The byte one character spells, if the character is in the alphabet.
+    fn byte(&self, character: char) -> Option<u8> {
+        let code = usize::try_from(u32::from(character)).ok()?;
+        self.reverse.get(code).copied().flatten()
+    }
+}
+
+/// The one byte a byte-fallback vocabulary entry spells.
+fn byte_fallback_bytes(token: &str) -> Option<Box<[u8]>> {
+    if token.len() == 6 && token.starts_with("<0x") && token.ends_with('>') {
+        return u8::from_str_radix(&token[3..5], 16)
+            .ok()
+            .map(|byte| Box::from([byte]) as Box<[u8]>);
+    }
+    None
 }
 
 fn validate_eos_token_ids(tokenizer: &Tokenizer, eos_token_ids: Vec<u32>) -> Result<BTreeSet<u32>> {
@@ -318,17 +602,24 @@ impl LogitsConstraint for JsonSchemaTokenConstraint {
         );
 
         let (next_decoder, fragment) = self.candidate_step(token_id)?;
-        let fragment = fragment
-            .filter(|fragment| !fragment.is_empty())
-            .with_context(|| {
-                format!(
-                    "token {token_id} produced no text; pending byte-fallback and skipped special tokens are conservatively rejected"
-                )
-            })?;
-        self.grammar.commit_token_text(&fragment)?;
-        self.decoder = next_decoder;
-        self.selected_token_ids.push(token_id);
-        Ok(())
+        match self.classify_candidate(token_id, next_decoder, fragment) {
+            Candidate::Partial { decoder, bytes } => {
+                self.decoder = decoder;
+                self.selected_token_ids.push(token_id);
+                self.pending = bytes;
+                Ok(())
+            }
+            Candidate::Fragment { decoder, fragment } => {
+                self.grammar.commit_token_text(&fragment)?;
+                self.decoder = decoder;
+                self.selected_token_ids.push(token_id);
+                self.pending.clear();
+                Ok(())
+            }
+            Candidate::Refused => bail!(
+                "token {token_id} cannot be used here; its bytes do not spell text the grammar accepts"
+            ),
+        }
     }
 
     fn finish(&self) -> Result<()> {
@@ -418,6 +709,26 @@ impl JsonSchemaGrammar {
     #[must_use]
     pub fn allows_token_text(&self, token_text: &str) -> bool {
         self.allows_token_bytes(token_text.as_bytes())
+    }
+
+    /// Check candidate bytes that may end in an unfinished character.
+    ///
+    /// The bytes are judged exactly like the committed output is: the prefix
+    /// must stay a viable JSON value. The bytes may end in an incomplete but
+    /// valid UTF-8 tail, and the tail is judged by its bytes, so an enum
+    /// value or a property key only admits a tail that is a byte prefix of an
+    /// allowed literal, while a free string admits any valid tail. Such a
+    /// prefix can never be complete, so EOS stays refused while a character
+    /// is pending.
+    #[must_use]
+    pub fn allows_partial_bytes(&self, bytes: &[u8]) -> bool {
+        if self.output.len().saturating_add(bytes.len()) > self.max_output_bytes {
+            return false;
+        }
+        let mut candidate = self.output.clone();
+        candidate.extend_from_slice(bytes);
+        analyze_prefix_bytes(&self.schema.root, &candidate, self.max_output_bytes, true)
+            != GrammarStatus::Dead
     }
 
     /// Commit a token only after applying the same pre-sampling viability test
@@ -1553,21 +1864,40 @@ impl ParseOutcomes {
 }
 
 fn analyze_prefix(root: &SchemaNode, bytes: &[u8], max_output_bytes: usize) -> GrammarStatus {
+    analyze_prefix_bytes(root, bytes, max_output_bytes, false)
+}
+
+/// Analyse a byte prefix, optionally keeping an unfinished character.
+///
+/// The JSON grammar matches bytes, so a prefix that ends in an incomplete but
+/// valid UTF-8 tail can be judged as it is: the tail is compared with the
+/// literals the schema allows. A prefix with such a tail can never be
+/// complete, because the character it starts has no text yet.
+fn analyze_prefix_bytes(
+    root: &SchemaNode,
+    bytes: &[u8],
+    max_output_bytes: usize,
+    allow_incomplete_tail: bool,
+) -> GrammarStatus {
     if bytes.len() > max_output_bytes {
         return GrammarStatus::Dead;
     }
-    let Ok(input) = std::str::from_utf8(bytes) else {
+    let valid_utf8 = match std::str::from_utf8(bytes) {
+        Ok(_) => true,
+        // An unfinished character: more bytes may still complete it.
+        Err(error) if allow_incomplete_tail && error.error_len().is_none() => false,
         // Candidate token fragments must be exact decoded UTF-8, not arbitrary
         // tokenizer vocabulary bytes or a partial code point.
-        return GrammarStatus::Dead;
+        Err(_) => return GrammarStatus::Dead,
     };
-    let input = input.as_bytes();
+    let input = bytes;
     let start = skip_json_whitespace(input, 0);
     let outcomes = parse_node(root, input, start, 0);
-    let complete = outcomes
-        .complete
-        .iter()
-        .any(|position| skip_json_whitespace(input, *position) == input.len());
+    let complete = valid_utf8
+        && outcomes
+            .complete
+            .iter()
+            .any(|position| skip_json_whitespace(input, *position) == input.len());
     if complete {
         GrammarStatus::Complete
     } else if outcomes.incomplete {
@@ -1651,27 +1981,56 @@ fn parse_string(input: &[u8], position: usize) -> ParseOutcomes {
                     b'u' => {
                         let (code_unit, next) = match parse_hex_escape(input, cursor + 1) {
                             HexEscape::Complete(value, next) => (value, next),
-                            HexEscape::Incomplete => return ParseOutcomes::incomplete(),
+                            HexEscape::Incomplete { low, high } => {
+                                // A partial escape still reaches a range of
+                                // code units. It cannot reach a valid one
+                                // only when every code unit it reaches is a
+                                // lone low surrogate: no continuation can
+                                // repair that.
+                                if low >= LOW_SURROGATE_START && high <= LOW_SURROGATE_END {
+                                    return ParseOutcomes::default();
+                                }
+                                return ParseOutcomes::incomplete();
+                            }
                             HexEscape::Invalid => return ParseOutcomes::default(),
                         };
                         cursor = next;
-                        if (0xD800..=0xDBFF).contains(&code_unit) {
+                        if (HIGH_SURROGATE_START..=HIGH_SURROGATE_END).contains(&code_unit) {
+                            // A high surrogate is only valid as the first
+                            // half of a surrogate pair, so the bytes that
+                            // follow it must spell `\u` and a low
+                            // surrogate. A byte that cannot start that
+                            // escape ends the value: no continuation can
+                            // repair it.
+                            match input.get(cursor) {
+                                None => return ParseOutcomes::incomplete(),
+                                Some(b'\\') => {}
+                                Some(_) => return ParseOutcomes::default(),
+                            }
                             if input.len() < cursor + 2 {
                                 return ParseOutcomes::incomplete();
                             }
-                            if input[cursor] != b'\\' || input[cursor + 1] != b'u' {
+                            if input[cursor + 1] != b'u' {
                                 return ParseOutcomes::default();
                             }
-                            let (low, next) = match parse_hex_escape(input, cursor + 2) {
+                            let (low_surrogate, next) = match parse_hex_escape(input, cursor + 2) {
                                 HexEscape::Complete(value, next) => (value, next),
-                                HexEscape::Incomplete => return ParseOutcomes::incomplete(),
+                                HexEscape::Incomplete { low, high } => {
+                                    // The pair still completes as long as the
+                                    // partial escape can reach a low
+                                    // surrogate.
+                                    if high < LOW_SURROGATE_START || low > LOW_SURROGATE_END {
+                                        return ParseOutcomes::default();
+                                    }
+                                    return ParseOutcomes::incomplete();
+                                }
                                 HexEscape::Invalid => return ParseOutcomes::default(),
                             };
-                            if !(0xDC00..=0xDFFF).contains(&low) {
+                            if !(LOW_SURROGATE_START..=LOW_SURROGATE_END).contains(&low_surrogate) {
                                 return ParseOutcomes::default();
                             }
                             cursor = next;
-                        } else if (0xDC00..=0xDFFF).contains(&code_unit) {
+                        } else if (LOW_SURROGATE_START..=LOW_SURROGATE_END).contains(&code_unit) {
                             return ParseOutcomes::default();
                         }
                     }
@@ -1685,17 +2044,38 @@ fn parse_string(input: &[u8], position: usize) -> ParseOutcomes {
     ParseOutcomes::incomplete()
 }
 
+/// The result of reading the four hex digits of a `\u` escape.
+///
+/// A partial escape still reaches a range of code units: the digits that are
+/// already there fix the high bits and the missing ones are still free. The
+/// range tells the caller whether the partial escape can still become a valid
+/// code unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HexEscape {
+    /// The four digits and the position after them.
     Complete(u16, usize),
-    Incomplete,
+    /// The code units the missing digits can still spell.
+    Incomplete { low: u16, high: u16 },
+    /// A byte that is not a hex digit.
     Invalid,
 }
 
+/// The span of code units a partial `\u` escape reaches, indexed by the
+/// number of digits it already has: the missing digits are free, so the
+/// reachable code units are the value of the prefix shifted into the high
+/// bits, up to the end of its block.
+const HEX_ESCAPE_SPANS: [u16; 4] = [0xFFFF, 0x0FFF, 0x00FF, 0x000F];
+
 fn parse_hex_escape(input: &[u8], start: usize) -> HexEscape {
     let Some(digits) = input.get(start..) else {
-        return HexEscape::Incomplete;
+        // No digit at all: every code unit is still reachable.
+        return HexEscape::Incomplete {
+            low: 0,
+            high: u16::MAX,
+        };
     };
     let mut value = 0_u16;
+    let mut count = 0_usize;
     for digit in digits.iter().take(4) {
         let nibble = match digit {
             b'0'..=b'9' => u16::from(*digit - b'0'),
@@ -1704,9 +2084,20 @@ fn parse_hex_escape(input: &[u8], start: usize) -> HexEscape {
             _ => return HexEscape::Invalid,
         };
         value = value * 16 + nibble;
+        count += 1;
     }
-    if digits.len() < 4 {
-        HexEscape::Incomplete
+    if count < 4 {
+        // The digits that are missing are still free, so the escape reaches
+        // every code unit of the block its prefix fixes.
+        let low = if count == 0 {
+            0
+        } else {
+            value << (4 * (4 - count))
+        };
+        HexEscape::Incomplete {
+            low,
+            high: low | HEX_ESCAPE_SPANS[count],
+        }
     } else {
         HexEscape::Complete(value, start + 4)
     }
@@ -2099,6 +2490,72 @@ mod tests {
         let number = JsonSchemaGrammar::from_schema(&json!({"type":"number"}))?;
         assert!(!number.allows_token_text("01"));
         assert!(!number.allows_token_text("1e+X"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_partial_escape_reaches_the_code_units_its_missing_digits_can_still_spell() {
+        // No digit at all: every code unit is still reachable.
+        assert_eq!(
+            parse_hex_escape(b"", 0),
+            HexEscape::Incomplete {
+                low: 0,
+                high: u16::MAX
+            }
+        );
+        assert_eq!(
+            parse_hex_escape(b"d", 0),
+            HexEscape::Incomplete {
+                low: 0xD000,
+                high: 0xDFFF
+            }
+        );
+        assert_eq!(
+            parse_hex_escape(b"dc", 0),
+            HexEscape::Incomplete {
+                low: 0xDC00,
+                high: 0xDCFF
+            }
+        );
+        assert_eq!(
+            parse_hex_escape(b"dc0", 0),
+            HexEscape::Incomplete {
+                low: 0xDC00,
+                high: 0xDC0F
+            }
+        );
+        assert_eq!(parse_hex_escape(b"dc00", 0), HexEscape::Complete(0xDC00, 4));
+        assert_eq!(parse_hex_escape(b"dc0z", 0), HexEscape::Invalid);
+        assert_eq!(
+            parse_hex_escape(b"dc00z", 0),
+            HexEscape::Complete(0xDC00, 4)
+        );
+    }
+
+    #[test]
+    fn a_partial_escape_stays_viable_while_it_can_reach_a_valid_code_unit() -> Result<()> {
+        let string = JsonSchemaGrammar::from_schema(&json!({"type":"string"}))?;
+        // The missing digits can still spell a code unit the grammar accepts.
+        for viable in [
+            "\"\\ud800\\ud",
+            "\"\\ud800\\udc",
+            "\"\\ud",
+            "\"\\ud8",
+            "\"\\u0",
+        ] {
+            assert!(string.allows_token_text(viable), "{viable:?}");
+        }
+        // The missing digits can only spell a code unit no continuation can
+        // repair.
+        for refused in [
+            "\"\\ud800\\u0",
+            "\"\\ud800\\ud8",
+            "\"\\ud800\\ue",
+            "\"\\udc",
+            "\"\\udfff",
+        ] {
+            assert!(!string.allows_token_text(refused), "{refused:?}");
+        }
         Ok(())
     }
 

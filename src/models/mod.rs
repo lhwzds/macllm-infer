@@ -245,15 +245,24 @@ impl JinjaChatFallback {
         prompt: &AgentPrompt,
         options: ChatTemplateOptions,
     ) -> Result<String> {
-        use crate::agent::{AgentDirective, AgentMessage};
+        use crate::agent::{
+            AgentDirective, AgentMessage, FORCED_TOOL_CALL_ARGUMENTS, FORCED_TOOL_CALL_PREFIX,
+        };
         use crate::chat::{ChatToolArguments, ChatToolCall, ChatToolFunction};
         ensure!(
             self.format.is_some(),
             "unsupported tool-call format in chat template"
         );
+        // A forced turn ends inside the call, so the model generates only the
+        // arguments of the named tool. The Hermes envelope is the one the
+        // format declares.
+        let forced = match &prompt.directive {
+            AgentDirective::ForcedSingle { name } => Some(name.as_str()),
+            _ => None,
+        };
         ensure!(
-            !matches!(prompt.directive, AgentDirective::ForcedSingle { .. }),
-            "forced or required tool choice is unsupported for generic templates"
+            forced.is_none() || self.format == Some(ToolCallFormat::Hermes),
+            "forced or required tool choice is unsupported for this tool-call format"
         );
         prompt.validate_generic()?;
         prompt.reject_generic_controls(&self.reserved)?;
@@ -305,10 +314,13 @@ impl JinjaChatFallback {
                 } => ChatMessage::tool(content, tool_call_id),
             })
             .collect();
+        // A forced turn advertises the declared tools like an automatic turn:
+        // the forced tool is the only one the caller lowered.
+        let advertises_tools = !matches!(prompt.directive, AgentDirective::TextOnly);
         let tools: Vec<_> = prompt
             .tools
             .iter()
-            .filter(|_| matches!(prompt.directive, AgentDirective::Auto))
+            .filter(|_| advertises_tools)
             .map(|tool| {
                 serde_json::json!({
                     "type": "function",
@@ -320,16 +332,28 @@ impl JinjaChatFallback {
                 })
             })
             .collect();
-        let rendered = self
+        let mut rendered = self
             .template
             .as_ref()
             .map_err(|error| anyhow::anyhow!("{error}"))?
             .render_agent(
                 &messages,
-                matches!(prompt.directive, AgentDirective::Auto).then_some(&tools),
+                advertises_tools.then_some(&tools),
                 &options,
                 true,
             )?;
+        if let Some(name) = forced {
+            // The call belongs after the reasoning block the template closed.
+            // A call inside an open block is not a call, so the render is
+            // refused instead of closed here.
+            ensure!(
+                !rendered.trim_end().ends_with("<think>"),
+                "the prompt ends inside an open reasoning block"
+            );
+            rendered.push_str(FORCED_TOOL_CALL_PREFIX);
+            rendered.push_str(name);
+            rendered.push_str(FORCED_TOOL_CALL_ARGUMENTS);
+        }
         Ok(self.with_bos_token(rendered))
     }
 
@@ -984,7 +1008,7 @@ mod generic_agent_tests {
     }
 
     #[test]
-    fn renders_tools_and_rejects_forced_choice() {
+    fn renders_tools_and_serves_a_forced_choice() {
         let source = "<tool_call>{# \"name\": \"arguments\": #}{{ tools | tojson }}{% for message in messages %}{{ message.role }}:{{ message.content }}{% endfor %}";
         let fallback = jinja_fallback(
             "test",
@@ -1028,14 +1052,162 @@ mod generic_agent_tests {
                 .unwrap(),
             "<tool_call>nulluser:hello"
         );
+        // A forced turn renders the tools like an automatic turn and ends
+        // inside the call, so the model generates only the arguments.
         prompt.directive = AgentDirective::ForcedSingle {
             name: "weather".into(),
         };
-        assert!(
-            fallback
-                .format_agent_prompt(&prompt, ChatTemplateOptions::default())
-                .is_err()
+        let forced = fallback
+            .format_agent_prompt(&prompt, ChatTemplateOptions::default())
+            .unwrap();
+        assert_eq!(
+            forced,
+            format!("{rendered}<tool_call>\n{{\"name\":\"weather\",\"arguments\":")
         );
+    }
+
+    /// A Hermes template serves the forced turn: its render is the automatic
+    /// turn with the exact suffix of the forced call.
+    #[test]
+    fn a_hermes_forced_turn_is_the_automatic_turn_and_the_suffix() {
+        let source = "{# <tool_call> \"name\": \"arguments\": #}{{ tools | tojson }}{% for message in messages %}{{ message.role }}:{{ message.content }}{% endfor %}";
+        let fallback = jinja_fallback(
+            "test",
+            GenericPaths {
+                chat: true,
+                agent: true,
+            },
+            GgufPromptTokens {
+                chat_template: Some(source),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(fallback.tool_call_format(), Some(ToolCallFormat::Hermes));
+        let mut prompt = AgentPrompt {
+            messages: vec![AgentMessage::User {
+                content: "hello".into(),
+            }],
+            tools: vec![ToolDefinition {
+                name: "weather".into(),
+                description: Some("forecast".into()),
+                parameters: serde_json::json!({"type":"object"}),
+                strict: false,
+                declaration: None,
+            }],
+            directive: AgentDirective::Auto,
+        };
+        let automatic = fallback
+            .format_agent_prompt(&prompt, ChatTemplateOptions::default())
+            .unwrap();
+        prompt.directive = AgentDirective::ForcedSingle {
+            name: "weather".into(),
+        };
+        let forced = fallback
+            .format_agent_prompt(&prompt, ChatTemplateOptions::default())
+            .unwrap();
+        assert_eq!(
+            forced,
+            format!("{automatic}<tool_call>\n{{\"name\":\"weather\",\"arguments\":")
+        );
+    }
+
+    /// A forced call cannot follow an open reasoning block: a call inside one
+    /// is not a call, so the render is refused instead of closing the block.
+    #[test]
+    fn a_forced_turn_refuses_a_render_that_ends_inside_a_reasoning_block() {
+        let source = "{# <tool_call> \"name\": \"arguments\": #}{{ tools | tojson }}<think>\n";
+        let fallback = jinja_fallback(
+            "test",
+            GenericPaths {
+                chat: true,
+                agent: true,
+            },
+            GgufPromptTokens {
+                chat_template: Some(source),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let prompt = AgentPrompt {
+            messages: vec![AgentMessage::User {
+                content: "hello".into(),
+            }],
+            tools: vec![ToolDefinition {
+                name: "weather".into(),
+                description: None,
+                parameters: serde_json::json!({"type":"object"}),
+                strict: false,
+                declaration: None,
+            }],
+            directive: AgentDirective::ForcedSingle {
+                name: "weather".into(),
+            },
+        };
+        let error = fallback
+            .format_agent_prompt(&prompt, ChatTemplateOptions::default())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("open reasoning block"),
+            "{error}"
+        );
+    }
+
+    /// Every format but Hermes refuses a forced turn: their envelopes differ.
+    #[test]
+    fn a_forced_turn_refuses_every_format_but_hermes() {
+        for (source, format) in [
+            (
+                "{# [TOOL_CALLS] #}{{ tools | tojson }}",
+                ToolCallFormat::MistralJson,
+            ),
+            (
+                "{# <tool_call> <function= #}{{ tools | tojson }}",
+                ToolCallFormat::QwenXml,
+            ),
+            (
+                "{# <|tool_call_start|> #}{{ tools | tojson }}",
+                ToolCallFormat::Pythonic,
+            ),
+        ] {
+            let fallback = jinja_fallback(
+                "test",
+                GenericPaths {
+                    chat: true,
+                    agent: true,
+                },
+                GgufPromptTokens {
+                    chat_template: Some(source),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(fallback.tool_call_format(), Some(format));
+            let prompt = AgentPrompt {
+                messages: vec![AgentMessage::User {
+                    content: "hello".into(),
+                }],
+                tools: vec![ToolDefinition {
+                    name: "weather".into(),
+                    description: None,
+                    parameters: serde_json::json!({"type":"object"}),
+                    strict: false,
+                    declaration: None,
+                }],
+                directive: AgentDirective::ForcedSingle {
+                    name: "weather".into(),
+                },
+            };
+            let error = fallback
+                .format_agent_prompt(&prompt, ChatTemplateOptions::default())
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("forced or required tool choice is unsupported"),
+                "{format:?}: {error}"
+            );
+        }
     }
 
     #[test]

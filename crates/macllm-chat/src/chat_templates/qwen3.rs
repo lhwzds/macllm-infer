@@ -10,7 +10,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    agent::{AgentDirective, AgentMessage, AgentPrompt, AgentTemplateProfile, ToolDefinition},
+    agent::{
+        AgentDirective, AgentMessage, AgentPrompt, AgentTemplateProfile,
+        FORCED_TOOL_CALL_ARGUMENTS, FORCED_TOOL_CALL_PREFIX, ToolDefinition,
+    },
     chat::{ChatMessage, ChatRole, ChatTemplateOptions, validate_chat_messages},
 };
 
@@ -317,9 +320,9 @@ pub fn format_qwen3_agent_prompt(
     // call's envelope follows the (possibly pre-closed) reasoning block.
     push_qwen3_generation_prompt(&mut rendered, options);
     if let AgentDirective::ForcedSingle { name } = &prompt.directive {
-        rendered.push_str("<tool_call>\n{\"name\":\"");
+        rendered.push_str(FORCED_TOOL_CALL_PREFIX);
         rendered.push_str(name);
-        rendered.push_str("\",\"arguments\":");
+        rendered.push_str(FORCED_TOOL_CALL_ARGUMENTS);
     }
     Ok(rendered)
 }

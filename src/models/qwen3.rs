@@ -889,15 +889,15 @@ mod tests {
                 )?
                 .ends_with("False<eos>")
         );
+        // A Hermes template serves the forced turn: the prompt ends inside
+        // the call, so the model generates only the arguments.
         prompt.directive = AgentDirective::ForcedSingle {
             name: "lookup".to_owned(),
         };
         assert!(
             adapter
-                .format_agent_prompt(&prompt)
-                .unwrap_err()
-                .to_string()
-                .contains("forced or required tool choice is unsupported")
+                .format_agent_prompt(&prompt)?
+                .ends_with("<tool_call>\n{\"name\":\"lookup\",\"arguments\":")
         );
         Ok(())
     }

@@ -347,6 +347,13 @@ pub enum AgentDirective {
     Auto,
 }
 
+/// The bytes a forced call opens with: the tool-call envelope of the Hermes
+/// format and the opening quote of the forced tool's name.
+pub const FORCED_TOOL_CALL_PREFIX: &str = "<tool_call>\n{\"name\":\"";
+/// The bytes a forced call closes the name with: the closing quote and the
+/// arguments the model continues with.
+pub const FORCED_TOOL_CALL_ARGUMENTS: &str = "\",\"arguments\":";
+
 /// A protocol-neutral function declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolDefinition {

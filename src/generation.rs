@@ -1243,7 +1243,9 @@ impl GenerationCore {
         self.generated_tokens = n_decoded;
         self.history.push(token);
         if control == TokenControl::Stop {
-            finish_constraint(&constraint)?;
+            // A caller stop sequence ended the generation: the limit is the
+            // client's, so the failure carries the client-boundary marker.
+            finish_constraint(&constraint).map_err(ConstraintClientBoundaryError::new)?;
             let metrics = self.finish(FinishReason::Stop);
             return Ok(GenerationStep::emitted(
                 consumed_tokens,
@@ -1341,15 +1343,60 @@ fn finish_constraint(constraint: &Option<&mut (dyn LogitsConstraint + 'static)>)
     Ok(())
 }
 
+/// The error of a constraint that a client-set limit ended too early.
+///
+/// The limit is the caller's, not a server fault: the token budget or a
+/// stop sequence ended the generation before the constrained value was
+/// complete. The error travels with the failure so that the serving layer
+/// can tell this case apart from a constraint that dead-ends while the
+/// model is still generating.
+#[derive(Debug)]
+pub(crate) struct ConstraintClientBoundaryError {
+    source: anyhow::Error,
+}
+
+impl ConstraintClientBoundaryError {
+    fn new(source: anyhow::Error) -> Self {
+        Self { source }
+    }
+
+    /// Whether the error chain holds the client-boundary marker.
+    pub(crate) fn is_in(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<ConstraintClientBoundaryError>()
+                .is_some()
+        })
+    }
+}
+
+impl std::fmt::Display for ConstraintClientBoundaryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "the token budget or a stop sequence ended the constrained value before it was complete",
+        )
+    }
+}
+
+impl std::error::Error for ConstraintClientBoundaryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Validate a constraint at the token budget boundary.
 ///
 /// A tool call that the budget cut short is not an error: the serving layer
-/// reports the length limit and drops the incomplete call.
+/// reports the length limit and drops the incomplete call. A response format
+/// that the budget cut short is the caller's limit, so the failure carries
+/// the client-boundary marker.
 fn finish_constraint_at_length(
     constraint: &Option<&mut (dyn LogitsConstraint + 'static)>,
 ) -> Result<()> {
     if let Some(constraint) = constraint.as_deref() {
-        constraint.finish_at_length_boundary()?;
+        constraint
+            .finish_at_length_boundary()
+            .map_err(ConstraintClientBoundaryError::new)?;
     }
     Ok(())
 }
@@ -1840,8 +1887,64 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(error.to_string().contains("incomplete structured value"));
+        // The length boundary marks the failure, and the constraint's own
+        // message still travels with it.
+        assert!(format!("{error:#}").contains("incomplete structured value"));
+        assert!(format!("{error:#}").contains("token budget"));
         assert!(visible_tokens.is_empty());
+        assert_eq!(finish_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(sequence.status(), GenerationStatus::Failed);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stop_sequence_that_cuts_a_constrained_value_carries_the_client_marker() -> Result<()> {
+        let model = FakeModel::new(8, vec![1]);
+        let finish_calls = Arc::new(AtomicUsize::new(0));
+        let mut sequence = GenerationSequence::new(
+            &model,
+            vec![0],
+            greedy(),
+            GenerationConfig {
+                max_new_tokens: 4,
+                ignore_stop_tokens: true,
+            },
+        )?;
+        sequence.set_logits_constraint(Box::new(TerminalConstraint {
+            allowed_token: 1,
+            terminal_is_valid: false,
+            finish_calls: Arc::clone(&finish_calls),
+        }))?;
+        let prepared = match sequence.prepare_step_with_budget(&model, 1, || false)? {
+            GenerationPreparation::Forward(prepared) => prepared,
+            GenerationPreparation::Complete(_) => panic!("live sequence must require a forward"),
+        };
+        let logits = {
+            let session = sequence
+                .session
+                .as_deref_mut()
+                .expect("live sequence owns its session");
+            model.forward_tokens(session, prepared.input_ids(), prepared.start_pos())?
+        };
+
+        // The caller stops the generation inside the constrained value.
+        let error = sequence
+            .complete_prepared_controlled(
+                &model,
+                prepared,
+                logits,
+                Duration::ZERO,
+                || false,
+                |_, _| Ok(TokenControl::Stop),
+            )
+            .expect_err("a stop sequence inside the constrained value must fail");
+
+        // The stop sequence is a limit the client set, so the failure carries
+        // the client-boundary marker, and the constraint's own message still
+        // travels with it.
+        assert!(ConstraintClientBoundaryError::is_in(&error));
+        assert!(format!("{error:#}").contains("stop sequence"));
+        assert!(format!("{error:#}").contains("injected incomplete structured value"));
         assert_eq!(finish_calls.load(Ordering::Relaxed), 1);
         assert_eq!(sequence.status(), GenerationStatus::Failed);
         Ok(())

@@ -22,9 +22,9 @@ use crate::{
     chat::{ChatMessage, ChatTemplateOptions},
     constraint::LogitsConstraint,
     generation::{
-        FinishReason, GenerationConfig, GenerationForwardPreview, GenerationMetrics,
-        GenerationPreparation, GenerationPreview, GenerationSequence, GenerationStep,
-        PreparedGeneration, PreparedGenerationPhase, TokenControl,
+        ConstraintClientBoundaryError, FinishReason, GenerationConfig, GenerationForwardPreview,
+        GenerationMetrics, GenerationPreparation, GenerationPreview, GenerationSequence,
+        GenerationStep, PreparedGeneration, PreparedGenerationPhase, TokenControl,
     },
     grammar::{
         CompiledJsonSchema, CompiledToolCalls, JsonSchemaTokenConstraint, LazyToolCallConstraint,
@@ -2491,9 +2491,20 @@ impl<'a> ServingScheduler<'a> {
                         .input
                         .constraint()
                         .map_or("JSON schema", EngineConstraintSpec::label);
+                    // A constraint that a client-set limit ended is the
+                    // client's limit: the token budget ran out, or a stop
+                    // sequence cut the value short. A constraint that
+                    // dead-ends while the model is still generating is a
+                    // runtime failure, not a client error: the request was
+                    // well formed.
+                    let kind = if ConstraintClientBoundaryError::is_in(&error) {
+                        EngineFailureKind::InvalidRequest
+                    } else {
+                        EngineFailureKind::Internal
+                    };
                     pending.push_back(EngineEvent::Failed {
                         message: format!("{label} generation failed: {error:#}"),
-                        kind: EngineFailureKind::InvalidRequest,
+                        kind,
                     });
                     slot.phase = ActivePhase::Delivering;
                     Self::replace_failed_slot_session_after_completion_barrier(model, slot)?;
@@ -5432,6 +5443,9 @@ mod tests {
         else {
             panic!("incomplete JSON must produce a request-local failure");
         };
+        // The token budget ended the value before it was complete, so the
+        // request asked for too few tokens: the server answers it with
+        // HTTP 400, not with HTTP 500.
         assert_eq!(kind, EngineFailureKind::InvalidRequest);
         assert!(message.contains("response_format.json_schema generation failed"));
         assert!(message.contains("complete schema-valid JSON value"));
@@ -5444,6 +5458,149 @@ mod tests {
         assert_eq!(scheduler.sessions.len(), 1);
         assert_eq!(state.next_session_id.load(Ordering::Relaxed), 2);
         assert_eq!(cleanup_drain_calls(&state), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stop_sequence_that_cuts_a_constrained_value_fails_the_request() -> Result<()> {
+        let (mut runtime, _state) = fake_runtime()?;
+        // The model always samples `{`, which the schema accepts once and then
+        // refuses. The stop sequence matches that first token, so the
+        // generation ends inside the JSON value.
+        let vocab = [
+            ("[UNK]".to_owned(), 0),
+            ("a".to_owned(), 1),
+            ("b".to_owned(), 2),
+            ("{".to_owned(), 3),
+            ("y".to_owned(), 4),
+            ("<eos>".to_owned(), 5),
+        ]
+        .into_iter()
+        .collect();
+        let tokenizer_model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_owned())
+            .build()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let mut tokenizer = Tokenizer::new(tokenizer_model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        runtime.tokenizer = Arc::new(tokenizer);
+
+        let (jobs, receiver) = mpsc::channel(2);
+        let status = Arc::new(AtomicU8::new(EngineStatus::Ready as u8));
+        let config = SchedulerConfig {
+            max_active_sequences: 1,
+            scheduler_token_budget: 1,
+            prefill_token_quantum: 1,
+            chat_template_defaults: ChatTemplateOptions::default(),
+        };
+        let mut scheduler = scheduler(&runtime, receiver, Arc::clone(&status), config)?;
+        let (mut constrained, mut constrained_ticket) = job("a", 4, 8, Duration::from_secs(1));
+        constrained.request.input = EngineInput::ConstrainedChat {
+            messages: vec![ChatMessage::user("a")],
+            constraint: EngineConstraintSpec::response_format(CompiledJsonSchema::compile(
+                &json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            )?),
+        };
+        // The stop sequence ends the generation inside the JSON value.
+        constrained.request.stop = vec!["{".to_owned()];
+        jobs.try_send(constrained)
+            .expect("constrained request fits");
+        drop(jobs);
+
+        scheduler.run();
+
+        assert!(preflight_is_ready(&mut constrained_ticket));
+        let mut failure = None;
+        while let Ok(event) = constrained_ticket.receiver.try_recv() {
+            if let EngineEvent::Failed { message, kind } = event {
+                failure = Some((message, kind));
+                break;
+            }
+        }
+        let (message, kind) =
+            failure.expect("a stop sequence inside the value must produce a request-local failure");
+        // The stop sequence is a limit the client set, so the server answers
+        // the request with HTTP 400, not with HTTP 500.
+        assert_eq!(kind, EngineFailureKind::InvalidRequest);
+        assert!(message.contains("response_format.json_schema generation failed"));
+        assert!(message.contains("stop sequence"));
+        assert!(message.contains("complete schema-valid JSON value"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_constraint_dead_end_during_generation_fails_internally() -> Result<()> {
+        let (mut runtime, _state) = fake_runtime()?;
+        // The model always samples `{`, which the schema accepts once and then
+        // refuses, so the mask runs out of candidates in the middle of the
+        // generation.
+        let vocab = [
+            ("[UNK]".to_owned(), 0),
+            ("a".to_owned(), 1),
+            ("b".to_owned(), 2),
+            ("{".to_owned(), 3),
+            ("y".to_owned(), 4),
+            ("<eos>".to_owned(), 5),
+        ]
+        .into_iter()
+        .collect();
+        let tokenizer_model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_owned())
+            .build()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let mut tokenizer = Tokenizer::new(tokenizer_model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
+        runtime.tokenizer = Arc::new(tokenizer);
+
+        let (jobs, receiver) = mpsc::channel(2);
+        let status = Arc::new(AtomicU8::new(EngineStatus::Ready as u8));
+        let config = SchedulerConfig {
+            max_active_sequences: 1,
+            scheduler_token_budget: 1,
+            prefill_token_quantum: 1,
+            chat_template_defaults: ChatTemplateOptions::default(),
+        };
+        let mut scheduler = scheduler(&runtime, receiver, Arc::clone(&status), config)?;
+        let (mut constrained, mut constrained_ticket) = job("a", 4, 8, Duration::from_secs(1));
+        constrained.request.input = EngineInput::ConstrainedChat {
+            messages: vec![ChatMessage::user("a")],
+            constraint: EngineConstraintSpec::response_format(CompiledJsonSchema::compile(
+                &json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            )?),
+        };
+        jobs.try_send(constrained)
+            .expect("constrained request fits");
+        drop(jobs);
+
+        scheduler.run();
+
+        assert!(preflight_is_ready(&mut constrained_ticket));
+        let mut failure = None;
+        while let Ok(event) = constrained_ticket.receiver.try_recv() {
+            if let EngineEvent::Failed { message, kind } = event {
+                failure = Some((message, kind));
+                break;
+            }
+        }
+        let (message, kind) =
+            failure.expect("a constraint dead end must produce a request-local failure");
+        // The request was well formed, so the failure is a runtime failure and
+        // the server answers it with HTTP 500.
+        assert_eq!(kind, EngineFailureKind::Internal);
+        assert!(message.contains("response_format.json_schema generation failed"));
+        assert!(message.contains("JSON grammar rejected every finite token candidate"));
         Ok(())
     }
 

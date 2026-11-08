@@ -460,11 +460,11 @@ qwen2/OfficialQwen2_5 assistant_text_before_call default refused/agent x-pinned 
 qwen2/OfficialQwen2_5 two_assistant_calls default refused/agent x-pinned 4f585142d296386b  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
 qwen2/OfficialQwen2_5 parallel_tool_calls default refused/agent x-pinned d14665c7cc84cab1  # undecided: the pinned validation refuses an assistant turn with two calls, the generic arm accepts the history and renders it
 qwen2/OfficialQwen2_5 tool_output_with_think default refused/agent x-pinned 71ecde1333e73383  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
-qwen2/OfficialQwen2_5 tool_choice_required default refused/refused x-both
-qwen2/OfficialQwen2_5 tool_choice_named default refused/refused x-both
+qwen2/OfficialQwen2_5 tool_choice_required default refused/agent x-pinned 6db7543c53e01ace  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
+qwen2/OfficialQwen2_5 tool_choice_named default refused/agent x-pinned 6db7543c53e01ace  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
 qwen2/OfficialQwen2_5 tool_choice_none default chat/chat =
 qwen2/OfficialQwen2_5 automatic_tool_call default refused/agent x-pinned 9d9ab80e586e6453  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
-qwen2/OfficialQwen2_5 forced_tool_call default refused/refused x-both
+qwen2/OfficialQwen2_5 forced_tool_call default refused/agent x-pinned 6db7543c53e01ace  # undecided: the family owns no pinned agent path; the pinned renderer refuses the agent prompt, the shared engine renders it
 qwen2/OfficialQwen2_5 multi_part_content default refused/refused x-both
 qwen2/OfficialQwen2_5 system_only default refused/refused x-both
 qwen2/OfficialQwen2_5 explicit_thinking_off default refused/refused x-both
@@ -571,21 +571,21 @@ qwen3/Current parallel_tool_calls off refused/agent x-pinned ec410fbe39a3dd6e  #
 qwen3/Current tool_output_with_think default agent/agent =
 qwen3/Current tool_output_with_think on agent/agent =
 qwen3/Current tool_output_with_think off agent/agent =
-qwen3/Current tool_choice_required default agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
-qwen3/Current tool_choice_required on agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
-qwen3/Current tool_choice_required off agent/refused x-generic 5118dd9f0d357243  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
-qwen3/Current tool_choice_named default agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
-qwen3/Current tool_choice_named on agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
-qwen3/Current tool_choice_named off agent/refused x-generic 5118dd9f0d357243  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Current tool_choice_required default agent/agent =
+qwen3/Current tool_choice_required on agent/agent =
+qwen3/Current tool_choice_required off agent/agent =
+qwen3/Current tool_choice_named default agent/agent =
+qwen3/Current tool_choice_named on agent/agent =
+qwen3/Current tool_choice_named off agent/agent =
 qwen3/Current tool_choice_none default chat/chat =
 qwen3/Current tool_choice_none on chat/chat =
 qwen3/Current tool_choice_none off chat/chat =
 qwen3/Current automatic_tool_call default agent/agent =
 qwen3/Current automatic_tool_call on agent/agent =
 qwen3/Current automatic_tool_call off agent/agent =
-qwen3/Current forced_tool_call default agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
-qwen3/Current forced_tool_call on agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
-qwen3/Current forced_tool_call off agent/refused x-generic 5118dd9f0d357243  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Current forced_tool_call default agent/agent =
+qwen3/Current forced_tool_call on agent/agent =
+qwen3/Current forced_tool_call off agent/agent =
 qwen3/Current multi_part_content default refused/refused x-both
 qwen3/Current multi_part_content on refused/refused x-both
 qwen3/Current multi_part_content off refused/refused x-both
@@ -700,21 +700,21 @@ qwen3/Gguf parallel_tool_calls off refused/agent x-pinned ec410fbe39a3dd6e  # un
 qwen3/Gguf tool_output_with_think default agent/agent =
 qwen3/Gguf tool_output_with_think on agent/agent =
 qwen3/Gguf tool_output_with_think off agent/agent =
-qwen3/Gguf tool_choice_required default agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
-qwen3/Gguf tool_choice_required on agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
-qwen3/Gguf tool_choice_required off agent/refused x-generic 5118dd9f0d357243  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
-qwen3/Gguf tool_choice_named default agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
-qwen3/Gguf tool_choice_named on agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
-qwen3/Gguf tool_choice_named off agent/refused x-generic 5118dd9f0d357243  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Gguf tool_choice_required default agent/agent =
+qwen3/Gguf tool_choice_required on agent/agent =
+qwen3/Gguf tool_choice_required off agent/agent =
+qwen3/Gguf tool_choice_named default agent/agent =
+qwen3/Gguf tool_choice_named on agent/agent =
+qwen3/Gguf tool_choice_named off agent/agent =
 qwen3/Gguf tool_choice_none default chat/chat =
 qwen3/Gguf tool_choice_none on chat/chat =
 qwen3/Gguf tool_choice_none off chat/chat =
 qwen3/Gguf automatic_tool_call default agent/agent =
 qwen3/Gguf automatic_tool_call on agent/agent =
 qwen3/Gguf automatic_tool_call off agent/agent =
-qwen3/Gguf forced_tool_call default agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
-qwen3/Gguf forced_tool_call on agent/refused x-generic e8427299203a4fa6  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
-qwen3/Gguf forced_tool_call off agent/refused x-generic 5118dd9f0d357243  # undecided: the generic gate refuses a forced tool choice, the pinned agent renderer serves the turn
+qwen3/Gguf forced_tool_call default agent/agent =
+qwen3/Gguf forced_tool_call on agent/agent =
+qwen3/Gguf forced_tool_call off agent/agent =
 qwen3/Gguf multi_part_content default refused/refused x-both
 qwen3/Gguf multi_part_content on refused/refused x-both
 qwen3/Gguf multi_part_content off refused/refused x-both
