@@ -14,6 +14,7 @@ path = "src/lib.rs"
 default = []
 metal = ["candle-core/metal"]
 accelerate = ["candle-core/accelerate"]
+cuda = ["candle-core/cuda"]
 # Publish the test-only materialization counter so the crates that assert on
 # it can reach it across the crate boundary.
 test-exports = []

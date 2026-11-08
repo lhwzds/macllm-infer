@@ -19,6 +19,7 @@ metal = [
     "macllm-kv/metal",
 ]
 accelerate = ["candle-core/accelerate", "macllm-kv/accelerate"]
+cuda = ["candle-core/cuda", "macllm-kv/cuda"]
 
 [dependencies]
 candle-core = { workspace = true }

@@ -513,6 +513,7 @@ impl TaskRuntimeConfig {
             device: match config.device {
                 DeviceKind::Cpu => "cpu",
                 DeviceKind::Metal => "metal",
+                DeviceKind::Cuda => "cuda",
             }
             .to_owned(),
             dtype: match runtime.dtype {

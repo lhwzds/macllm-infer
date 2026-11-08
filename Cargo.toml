@@ -62,6 +62,13 @@ accelerate = [
     "macllm-kv/accelerate",
     "candle-transformers/accelerate",
 ]
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+    "macllm-kernels/cuda",
+    "macllm-kv/cuda",
+]
 
 [dependencies]
 anyhow = { workspace = true }

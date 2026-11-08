@@ -36,11 +36,14 @@ use serde::Serialize;
 
 /// Default `--device` value for this build.
 ///
-/// Builds with the `metal` feature select the Metal backend. Builds without
-/// it select the CPU backend, because such a binary cannot create a Metal
-/// device and would otherwise fail while loading the model.
+/// Builds with the `metal` feature select the Metal backend. Builds with the
+/// `cuda` feature but without Metal select the CUDA backend. Builds without
+/// either select the CPU backend, because such a binary cannot create a Metal
+/// or CUDA device and would otherwise fail while loading the model.
 const DEFAULT_DEVICE: &str = if cfg!(feature = "metal") {
     "metal"
+} else if cfg!(feature = "cuda") {
+    "cuda"
 } else {
     "cpu"
 };
@@ -1708,6 +1711,8 @@ mod tests {
         assert_eq!(rerank.document, ["first", "second"]);
         let expected_device = if cfg!(feature = "metal") {
             DeviceKind::Metal
+        } else if cfg!(feature = "cuda") {
+            DeviceKind::Cuda
         } else {
             DeviceKind::Cpu
         };
@@ -2528,6 +2533,8 @@ mod tests {
         // the automatic quantum follows it as well.
         let expected_device = if cfg!(feature = "metal") {
             DeviceKind::Metal
+        } else if cfg!(feature = "cuda") {
+            DeviceKind::Cuda
         } else {
             DeviceKind::Cpu
         };

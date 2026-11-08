@@ -19,6 +19,7 @@ use crate::{
         CausalLm, CausalLmBatchCapability, CausalLmKvReservation, CausalLmSession,
         KvCacheExhausted, KvCacheReservationError, PrefixCacheDiagnostics,
     },
+    backend::device_label,
     chat::{ChatMessage, ChatTemplateOptions},
     constraint::LogitsConstraint,
     generation::{
@@ -1287,12 +1288,7 @@ fn worker_main(
         served_model,
         family: runtime.adapter.family().to_owned(),
         max_context: runtime.model.runtime_spec().max_context,
-        device: if runtime.model.device().is_metal() {
-            "metal"
-        } else {
-            "cpu"
-        }
-        .to_owned(),
+        device: device_label(runtime.model.device()).to_owned(),
         dtype: format!("{:?}", runtime.dtype).to_ascii_lowercase(),
         chat_template_defaults: scheduler_config
             .chat_template_defaults
