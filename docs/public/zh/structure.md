@@ -8,13 +8,13 @@ title: 代码结构
 
 本页由 Codocia 根据代码自动生成，每次 build 重新计算：功能区划分、各区自带的说明、区之间的 import 依赖，以及讲解各区的页面。
 
-范围内共 120 个文件，119,405 行；已排除 `tests/fixtures/**`、`Cargo.lock`、`LICENSE-MIT`、`README_CN.md`、`.gitignore`
+范围内共 120 个文件，119,414 行；已排除 `tests/fixtures/**`、`Cargo.lock`、`LICENSE-MIT`、`README_CN.md`、`.gitignore`
 
 ## 文件结构
 
 **仓库根目录**
 
-- （根目录文件） — 379 行，5 个文件。An Apple Silicon-first Rust LLM inference runtime\
+- （根目录文件） — 388 行，5 个文件。An Apple Silicon-first Rust LLM inference runtime\
   核心文件：`build.rs`\
   讲解：[概览与支持矩阵](01-overview.md) (1), [工作原理](04-how-it-works.md) (1)
 - `benchmarks/` — 144 行，3 个文件\

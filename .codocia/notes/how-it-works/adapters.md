@@ -16,7 +16,7 @@ evidence:
   - src/gguf_model.rs:2650-2653 #8832fc29b798
 ---
 
-`ModelAdapter` is the only place family code lives. An adapter turns a config or GGUF metadata into a `RuntimeSpec` and a `DecoderSpec`, maps weight names, and renders chat or agent prompts. Unpinned GGUF templates go to a generic Jinja renderer (`attach_prompt_tokens` in the Qwen adapters, `with_jinja_fallback` for the rest). Every adapter's `build_model` returns a `DecoderModel`, so attention, caching, batching and sampling are written once.
+`ModelAdapter` is the only place family code lives. An adapter turns a config or GGUF metadata into a `RuntimeSpec` and a `DecoderSpec`, maps weight names, and renders chat or agent prompts. Unpinned GGUF templates go to a generic Jinja renderer (`attach_prompt_tokens` for Qwen3/Qwen3MoE/Qwen3.5, `with_jinja_fallback` for the rest, Qwen2 included). Every adapter's `build_model` returns a `DecoderModel`, so attention, caching, batching and sampling are written once.
 
 A `DecoderSpec` is a list of per-layer specs. Each layer picks a `SequenceMixerSpec`: `Attention` (full or sliding causal, RoPE or NoPE), `ShortConvolution` (LFM2), `GatedDeltaNet` (Qwen3.5) or `ParallelAttentionMamba2` (Falcon-H1), plus a dense or sparse-MoE feed-forward. Hybrid models are just layer lists; the decoder implements the `CausalLm` trait the rest of the runtime uses.
 

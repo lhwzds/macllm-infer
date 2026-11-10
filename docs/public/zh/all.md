@@ -77,7 +77,7 @@ MacLLM Infer 是一个以 Apple Silicon 为先的 Rust workspace，通过 Candle
 
 ### 用 run 生成文本
 
-`run` 通过 adapter 的对话模板渲染 `--prompt`（以及可选的 `--system`），完成 tokenization 后把解码出的文本流式输出到 stdout。Adapter 按字节固定（pin）的模板由它自己渲染；GGUF 文件中内嵌的未固定模板交给通用 Jinja 渲染器；两者都没有的 checkpoint 会直接失败。`--raw-prompt` 会绕过模板，原样对 prompt 做 tokenization。`--add-special-tokens` 让 tokenizer 添加 BOS/EOS；对于本身已经包含 BOS 的模板，不要打开它。
+`run` 通过 adapter 的对话模板渲染 `--prompt`（以及可选的 `--system`），完成 tokenization 后把解码出的文本流式输出到 stdout。Adapter 逐字节渲染它固定（pin）的对话模板；GGUF 文件中内嵌的未固定模板交给通用 Jinja 渲染器；两者都没有的 checkpoint 会直接失败。`--raw-prompt` 会绕过模板，原样对 prompt 做 tokenization。`--add-special-tokens` 让 tokenizer 添加 BOS/EOS；对于本身已经包含 BOS 的模板，不要打开它。
 
 采样默认值：`--max-new-tokens 128`、`--temperature 0.7`（0 表示贪心 argmax）、`--top-k 20`、`--top-p 0.8`、`--repetition-penalty 1.1`、`--seed 42`。
 
@@ -155,7 +155,7 @@ MacLLM Infer 是一个以 Apple Silicon 为先的 Rust workspace，通过 Candle
 - `stop` 接受一个字符串或最多 4 个字符串。
 - `stream` 支持 `stream_options.include_usage`；`include_obfuscation=true` 会被拒绝。
 - `chat_template_kwargs` 只接受布尔值的 `enable_thinking`。
-- 角色：`system`、`user`、`assistant`，以及工具调用历史中的 `tool`（字符串内容加上一个 `tool_call_id`，回应前一个 assistant 轮次中的某个调用）。该轮次只能包含一个调用；在检测到工具调用格式的通用模板上可以包含多个。assistant 的 `reasoning_content` 只被 Qwen3、Qwen3MoE 和 Qwen3.5 的模板接受。`function`、`developer`、`name`、多模态内容、`logprobs` 和 `top_logprobs` 都会被拒绝。
+- 角色：`system`、`user`、`assistant`，以及工具调用历史中的 `tool`（字符串内容加上一个 `tool_call_id`，回应前一个 assistant 轮次中的某个调用）。该轮次只能包含一个调用；在检测到工具调用格式的通用模板上可以包含多个。assistant 的 `reasoning_content` 只对 Qwen3、Qwen3MoE 和 Qwen3.5 模型族接受，不论由哪种模板渲染。`function`、`developer`、`name`、多模态内容、`logprobs` 和 `top_logprobs` 都会被拒绝。
 
 `usage.prompt_tokens_details.cached_tokens` 报告有多少 prompt token 来自 prefix cache。
 
@@ -210,7 +210,7 @@ flowchart LR
 
 ### Adapter 与共享 decoder
 
-`ModelAdapter` 是唯一存放模型家族代码的地方。Adapter 把配置或 GGUF 元数据转换成 `RuntimeSpec` 和 `DecoderSpec`，映射权重名称，并渲染 chat 或 agent prompt。未固定的 GGUF 模板交给通用 Jinja 渲染器（Qwen adapter 在 `attach_prompt_tokens` 中处理，其余由 `with_jinja_fallback` 处理）。每个 adapter 的 `build_model` 都返回 `DecoderModel`，因此 attention、缓存、批处理和采样只需实现一次。
+`ModelAdapter` 是唯一存放模型家族代码的地方。Adapter 把配置或 GGUF 元数据转换成 `RuntimeSpec` 和 `DecoderSpec`，映射权重名称，并渲染 chat 或 agent prompt。未固定的 GGUF 模板交给通用 Jinja 渲染器（Qwen3、Qwen3MoE 和 Qwen3.5 在 `attach_prompt_tokens` 中处理，其余包括 Qwen2 由 `with_jinja_fallback` 处理）。每个 adapter 的 `build_model` 都返回 `DecoderModel`，因此 attention、缓存、批处理和采样只需实现一次。
 
 `DecoderSpec` 是逐层 spec 的列表。每一层选择一种 `SequenceMixerSpec`：`Attention`（full 或 sliding causal，RoPE 或 NoPE）、`ShortConvolution`（LFM2）、`GatedDeltaNet`（Qwen3.5）或 `ParallelAttentionMamba2`（Falcon-H1），再加上一个 dense 或 sparse-MoE 前馈层。混合架构模型只是不同的层列表；decoder 实现了运行时其余部分所使用的 `CausalLm` trait。
 
@@ -332,13 +332,13 @@ Scoreboard manifest（`schema_version` 1，见 `benchmarks/manifests/`）固定�
 
 本页由 Codocia 根据代码自动生成，每次 build 重新计算：功能区划分、各区自带的说明、区之间的 import 依赖，以及讲解各区的页面。
 
-范围内共 120 个文件，119,405 行；已排除 `tests/fixtures/**`、`Cargo.lock`、`LICENSE-MIT`、`README_CN.md`、`.gitignore`
+范围内共 120 个文件，119,414 行；已排除 `tests/fixtures/**`、`Cargo.lock`、`LICENSE-MIT`、`README_CN.md`、`.gitignore`
 
 ### 文件结构
 
 **仓库根目录**
 
-- （根目录文件） — 379 行，5 个文件。An Apple Silicon-first Rust LLM inference runtime\
+- （根目录文件） — 388 行，5 个文件。An Apple Silicon-first Rust LLM inference runtime\
   核心文件：`build.rs`\
   讲解：[概览与支持矩阵](#overview) (1), [工作原理](#how-it-works) (1)
 - `benchmarks/` — 144 行，3 个文件\

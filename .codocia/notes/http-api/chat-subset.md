@@ -23,6 +23,6 @@ Unknown JSON fields are a 400, and known-but-unsupported fields return an OpenAI
 - `stop` takes a string or up to 4 strings.
 - `stream` with `stream_options.include_usage`; `include_obfuscation=true` is rejected.
 - `chat_template_kwargs` accepts only a boolean `enable_thinking`.
-- Roles: `system`, `user`, `assistant`, and `tool` in tool-call histories (string content and a `tool_call_id` answering a call of the preceding assistant turn). That turn holds exactly one call, or several on generic templates with a detected tool-call format. Assistant `reasoning_content` is accepted only by the Qwen3, Qwen3MoE and Qwen3.5 templates. `function`, `developer`, `name`, multimodal content, `logprobs` and `top_logprobs` are rejected.
+- Roles: `system`, `user`, `assistant`, and `tool` in tool-call histories (string content and a `tool_call_id` answering a call of the preceding assistant turn). That turn holds exactly one call, or several on generic templates with a detected tool-call format. Assistant `reasoning_content` is accepted only for the Qwen3, Qwen3MoE and Qwen3.5 model families, whichever template renders them. `function`, `developer`, `name`, multimodal content, `logprobs` and `top_logprobs` are rejected.
 
 `usage.prompt_tokens_details.cached_tokens` reports how many prompt tokens came from the prefix cache.

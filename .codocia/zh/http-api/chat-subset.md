@@ -1,6 +1,6 @@
 ---
 title: /v1/chat/completions 接受哪些字段
-source: #dd0475f698da
+source: #cc4a5c7364af
 ---
 
 未知 JSON 字段返回 400；已知但不支持的字段返回 OpenAI 格式的错误，而不是被丢弃。
@@ -11,6 +11,6 @@ source: #dd0475f698da
 - `stop` 接受一个字符串或最多 4 个字符串。
 - `stream` 支持 `stream_options.include_usage`；`include_obfuscation=true` 会被拒绝。
 - `chat_template_kwargs` 只接受布尔值的 `enable_thinking`。
-- 角色：`system`、`user`、`assistant`，以及工具调用历史中的 `tool`（字符串内容加上一个 `tool_call_id`，回应前一个 assistant 轮次中的某个调用）。该轮次只能包含一个调用；在检测到工具调用格式的通用模板上可以包含多个。assistant 的 `reasoning_content` 只被 Qwen3、Qwen3MoE 和 Qwen3.5 的模板接受。`function`、`developer`、`name`、多模态内容、`logprobs` 和 `top_logprobs` 都会被拒绝。
+- 角色：`system`、`user`、`assistant`，以及工具调用历史中的 `tool`（字符串内容加上一个 `tool_call_id`，回应前一个 assistant 轮次中的某个调用）。该轮次只能包含一个调用；在检测到工具调用格式的通用模板上可以包含多个。assistant 的 `reasoning_content` 只对 Qwen3、Qwen3MoE 和 Qwen3.5 模型族接受，不论由哪种模板渲染。`function`、`developer`、`name`、多模态内容、`logprobs` 和 `top_logprobs` 都会被拒绝。
 
 `usage.prompt_tokens_details.cached_tokens` 报告有多少 prompt token 来自 prefix cache。
