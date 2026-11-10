@@ -12,7 +12,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    backend::{DTypeKind, DeviceKind},
+    backend::{DTypeKind, device_label},
     generation::{FinishReason, GenerationMetrics},
     rerank::RerankScore,
     runtime::{LoadedRuntime, ModelLoadConfig},
@@ -20,10 +20,11 @@ use crate::{
 };
 
 use super::file_stamp::file_stamp;
+use super::host::collect_task_host;
 use super::provenance::parse_snapshot_provenance;
 use super::{
     FileProvenance, FileProvenanceGuard, GREEDY_SEED, GreedySamplingSpec, MacllmProvenanceGuard,
-    SanitizedHost, SnapshotProvenance, collect_macos_host, file_provenance, token_ids_sha256,
+    SanitizedHost, SnapshotProvenance, file_provenance, token_ids_sha256,
 };
 
 pub const TASK_BENCHMARK_SCHEMA_VERSION: u32 = 1;
@@ -91,13 +92,11 @@ struct LocalFileDigest {
 impl LocalFileDigest {
     fn capture(file: &FileProvenance, base: Option<&Path>) -> Result<Self> {
         let path = match base {
-            Some(base) => file
-                .canonical_path
-                .strip_prefix(base)
-                .context("checkpoint file is outside its model root")?
-                .to_str()
-                .context("checkpoint relative path is not valid UTF-8")?
-                .to_owned(),
+            Some(base) => recorded_checkpoint_path(
+                file.canonical_path
+                    .strip_prefix(base)
+                    .context("checkpoint file is outside its model root")?,
+            )?,
             None => file.filename.clone(),
         };
         Ok(Self {
@@ -106,6 +105,34 @@ impl LocalFileDigest {
             sha256: file.sha256.clone(),
         })
     }
+}
+
+/// The relative path of one checkpoint file, with `/` separators.
+///
+/// The recorded path is the same on every operating system, so a report that
+/// a Windows host produced can be compared with a report that another host
+/// produced. The path is rebuilt from its components, so a Windows host never
+/// records a `\` separator.
+fn recorded_checkpoint_path(path: &Path) -> Result<String> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => components.push(
+                part.to_str()
+                    .context("checkpoint relative path is not valid UTF-8")?
+                    .to_owned(),
+            ),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                anyhow::bail!("checkpoint relative path leaves its model root")
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("checkpoint relative path is not relative")
+            }
+        }
+    }
+    ensure!(!components.is_empty(), "checkpoint relative path is empty");
+    Ok(components.join("/"))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -510,12 +537,9 @@ impl TaskRuntimeConfig {
         );
         Ok(Self {
             family,
-            device: match config.device {
-                DeviceKind::Cpu => "cpu",
-                DeviceKind::Metal => "metal",
-                DeviceKind::Cuda => "cuda",
-            }
-            .to_owned(),
+            // The label follows the device that runs the model, so a CUDA
+            // benchmark records the CUDA device without probing the GPU.
+            device: device_label(runtime.model.device()).to_owned(),
             dtype: match runtime.dtype {
                 DTypeKind::F32 => "f32",
                 DTypeKind::F16 => "f16",
@@ -661,9 +685,11 @@ impl TaskBenchmarkGuard {
                 && matches!(env!("MACLLM_BUILD_OPT_LEVEL"), "1" | "2" | "3" | "s" | "z"),
             "task benchmarks require an optimized build"
         );
-        // The host is collected first, so a host that cannot publish a
-        // benchmark refuses before the model is hashed.
-        let host = collect_macos_host()?;
+        // The host is collected first, so a host that cannot run the
+        // benchmark refuses before the model is hashed. Task benchmarks
+        // publish nothing, so they record the sanitized host of every
+        // operating system that the runtime supports.
+        let host = collect_task_host()?;
         let build = MacllmProvenanceGuard::capture_publishable()?;
         let (checkpoint, checkpoint_guard) = TaskCheckpointProvenance::capture(&config.model)?;
         Ok(Self {
@@ -1161,6 +1187,43 @@ mod tests {
         let json = serde_json::to_string(&provenance)?;
         assert!(!json.contains(directory.path().to_string_lossy().as_ref()));
         assert!(!json.contains("canonical_path"));
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_relative_paths_use_forward_slashes() -> Result<()> {
+        let relative = Path::new("shards")
+            .join("parts")
+            .join("model-00001-of-00001.safetensors");
+        let recorded = recorded_checkpoint_path(&relative)?;
+        assert_eq!(recorded, "shards/parts/model-00001-of-00001.safetensors");
+        assert!(!recorded.contains('\\'));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_checkpoint_weights_record_forward_slash_paths() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        write_task_checkpoint(directory.path())?;
+        fs::remove_file(directory.path().join("model.safetensors"))?;
+        let parts = directory.path().join("shards").join("parts");
+        fs::create_dir_all(&parts)?;
+        fs::write(parts.join("model-00001-of-00001.safetensors"), b"weights")?;
+        fs::write(
+            directory.path().join("model.safetensors.index.json"),
+            br#"{"weight_map":{"model.weight":"shards/parts/model-00001-of-00001.safetensors"}}"#,
+        )?;
+        let (provenance, guard) = TaskCheckpointProvenance::capture(directory.path())?;
+        guard.finish()?;
+        assert_eq!(
+            provenance.weights[0].path,
+            "shards/parts/model-00001-of-00001.safetensors"
+        );
+        let json = serde_json::to_string(&provenance)?;
+        assert!(
+            !json.contains('\\'),
+            "the report records a backslash: {json}"
+        );
         Ok(())
     }
 
