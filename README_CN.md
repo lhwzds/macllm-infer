@@ -14,7 +14,8 @@ tokenization、批处理、缓存、采样和服务层由所有模型复用。�
 
 ## 核心能力
 
-- Apple Metal 和 CPU 执行，支持量化 GGUF 模型。
+- Apple Metal、NVIDIA CUDA（使用 `--features cuda` 构建）和 CPU 执行，支持量化 GGUF
+  模型。
 - GGUF v3 单文件、规范分片，以及部分 Safetensors profile。
 - 12 种架构 dispatch：`llama`、`qwen2`、`qwen3`、`qwen3moe`、`qwen35`、
   `gemma`、`gemma2`、`gemma3`、`granitemoe`、`lfm2`、`falcon-h1` 和 `smollm3`。
@@ -24,8 +25,10 @@ tokenization、批处理、缓存、采样和服务层由所有模型复用。�
   exact-token automatic prefix cache。
 - 通过共用同一 runtime 的 `run`、`embed` 和 `rerank` 命令完成生成、向量嵌入和重排序。
 - 纯文本 Chat Completions-compatible API 子集，支持受约束 JSON 生成、stop sequence、
-  已适配 Qwen3/Qwen3MoE profile 的 native tool call（forced，或 `tool_choice=auto`，
-  每轮最多一个受 grammar 约束的调用），以及 cached-token 统计。
+  native tool call（最多 128 个工具）和 cached-token 统计：`tool_choice=auto` 可用于
+  固定的 Qwen3/Qwen3MoE/Qwen3.5 模板，以及调用格式能被检测的通用 GGUF 模板
+  （Hermes、Qwen XML、Llama 3 JSON、Mistral JSON、Granite JSON、Pythonic）；受 schema
+  约束的强制调用适用于固定的 Qwen3/Qwen3MoE 和通用 Hermes 模板。
 - 固定模型和 runtime provenance 的 MacLLM/llama.cpp 可重复 benchmark。
 
 当前已经完成真实验证的垂直切片包括 SmolLM3-3B Q4_K_M 生成，以及 Qwen3
@@ -58,8 +61,12 @@ cargo build --release
   --port 8080
 ```
 
-默认设备是 Metal；使用 `--device cpu` 可以切换到 CPU。遇到未知 chat template 时，
-请显式传入 `--raw-prompt`。MacLLM 不执行任意 Jinja，也不会静默猜测模板。
+- 默认构建以 Metal 为默认设备；不带 Metal 的构建如果启用了 `cuda` feature 就默认
+  `cuda`，否则默认 `cpu`；`--device` 可以覆盖这个默认值。
+- Adapter 按字节固定（pin）的对话模板由它自己渲染；GGUF 文件中内嵌的未固定模板交给
+  通用 Jinja 渲染器渲染。
+- 固定模板和内嵌模板都没有的 checkpoint 会直接失败，而不是静默猜测；
+  `run --raw-prompt` 会原样对 prompt 做 tokenization。
 
 面向 agent 客户端时，`serve --default-max-completion-tokens N` 设置未指定输出长度的请求的
 默认上限（默认 128），`--disable-thinking` 以 `enable_thinking=false` 渲染模板使用该选项的 prompt；

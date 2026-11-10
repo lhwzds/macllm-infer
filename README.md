@@ -15,7 +15,8 @@ compatibility, output correctness, memory use, and performance—not an ABI targ
 
 ## Highlights
 
-- Apple Metal and CPU execution, with quantized GGUF support.
+- Apple Metal, NVIDIA CUDA (build with `--features cuda`) and CPU execution, with
+  quantized GGUF support.
 - GGUF v3 single files and canonical shards, plus selected Safetensors profiles.
 - Dispatch for 12 architectures: `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35`,
   `gemma`, `gemma2`, `gemma3`, `granitemoe`, `lfm2`, `falcon-h1`, and `smollm3`.
@@ -26,9 +27,12 @@ compatibility, output correctness, memory use, and performance—not an ABI targ
 - Generation, embedding, and reranking through the `run`, `embed`, and `rerank`
   commands, backed by the same runtime.
 - A text-only Chat Completions-compatible API subset with constrained JSON
-  generation, stop sequences, native tool calls for supported Qwen3/Qwen3MoE
-  profiles (forced, or `tool_choice=auto` with at most one grammar-constrained
-  call per turn), and cached-token accounting.
+  generation, stop sequences, native tool calls (up to 128 tools), and
+  cached-token accounting: `tool_choice=auto` on pinned Qwen3/Qwen3MoE/Qwen3.5
+  templates and on generic GGUF templates whose call format is detected (Hermes,
+  Qwen XML, Llama 3 JSON, Mistral JSON, Granite JSON, Pythonic), and
+  schema-constrained forced calls on pinned Qwen3/Qwen3MoE and generic Hermes
+  templates.
 - Reproducible MacLLM/llama.cpp benchmarks with pinned model and runtime provenance.
 
 The current validated vertical slices include SmolLM3-3B Q4_K_M generation and
@@ -61,9 +65,14 @@ cargo build --release
   --port 8080
 ```
 
-Metal is the default device; pass `--device cpu` to use the CPU. For an unknown
-chat template, pass `--raw-prompt` explicitly. MacLLM does not execute arbitrary
-Jinja templates or silently guess a template.
+- Metal is the default device of the default build; a build without Metal
+  defaults to `cuda` when built with the `cuda` feature, else `cpu`;
+  `--device` overrides it.
+- Adapters render the chat templates they pin byte-for-byte; a GGUF file whose
+  template is not pinned is rendered by the generic Jinja renderer from the
+  template embedded in the file.
+- A checkpoint with neither a pinned nor an embedded template fails instead of
+  guessing; `run --raw-prompt` tokenizes a prompt verbatim.
 
 For agent clients, `serve --default-max-completion-tokens N` sets the budget of
 requests that omit one (default 128), and `--disable-thinking` renders prompts
