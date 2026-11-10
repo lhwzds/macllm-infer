@@ -63,7 +63,7 @@ cargo build --release
 
 - 默认构建以 Metal 为默认设备；不带 Metal 的构建如果启用了 `cuda` feature 就默认
   `cuda`，否则默认 `cpu`；`--device` 可以覆盖这个默认值。
-- Adapter 按字节固定（pin）的对话模板由它自己渲染；GGUF 文件中内嵌的未固定模板交给
+- Adapter 逐字节渲染它固定（pin）的对话模板；GGUF 文件中内嵌的未固定模板交给
   通用 Jinja 渲染器渲染。
 - 固定模板和内嵌模板都没有的 checkpoint 会直接失败，而不是静默猜测；
   `run --raw-prompt` 会原样对 prompt 做 tokenization。

@@ -23,7 +23,7 @@ ignore:
 langs:
   - zh
 translations:
-  - README_CN.md: README.md #125be12f7683
+  - README_CN.md: README.md #dbfb8fa5fde7
 ---
 
 These docs go one level below the README of MacLLM Infer, a Rust, Apple
