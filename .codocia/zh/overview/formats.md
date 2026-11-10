@@ -1,9 +1,9 @@
 ---
 title: 支持的格式和架构
-source: #637d49d44d26
+source: #8475c162ae86
 ---
 
-`ModelFiles::from_dir` 接受单个 `.gguf` 文件或一个目录。同时包含 GGUF 和 Safetensors 权重的目录会被拒绝；其他情况下发现文件时 GGUF 优先，规范的 GGUF 分片集合会作为一个逻辑文件打开。
+`ModelFiles::from_dir` 接受单个 `.gguf` 文件或一个目录。同时包含 GGUF 和 Safetensors 权重的目录会被拒绝；`macllm download` 标记为未下载完成的目录也会被拒绝。其他情况下发现文件时 GGUF 优先，规范的 GGUF 分片集合会作为一个逻辑文件打开。
 
 两种格式覆盖的架构并不相同：
 

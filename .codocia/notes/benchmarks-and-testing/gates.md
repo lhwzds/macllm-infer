@@ -22,7 +22,8 @@ evidence:
   - tests/gguf_reference.rs:1-5 #a14855f0b937
   - tests/qwen_gguf_reference.rs:1-10 #5ed1fc560dc8
   - tests/sharded_gguf_reference.rs:1-5 #0b2a66d9f595
-  - tests/gemma_gguf_reference.rs:129-146 #a773fc14c5db
+  - tests/gemma_gguf_reference.rs:127-146 #363f0e6acf9d
+  - tests/qwen3_4b_gguf_reference.rs:1-10 #d1b733f97e73
 ---
 
 Real-model tests are `#[ignore]`d and need their fixture files. The Gemma 1 gate is typical. It pins the public file by size and SHA-256 and checks the prompt token IDs. On CPU and on Metal, it asserts that cached decode matches a fresh full forward (same argmax, maximum-difference and relative-RMS logit bounds) and that greedy generation reproduces `llama.cpp`'s token IDs. Other gates compare against `llama.cpp` goldens, Candle's independent implementations, or both.
@@ -33,7 +34,7 @@ Real-model tests are `#[ignore]`d and need their fixture files. The Gemma 1 gate
 | `gemma2` / `gemma3` | Gemma 2 2B-it Q4_K_M / Gemma 3 270M-it QAT Q4_0 |
 | `smollm3` | SmolLM3-3B Q4_K_M (official) |
 | `llama` | SmolLM2-135M, Llama 3.2 1B Q4_K_M, TinyLlama Q2_K and Q3_K_M, TinyMistral-6x248M MoE |
-| `qwen2` / `qwen3` / `qwen35` | Qwen2.5-0.5B Q4_0 / Qwen3-0.6B Q8_0 (also as 12 shards) / Qwen3.5-0.8B Q4_0 |
+| `qwen2` / `qwen3` / `qwen35` | Qwen2.5-0.5B Q4_0 / Qwen3-0.6B Q8_0 (also as 12 shards) and Qwen3-4B Q4_K_M / Qwen3.5-0.8B Q4_0 |
 | `qwen3moe` / `granitemoe` | loggenix-moe Q8_0 / Granite 3.1 1B-A400M Q4_K_M |
 | `lfm2` / `falcon-h1` | LFM2-350M Q4_K_M / Falcon-H1-Tiny-90M Q8_0 |
 | tasks | Qwen3 Embedding and Reranker checkpoints vs Candle and Qwen's examples |

@@ -2,14 +2,14 @@
 title: K/V cache layout
 order: 40
 evidence:
-  - src/cache.rs:116-122 #291fe6476793
-  - src/cache.rs:162-166 #04e9dec5006c
-  - src/cache.rs:1401-1410 #0ba84f39c357
-  - src/cache.rs:1450-1460 #9934aa08ff6e
-  - src/cache.rs:2392-2397 #01be815e7523
-  - src/cache.rs:3133-3142 #0b83d691c9f5
-  - src/cache.rs:3353-3360 #769d4a45a1d6
-  - src/runtime.rs:133-158 #c702fcc25b47
+  - crates/macllm-kv/src/cache.rs:119-125 #291fe6476793
+  - crates/macllm-kv/src/cache.rs:165-169 #04e9dec5006c
+  - crates/macllm-kv/src/cache.rs:1432-1441 #0ba84f39c357
+  - crates/macllm-kv/src/cache.rs:1481-1491 #9934aa08ff6e
+  - crates/macllm-kv/src/cache.rs:2423-2428 #01be815e7523
+  - crates/macllm-kv/src/cache.rs:3159-3168 #0b83d691c9f5
+  - crates/macllm-kv/src/cache.rs:3380-3387 #769d4a45a1d6
+  - src/runtime.rs:138-163 #c702fcc25b47
 ---
 
 Each decoder layer gets a `KvCachePolicy`:

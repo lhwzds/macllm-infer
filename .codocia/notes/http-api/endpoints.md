@@ -2,17 +2,19 @@
 title: Endpoints
 order: 10
 evidence:
-  - src/server.rs:123-131 #5eca8bab7288
-  - src/server.rs:156-185 #255fb6a64ee9
-  - src/server.rs:219-236 #fffbe5c6bd80
-  - src/server.rs:1265-1276 #32f315b33eaf
-  - src/server.rs:1088-1096 #395941996be3
-  - src/server.rs:1220-1252 #c5ffb42219c9
+  - src/server.rs:224-228 #a624776b0e03
+  - src/server.rs:264-299 #fcffd8d65d1d
+  - src/engine.rs:1287-1292 #07014befda92
+  - src/backend.rs:74-88 #690f00ee1dce
+  - src/server.rs:327-344 #fffbe5c6bd80
+  - src/server.rs:2192-2203 #32f315b33eaf
+  - src/server.rs:1820-1824 #fca595c0bb0c
+  - src/server.rs:2153-2178 #c0c0d77980f0
 ---
 
 | Route | Purpose |
 | --- | --- |
-| `GET /healthz` | `status`, `worker` (`starting`, `ready`, `busy`, `poisoned`, `stopped`), `model`, `device`, `dtype`; 503 when unhealthy |
+| `GET /healthz` | `status`, `worker` (`starting`, `ready`, `busy`, `poisoned`, `stopped`), `model`, `device` (the live backend: `metal`, `cuda` or `cpu`), `dtype`; 503 when unhealthy |
 | `GET /v1/models` | the single served model |
 | `POST /v1/chat/completions` | strict Chat Completions subset, JSON or SSE |
 | `POST /completion` | untemplated, llama-server-shaped route used by the benchmarks |

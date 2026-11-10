@@ -2,13 +2,13 @@
 title: Automatic prefix cache
 order: 50
 evidence:
-  - src/prefix_cache.rs:1-7 #497fa2620036
-  - src/prefix_cache.rs:116-122 #2342b90343e3
-  - src/decoder.rs:3461-3499 #6f04069653c4
-  - src/decoder.rs:3501-3540 #b846a89ce8ec
-  - src/decoder.rs:4308-4340 #845d56ced21b
-  - src/engine.rs:166-172 #ff0594e8d5c4
-  - src/generation.rs:513-517 #42a0d50164d2
+  - crates/macllm-kv/src/prefix_cache.rs:1-7 #497fa2620036
+  - crates/macllm-kv/src/prefix_cache.rs:116-122 #2342b90343e3
+  - src/decoder.rs:3473-3511 #6f04069653c4
+  - src/decoder.rs:3513-3552 #b846a89ce8ec
+  - src/decoder.rs:4320-4352 #845d56ced21b
+  - src/engine.rs:217-223 #ff0594e8d5c4
+  - src/generation.rs:505-509 #42a0d50164d2
 ---
 
 `TokenPrefixCache` is a cost-bounded LRU of model-state snapshots keyed by exact token IDs. Hash blocks only narrow the candidates; every hit is confirmed by a token-by-token comparison from position zero. A snapshot is stored only at each inserted prompt endpoint, never at every block, so a set of progressively longer prompts does not retain a quadratic amount of state.

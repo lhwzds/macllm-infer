@@ -2,15 +2,15 @@
 title: Prefix-cache demos and local bench
 order: 30
 evidence:
-  - src/main.rs:352-394 #182e259b0967
-  - src/main.rs:560-573 #86482cfdda54
+  - src/main.rs:396-438 #182e259b0967
+  - src/main.rs:660-673 #86482cfdda54
   - src/benchmark/prefix_demo_mac.rs:39-46 #70d0343130f2
   - src/benchmark/fair_prefix.rs:59-61 #24a47f0bcf07
   - src/benchmark/fair_prefix.rs:912-956 #5faa4affde26
   - src/benchmark/fair_prefix.rs:1010-1022 #01ca7c0de766
   - benchmarks/manifests/smollm3-3b-q4_k_m-m4pro-fair-prefix.json:61-81 #3bfdafb1badc
-  - src/main.rs:247-302 #1f4fd4de7719
-  - src/main.rs:1165-1208 #d7f2c0b47dfb
+  - src/main.rs:291-346 #1f4fd4de7719
+  - src/main.rs:1265-1308 #d7f2c0b47dfb
   - scripts/bench-llama-cpp.sh #aa2fd647f93d
 ---
 

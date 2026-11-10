@@ -26,4 +26,4 @@ performance claims. They describe current capabilities only.
 
 - [Code structure](structure.md) — generated from the code: areas, dependencies, pages
 
-<sub>Generated from https://github.com/lhwzds/macllm-infer @ `15bfbd64e8`</sub>
+<sub>Generated from https://github.com/lhwzds/macllm-infer @ `789a9829af`</sub>

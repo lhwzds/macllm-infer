@@ -1,11 +1,11 @@
 ---
 title: 端点
-source: #150fd1150a99
+source: #1fe87bc4cbd3
 ---
 
 | 路由 | 用途 |
 | --- | --- |
-| `GET /healthz` | `status`、`worker`（`starting`、`ready`、`busy`、`poisoned`、`stopped`）、`model`、`device`、`dtype`；不健康时返回 503 |
+| `GET /healthz` | `status`、`worker`（`starting`、`ready`、`busy`、`poisoned`、`stopped`）、`model`、`device`（实际运行的后端：`metal`、`cuda` 或 `cpu`）、`dtype`；不健康时返回 503 |
 | `GET /v1/models` | 唯一的服务模型 |
 | `POST /v1/chat/completions` | 严格的 Chat Completions 子集，JSON 或 SSE |
 | `POST /completion` | 不套模板、与 llama-server 形状一致的路由，供 benchmark 使用 |

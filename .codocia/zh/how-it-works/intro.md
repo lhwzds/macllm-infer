@@ -1,9 +1,9 @@
 ---
-title: 
-source: #d08af497852e
+title:
+source: #4a7b0a283434
 ---
 
-每个命令都经过 `LoadedRuntime::load`：打开文件，选择 adapter，从 `WeightSource` 构建共享 decoder，然后配置 paged K/V 池和 prefix cache。阻塞式命令直接调用模型。`serve` 在一个 worker 线程中构建同样的运行时，该线程在整个生命周期内独占模型。
+每个命令都经过 `LoadedRuntime::load`：打开文件，选择 adapter，从 `WeightSource` 构建共享 decoder，然后配置 paged K/V 池、prefix cache 和 prefill attention 模式。阻塞式命令直接调用模型。`serve` 在一个 worker 线程中构建同样的运行时，该线程在整个生命周期内独占模型。
 
 ```mermaid
 flowchart LR

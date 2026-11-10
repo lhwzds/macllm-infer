@@ -2,10 +2,10 @@
 title: Embedding and reranking
 order: 30
 evidence:
-  - src/main.rs:172-232 #751645b4991d
-  - src/main.rs:808-850 #63dcbb443b9a
-  - src/main.rs:865-923 #3ba659717363
-  - src/main.rs:925-968 #5260b65e939d
+  - src/main.rs:216-276 #751645b4991d
+  - src/main.rs:908-950 #63dcbb443b9a
+  - src/main.rs:965-1023 #3ba659717363
+  - src/main.rs:1025-1068 #5260b65e939d
   - src/models/qwen3_tasks.rs:1-40 #1504c73ec1fc
   - src/models/qwen3_tasks.rs:62-95 #c0d214e056de
   - src/models/qwen3_tasks.rs:158-188 #e4532b0306a5

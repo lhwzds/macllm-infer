@@ -2,8 +2,8 @@
 
 [English](README.md) | [简体中文](README_CN.md)
 
-MacLLM Infer 是一个用 Rust 编写、Apple Silicon 优先的本地纯文本 LLM 推理引擎。
-它在同一套 decoder runtime 上运行生成、向量嵌入和重排序任务。
+MacLLM Infer 是一个用 Rust 编写、Apple Silicon 优先的纯文本 LLM 推理 runtime。
+它在同一套共享的 decoder 引擎上运行生成、向量嵌入和重排序任务。
 
 项目核心采用通用架构：模型配置、对话模板和权重映射放在 adapter 中；加载、
 tokenization、批处理、缓存、采样和服务层由所有模型复用。项目将 `llama.cpp` 作为 GGUF

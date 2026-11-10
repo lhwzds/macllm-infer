@@ -6,7 +6,7 @@ evidence:
   - src/file_backed_quant.rs:1-6 #e74119a66673
   - src/model_weights.rs:1-40 #c6c5317e0d35
   - src/model_weights.rs:305-306 #06a0a2c8df30
-  - src/runtime.rs:113-128 #3f7ebb3c986e
+  - src/runtime.rs:118-133 #3f7ebb3c986e
 ---
 
 `ModelFiles::weight_source` memory-maps Safetensors through Candle's `VarBuilder`. GGUF goes through the project's own parser and an mmap-backed `GgufWeightSource`, and block-quantized matrices stay compressed through model build and run as `QMatMul`. With the `metal` feature, `file_backed_quant` wraps each GGUF shard's read-only mapping in one shared Metal buffer and binds each tensor at its file offset. Candle's stock loader would copy every weight into an anonymous buffer, making the model dirty unified memory.

@@ -2,13 +2,14 @@
 title: Supported formats and architectures
 order: 10
 evidence:
-  - src/weights.rs:58-115 #e5400707b6fb
-  - src/models/mod.rs:102-118 #d1fbf6cba622
-  - src/gguf_model.rs:271-300 #6319cd2f4edd
-  - src/gguf.rs:283-296 #997606a1db32
+  - src/weights.rs:58-115 #729a297ff30e
+  - src/snapshot.rs:83-96 #b285a82f8992
+  - src/models/mod.rs:698-714 #d1fbf6cba622
+  - src/gguf_model.rs:316-335 #9cbd64313536
+  - src/gguf.rs:283-297 #f65a66077752
 ---
 
-`ModelFiles::from_dir` accepts a standalone `.gguf` file or a directory. A directory holding both GGUF and Safetensors weights is rejected; GGUF wins discovery otherwise, and canonical GGUF shard sets are opened as one logical file.
+`ModelFiles::from_dir` accepts a standalone `.gguf` file or a directory. A directory holding both GGUF and Safetensors weights is rejected, and so is a directory whose `macllm download` marker says the download did not complete. Otherwise GGUF wins discovery, and canonical GGUF shard sets are opened as one logical file.
 
 The two formats do not cover the same architectures:
 

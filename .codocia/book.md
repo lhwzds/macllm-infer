@@ -2,7 +2,7 @@
 title: macllm-infer
 repo: ..
 out: docs/public
-commit: 15bfbd64e8d588d4ad54c9cc535a623dea5e129b
+commit: 789a9829af81f30a826d470a725dfb25075103c6
 remote: https://github.com/lhwzds/macllm-infer
 lang: en
 max_pages: 8
@@ -23,7 +23,7 @@ ignore:
 langs:
   - zh
 translations:
-  - README_CN.md: README.md #32eda45486d3
+  - README_CN.md: README.md #125be12f7683
 ---
 
 These docs go one level below the README of MacLLM Infer, a Rust, Apple
