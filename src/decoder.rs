@@ -4521,9 +4521,16 @@ pub(crate) fn attention_mask_for_range(
 
 /// Dense full-causal attention over a materialized K/V history.
 ///
-/// This is the reference attention path: the K/V heads are expanded for the
-/// matmul, the scores are scaled and optionally softcapped, the additive mask
-/// is applied and the softmax reduces in F32 before the value matmul.
+/// This is the reference attention path: the query heads are grouped by the
+/// KV head they read, so the K/V history is never expanded, the scores are
+/// scaled and optionally softcapped, the additive mask is applied and the
+/// softmax reduces in F32 before the value matmul.
+///
+/// Grouped-query attention keeps the K/V history at `num_kv_heads` and
+/// gathers the query heads instead: query head `h` reads KV head
+/// `h / kv_groups`, the pairing the expanded K/V used to encode. The query
+/// rows are therefore reshaped to `(batch, kv_heads, kv_groups * query_len,
+/// head_dim)` and the scores are computed against the compact K/V.
 pub(crate) fn dense_causal_attention(
     query: &Tensor,
     key: &Tensor,
@@ -4533,35 +4540,117 @@ pub(crate) fn dense_causal_attention(
     logit_softcap: Option<f64>,
     mask: Option<&Tensor>,
 ) -> Result<Tensor> {
-    let key = repeat_kv(key, kv_groups)?.contiguous()?;
-    let value = repeat_kv(value, kv_groups)?.contiguous()?;
-    let scores = query.matmul(&key.transpose(2, 3)?)?.affine(scale, 0.0)?;
+    let (batch, query_heads, query_len, head_dim) = query.dims4()?;
+    let (key_batch, kv_heads, key_len, key_head_dim) = key.dims4()?;
+    let (value_batch, value_heads, value_len, value_head_dim) = value.dims4()?;
+    if kv_groups == 0 || query_heads != kv_heads * kv_groups {
+        candle_core::bail!(
+            "grouped attention expects {kv_groups} query heads per KV head, got \
+             {query_heads} query heads and {kv_heads} KV heads"
+        );
+    }
+    if key_batch != batch
+        || value_batch != batch
+        || value_heads != kv_heads
+        || value_len != key_len
+        || key_head_dim != head_dim
+        || value_head_dim != head_dim
+    {
+        candle_core::bail!(
+            "grouped attention expects matching query, key and value shapes, got \
+             {batch}x{query_heads}x{query_len}x{head_dim}, {key_batch}x{kv_heads}x{key_len}x\
+             {key_head_dim} and {value_batch}x{value_heads}x{value_len}x{value_head_dim}"
+        );
+    }
+    // The matmul reads the K/V history one head block at a time. The
+    // compact cache views already have that layout, so the history is not
+    // copied; a view that interleaves the heads is copied once.
+    let key = if matmul_ready_kv(key, batch, kv_heads, key_len, head_dim) {
+        key.clone()
+    } else {
+        key.contiguous()?
+    };
+    let value = if matmul_ready_kv(value, batch, kv_heads, key_len, head_dim) {
+        value.clone()
+    } else {
+        value.contiguous()?
+    };
+    // Group the query heads by their KV head. The head order is the one the
+    // expanded K/V used to produce, so query head `h` still reads KV head
+    // `h / kv_groups`.
+    let grouped_query = query.reshape((batch, kv_heads, kv_groups * query_len, head_dim))?;
+    let scores = grouped_query
+        .matmul(&key.transpose(2, 3)?)?
+        .affine(scale, 0.0)?;
     let scores = match logit_softcap {
         Some(softcap) => tanh_softcap(&scores, softcap)?,
         None => scores,
     };
     let scores = match mask {
-        Some(mask) => scores.broadcast_add(mask)?,
+        Some(mask) => {
+            // The mask is per query row, so it broadcasts over the group axis
+            // the grouped query introduced.
+            let scores = scores.reshape((batch, kv_heads, kv_groups, query_len, key_len))?;
+            let mask = grouped_mask(mask)?;
+            scores.broadcast_add(&mask)?.reshape((
+                batch,
+                kv_heads,
+                kv_groups * query_len,
+                key_len,
+            ))?
+        }
         None => scores,
     };
     // Match reference implementations: reduction in F32, model dtype after.
     let score_dtype = scores.dtype();
     let probabilities =
         candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(score_dtype)?;
-    probabilities.matmul(&value)
+    let output = probabilities.matmul(&value)?;
+    output.reshape((batch, query_heads, query_len, head_dim))
 }
 
-/// Expand KV heads for the attention matmul only. The cached representation is
-/// kept compact at `num_kv_heads`.
-fn repeat_kv(input: &Tensor, groups: usize) -> Result<Tensor> {
-    if groups == 1 {
-        return Ok(input.clone());
+/// Whether the attention matmul can read a K/V history as it is.
+///
+/// The matmul reads one head block at a time, so the last two axes of a
+/// block must be contiguous and the heads must be evenly spaced. The
+/// compact cache views satisfy both; a view that interleaves the heads
+/// does not and is copied once.
+fn matmul_ready_kv(
+    tensor: &Tensor,
+    batch: usize,
+    heads: usize,
+    sequence: usize,
+    head_dim: usize,
+) -> bool {
+    let strides = tensor.stride();
+    let (batch_stride, head_stride, sequence_stride, dim_stride) =
+        (strides[0], strides[1], strides[2], strides[3]);
+    let block = sequence * head_dim;
+    // The block of one head is either head-major or sequence-major. Those are
+    // the two layouts the matmul reads without a copy.
+    let contiguous_block = (dim_stride == 1 && sequence_stride == head_dim)
+        || (sequence_stride == 1 && dim_stride == sequence);
+    // The head blocks are evenly spaced, so one batch element starts
+    // `heads` blocks after the previous one.
+    let spaced = head_stride >= block && (batch == 1 || batch_stride == head_stride * heads);
+    contiguous_block && spaced
+}
+
+/// Reshape an additive mask so it broadcasts over the group axis of the
+/// grouped scores `(batch, kv_heads, groups, query_len, key_len)`.
+///
+/// The mask keeps its own leading dimensions and gains a group axis of one
+/// right before the query and key axes.
+fn grouped_mask(mask: &Tensor) -> Result<Tensor> {
+    let dims = mask.dims();
+    match dims {
+        [query_len, key_len] => mask.reshape((1_usize, 1, 1, *query_len, *key_len)),
+        [leading, query_len, key_len] => mask.reshape((*leading, 1_usize, 1, *query_len, *key_len)),
+        [batch, leading, query_len, key_len] => {
+            mask.reshape((*batch, *leading, 1_usize, *query_len, *key_len))
+        }
+        _ => candle_core::bail!("attention mask with {} axes is not supported", dims.len()),
     }
-    let (batch, kv_heads, sequence, head_dim) = input.dims4()?;
-    input
-        .unsqueeze(2)?
-        .expand((batch, kv_heads, groups, sequence, head_dim))?
-        .reshape((batch, kv_heads * groups, sequence, head_dim))
 }
 
 fn tanh_softcap(input: &Tensor, softcap: f64) -> Result<Tensor> {
@@ -7314,11 +7403,275 @@ mod tests {
         Ok(tensors)
     }
 
+    /// Deterministic pseudo-random values in `[-1, 1)`.
+    fn pseudo_random_values(count: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let unit = (state >> 33) as f32 / (1_u64 << 31) as f32;
+                unit * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// A causal mask over the last `query_len` positions of the history.
+    fn causal_mask(
+        query_len: usize,
+        key_len: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let first_visible = key_len.saturating_sub(query_len);
+        let values = (0..query_len)
+            .flat_map(|query| {
+                let query_position = first_visible + query;
+                (0..key_len).map(move |key| {
+                    if key > query_position {
+                        f32::NEG_INFINITY
+                    } else {
+                        0.0
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let mask = Tensor::from_vec(values, (query_len, key_len), device)?;
+        mask.to_dtype(dtype)?.unsqueeze(0)?.unsqueeze(0)
+    }
+
+    /// Expand KV heads for the attention matmul only.
+    ///
+    /// This is the formula the grouped attention replaced, kept as the
+    /// reference implementation of the tests.
+    fn expand_kv_heads(input: &Tensor, groups: usize) -> Result<Tensor> {
+        if groups == 1 {
+            return Ok(input.clone());
+        }
+        let (batch, kv_heads, sequence, head_dim) = input.dims4()?;
+        input
+            .unsqueeze(2)?
+            .expand((batch, kv_heads, groups, sequence, head_dim))?
+            .reshape((batch, kv_heads * groups, sequence, head_dim))
+    }
+
+    /// The expand-based attention the grouped path replaced.
+    fn expanded_causal_attention(
+        query: &Tensor,
+        key: &Tensor,
+        value: &Tensor,
+        kv_groups: usize,
+        scale: f64,
+        logit_softcap: Option<f64>,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let key = expand_kv_heads(key, kv_groups)?.contiguous()?;
+        let value = expand_kv_heads(value, kv_groups)?.contiguous()?;
+        let scores = query.matmul(&key.transpose(2, 3)?)?.affine(scale, 0.0)?;
+        let scores = match logit_softcap {
+            Some(softcap) => tanh_softcap(&scores, softcap)?,
+            None => scores,
+        };
+        let scores = match mask {
+            Some(mask) => scores.broadcast_add(mask)?,
+            None => scores,
+        };
+        // Match reference implementations: reduction in F32, model dtype after.
+        let score_dtype = scores.dtype();
+        let probabilities = candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?
+            .to_dtype(score_dtype)?;
+        probabilities.matmul(&value)
+    }
+
+    /// Query head `h` reads KV head `h / kv_groups`, the pairing the expanded
+    /// K/V used to encode.
     #[test]
-    fn repeat_kv_maps_adjacent_query_groups() -> Result<()> {
-        let input = Tensor::from_vec(vec![1_f32, 2.0, 3.0, 4.0], (1, 2, 1, 2), &Device::Cpu)?;
-        let expanded = repeat_kv(&input, 2)?.flatten_all()?.to_vec1::<f32>()?;
-        assert_eq!(expanded, vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
+    fn grouped_attention_maps_adjacent_query_groups() -> Result<()> {
+        let device = Device::Cpu;
+        // Two KV heads with distinct keys and values, four query heads in
+        // two groups of two.
+        let key = Tensor::new(&[[[[1.0_f32], [0.0]], [[0.0], [1.0]]]], &device)?;
+        let value = Tensor::new(&[[[[1.0_f32], [10.0]], [[-1.0], [-10.0]]]], &device)?;
+        let query = Tensor::new(&[[[[1.0_f32]], [[1.0]], [[1.0]], [[1.0]]]], &device)?;
+        let output = dense_causal_attention(&query, &key, &value, 2, 1.0, None, None)?;
+        let rows = output.flatten_all()?.to_vec1::<f32>()?;
+        // The first KV head scores `[1, 0]` and the second one `[0, 1]`, so
+        // the first group averages `1` and `10` with the weights of the first
+        // softmax and the second group averages `-1` and `-10` with the
+        // weights of the second one.
+        let first = 0.731_058_6_f32 * 1.0 + 0.268_941_4_f32 * 10.0;
+        let second = -0.268_941_4_f32 - 0.731_058_6_f32 * 10.0;
+        for (index, expected) in [first, first, second, second].into_iter().enumerate() {
+            assert!(
+                (rows[index] - expected).abs() <= 1e-4,
+                "query head {index} produced {} instead of {expected}",
+                rows[index]
+            );
+        }
+        Ok(())
+    }
+
+    /// The device the comparison runs on for one dtype.
+    ///
+    /// The CPU backend only supports F16 matmuls without the accelerate
+    /// feature, so the F16 case moves to Metal when the host has it.
+    fn comparison_device(dtype: DType) -> Option<Device> {
+        if dtype == DType::F32 {
+            return Some(Device::Cpu);
+        }
+        #[cfg(feature = "metal")]
+        if let Ok(device) = Device::new_metal(0) {
+            return Some(device);
+        }
+        // Probe the CPU backend: the accelerate build has no F16 matmul.
+        let probe = Tensor::ones((2, 2), DType::F16, &Device::Cpu).ok()?;
+        probe.matmul(&probe).ok().map(|_| Device::Cpu)
+    }
+
+    /// The grouped attention must agree with the expand-based formula it
+    /// replaced, for every group count, query length, softcap and dtype.
+    #[test]
+    fn grouped_attention_matches_the_expanded_reference() -> Result<()> {
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 8;
+        const KEY_LEN: usize = 6;
+        for dtype in [DType::F32, DType::F16] {
+            let Some(device) = comparison_device(dtype) else {
+                eprintln!("skipping the {dtype:?} comparison: no F16 matmul backend");
+                continue;
+            };
+            for groups in [1_usize, 2, 4] {
+                for (query_len, masked) in [(1_usize, false), (5, true)] {
+                    for softcap in [None, Some(30.0_f64)] {
+                        let query_heads = KV_HEADS * groups;
+                        let query = Tensor::from_vec(
+                            pseudo_random_values(query_heads * query_len * HEAD_DIM, 13),
+                            (1, query_heads, query_len, HEAD_DIM),
+                            &device,
+                        )?
+                        .to_dtype(dtype)?;
+                        let key = Tensor::from_vec(
+                            pseudo_random_values(KV_HEADS * KEY_LEN * HEAD_DIM, 29),
+                            (1, KV_HEADS, KEY_LEN, HEAD_DIM),
+                            &device,
+                        )?
+                        .to_dtype(dtype)?;
+                        let value = Tensor::from_vec(
+                            pseudo_random_values(KV_HEADS * KEY_LEN * HEAD_DIM, 47),
+                            (1, KV_HEADS, KEY_LEN, HEAD_DIM),
+                            &device,
+                        )?
+                        .to_dtype(dtype)?;
+                        let mask = if masked {
+                            Some(causal_mask(query_len, KEY_LEN, dtype, &device)?)
+                        } else {
+                            None
+                        };
+                        let scale = 1.0 / (HEAD_DIM as f64).sqrt();
+                        let grouped = dense_causal_attention(
+                            &query,
+                            &key,
+                            &value,
+                            groups,
+                            scale,
+                            softcap,
+                            mask.as_ref(),
+                        )?;
+                        let expanded = expanded_causal_attention(
+                            &query,
+                            &key,
+                            &value,
+                            groups,
+                            scale,
+                            softcap,
+                            mask.as_ref(),
+                        )?;
+                        let tolerance = if dtype == DType::F32 { 1e-5 } else { 2e-3 };
+                        let difference = max_difference(
+                            &grouped.to_dtype(DType::F32)?,
+                            &expanded.to_dtype(DType::F32)?,
+                        )?;
+                        assert!(
+                            difference <= tolerance,
+                            "groups={groups} query_len={query_len} softcap={softcap:?} \
+                             {dtype:?} differed by {difference} (tolerance {tolerance})"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The KV cache hands over strided K/V views, so the grouped attention
+    /// must read them without a contiguous copy of the history.
+    #[test]
+    fn grouped_attention_reads_strided_kv_views() -> Result<()> {
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 4;
+        const KEY_LEN: usize = 5;
+        const CAPACITY: usize = 9;
+        let device = Device::Cpu;
+        for groups in [1_usize, 2, 4] {
+            let query_heads = KV_HEADS * groups;
+            let query = Tensor::from_vec(
+                pseudo_random_values(query_heads * HEAD_DIM, 71),
+                (1, query_heads, 1, HEAD_DIM),
+                &device,
+            )?;
+            let key = Tensor::from_vec(
+                pseudo_random_values(KV_HEADS * CAPACITY * HEAD_DIM, 83),
+                (1, KV_HEADS, CAPACITY, HEAD_DIM),
+                &device,
+            )?
+            .narrow(2, 2, KEY_LEN)?;
+            let value = Tensor::from_vec(
+                pseudo_random_values(KV_HEADS * CAPACITY * HEAD_DIM, 97),
+                (1, KV_HEADS, CAPACITY, HEAD_DIM),
+                &device,
+            )?
+            .narrow(2, 2, KEY_LEN)?;
+            assert!(!key.is_contiguous(), "the test needs a strided K/V view");
+            let scale = 1.0 / (HEAD_DIM as f64).sqrt();
+            let grouped = dense_causal_attention(&query, &key, &value, groups, scale, None, None)?;
+            let expanded =
+                expanded_causal_attention(&query, &key, &value, groups, scale, None, None)?;
+            let difference = max_difference(&grouped, &expanded)?;
+            assert!(
+                difference <= 1e-5,
+                "groups={groups} differed by {difference} on a strided K/V view"
+            );
+        }
+        Ok(())
+    }
+
+    /// The compact K/V history must reach the matmul as it is, so the
+    /// grouped attention never copies the history it reads.
+    #[test]
+    fn compact_kv_history_reaches_the_matmul_without_a_copy() -> Result<()> {
+        const KV_HEADS: usize = 4;
+        const HEAD_DIM: usize = 8;
+        const CAPACITY: usize = 16;
+        const LENGTH: usize = 9;
+        let device = Device::Cpu;
+        // The cache view of one layer: the head blocks of a buffer that
+        // holds more tokens than the history uses.
+        let cached = Tensor::zeros((1, KV_HEADS, CAPACITY, HEAD_DIM), DType::F32, &device)?
+            .narrow(2, 0, LENGTH)?;
+        assert!(!cached.is_contiguous(), "the test needs a strided K/V view");
+        assert!(matmul_ready_kv(&cached, 1, KV_HEADS, LENGTH, HEAD_DIM));
+        // A view whose head dimension is interleaved with another one cannot
+        // be read one head block at a time.
+        let interleaved = Tensor::zeros((1, KV_HEADS, LENGTH, HEAD_DIM * 2), DType::F32, &device)?
+            .narrow(3, 0, HEAD_DIM)?;
+        assert!(!matmul_ready_kv(
+            &interleaved,
+            1,
+            KV_HEADS,
+            LENGTH,
+            HEAD_DIM
+        ));
         Ok(())
     }
 
