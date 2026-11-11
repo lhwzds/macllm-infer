@@ -10,7 +10,11 @@ use std::{
     fs,
     io::Read,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -287,11 +291,21 @@ const HOST_COMMAND_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The most bytes that one stream of a host command may produce.
 ///
-/// Every reader stops at this cap, so a child that prints without end cannot
-/// grow the memory of the benchmark. Output past the cap is cut and parsed as
-/// it is, which is harmless for the `reg`, `powershell` and `sysctl` output
-/// that the host commands collect (a few hundred bytes).
+/// Every reader stops reading at this cap, so a child that prints without
+/// end cannot grow the memory of the benchmark. The output past the cap is
+/// not read at all: a child that keeps writing blocks while the pipe is
+/// full, and it gets a write error once the reader stopped at the cap and
+/// dropped the pipe. The deadline of the command ends it either way, and the
+/// output that was read is parsed as it is, which is harmless for the `reg`,
+/// `powershell` and `sysctl` output that the host commands collect (a few
+/// hundred bytes).
 const HOST_COMMAND_OUTPUT_CAP: u64 = 1024 * 1024;
+
+/// The size of one read of a stream of a host command.
+///
+/// The reader reads in chunks, so a reader that outlives its call stops
+/// appending at the next chunk instead of at the end of its buffer.
+const READER_CHUNK_BYTES: usize = 8 * 1024;
 
 /// The bound on the polls that reap a child after it was killed.
 const KILL_REAP_WAIT: Duration = Duration::from_secs(2);
@@ -741,6 +755,7 @@ fn nonempty_or_unknown(value: &str) -> String {
 /// without an end. Neither reader outlives this call either, except the
 /// grandchild case that [`join_command_readers`] documents: both are joined
 /// before it returns, and each stops at [`HOST_COMMAND_OUTPUT_CAP`] bytes. A
+/// reader that outlives the call stops appending once the call returned. A
 /// failing child is an error with context, never a panic.
 fn run_host_command(program: &str, args: &[&str], deadline: Duration) -> Result<String> {
     let start = Instant::now();
@@ -768,12 +783,24 @@ fn run_host_command(program: &str, args: &[&str], deadline: Duration) -> Result<
         ));
     };
     let (sender, receiver) = mpsc::channel();
+    // The readers stop appending once this flag is set, so a reader that
+    // outlives this call cannot fill the memory of the benchmark after the
+    // call returned.
+    let stop = Arc::new(AtomicBool::new(false));
     let stdout_sender = sender.clone();
+    let stdout_stop = Arc::clone(&stop);
     let stdout_reader = thread::spawn(move || {
-        read_command_stream(stdout, stdout_sender, HostCommandStream::Stdout);
+        read_command_stream(
+            stdout,
+            stdout_sender,
+            HostCommandStream::Stdout,
+            stdout_stop,
+        );
     });
-    let stderr_reader =
-        thread::spawn(move || read_command_stream(stderr, sender, HostCommandStream::Stderr));
+    let stderr_stop = Arc::clone(&stop);
+    let stderr_reader = thread::spawn(move || {
+        read_command_stream(stderr, sender, HostCommandStream::Stderr, stderr_stop);
+    });
     let mut stderr_output = Vec::new();
     let outcome = collect_command_output(
         &mut child,
@@ -783,16 +810,22 @@ fn run_host_command(program: &str, args: &[&str], deadline: Duration) -> Result<
         deadline,
         start,
     );
-    // Every return path joins both readers: the child has been reaped by now,
-    // its pipes are closed, and the joins end. The one exception, a
-    // grandchild that holds a pipe open, is documented on
-    // `join_command_readers`.
+    // Every return path joins both readers: the child has been killed and
+    // reaped by the time this runs when its reap succeeded, so its pipes are
+    // closed and the joins end at once. A reap that failed leaves the pipes
+    // open, but the join is bounded either way and the error of the command
+    // carries the failure of the reap. The one exception, a grandchild that
+    // holds a pipe open, is documented on `join_command_readers`.
     let joined = join_command_readers(
         stdout_reader,
         stderr_reader,
         program,
         reader_join_bound(deadline, start),
     );
+    // The readers stop appending once this call returns, so a reader that
+    // outlived it (a grandchild that holds a pipe open) keeps no buffer
+    // that grows after the call returned.
+    stop.store(true, Ordering::SeqCst);
     // A reader that finished after the loop delivered its stream through the
     // channel, and both senders are gone once the readers joined, so what is
     // left there completes the standard error of the child.
@@ -808,9 +841,11 @@ fn run_host_command(program: &str, args: &[&str], deadline: Duration) -> Result<
         // A reader that outlived the command follows the error of the command
         // in the chain: anyhow prints the context first, so the failing
         // command stays the primary message. The whole chain of the command
-        // error is the context, so a reap that failed is not lost.
+        // error is the context, so a reap that failed is not lost. The join
+        // error follows the same rule as a failed reap, so both chains are
+        // built by `with_reap`.
         (Err(error), Err(join_error)) => {
-            return Err(join_error.context(format!("{error:#}")));
+            return Err(with_reap(error, Err(join_error)));
         }
     };
     ensure!(
@@ -831,16 +866,35 @@ enum HostCommandStream {
 ///
 /// The read runs through [`Read::take`], so it stops at
 /// [`HOST_COMMAND_OUTPUT_CAP`] bytes even when the child never closes the
-/// stream.
+/// stream. The stream is read in chunks of [`READER_CHUNK_BYTES`], and the
+/// reader stops appending once `stop` is set: a reader that outlives its
+/// call must not fill the memory of the benchmark behind the back of the
+/// caller.
 fn read_command_stream<R: Read>(
     stream: R,
     sender: mpsc::Sender<HostCommandStream>,
     wrap: impl Fn(Vec<u8>) -> HostCommandStream,
+    stop: Arc<AtomicBool>,
 ) {
     let mut buffer = Vec::new();
-    let _ = stream
-        .take(HOST_COMMAND_OUTPUT_CAP)
-        .read_to_end(&mut buffer);
+    let mut chunk = [0_u8; READER_CHUNK_BYTES];
+    let mut reader = stream.take(HOST_COMMAND_OUTPUT_CAP);
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            // The call returned, so the buffer of this reader stops here.
+            break;
+        }
+        let count = match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        if stop.load(Ordering::SeqCst) {
+            // The call returned while this chunk was read, so the chunk is
+            // dropped instead of appended.
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..count]);
+    }
     let _ = sender.send(wrap(buffer));
 }
 
@@ -883,12 +937,15 @@ fn collect_command_output(
 
 /// Join both reader threads of one host command, bounded by `bound`.
 ///
-/// The child has been killed and reaped by the time this runs, so its pipes
-/// are closed and the joins end at once. The one case that can still hold a
-/// reader open is a grandchild that inherited the pipe: that reader is left
-/// blocked on the pipe (it still stops at [`HOST_COMMAND_OUTPUT_CAP`]) and the
-/// command fails, because waiting for a process the benchmark never spawned
-/// has no end.
+/// The child has been killed and reaped by the time this runs when the reap
+/// of the child succeeded, so its pipes are closed and the joins end at
+/// once. A reap that failed leaves the pipes open, but the join is bounded
+/// by `bound` either way, and the error of the command carries the failure
+/// of the reap. The one case that can still hold a reader open is a
+/// grandchild that inherited the pipe: that reader is left blocked on the
+/// pipe (it still stops at [`HOST_COMMAND_OUTPUT_CAP`], and it stops
+/// appending once the call returned) and the command fails, because waiting
+/// for a process the benchmark never spawned has no end.
 fn join_command_readers(
     stdout: thread::JoinHandle<()>,
     stderr: thread::JoinHandle<()>,
@@ -1017,6 +1074,10 @@ fn command_deadline_error(child: &mut Child, program: &str, deadline: Duration) 
 /// the command is the context here and the failed reap is its cause. The
 /// whole chain of the command error is the context, so a cause of that error
 /// is not lost.
+///
+/// The join of the readers follows the same rule, so the error of a reader
+/// that outlived the command keeps the whole chain of the command error as
+/// well.
 fn with_reap(error: anyhow::Error, reap: Result<()>) -> anyhow::Error {
     match reap {
         Ok(()) => error,
@@ -1502,18 +1563,82 @@ mod tests {
 
     #[test]
     fn with_reap_keeps_the_message_of_the_command_and_the_failed_reap() {
-        let command = anyhow::anyhow!("the command did not finish within 2s");
+        // This guards the chain of an error that carries a cause: the
+        // message of the command, the cause of that message and the failed
+        // reap all stay in the chain. A reap that is attached to the
+        // message of the command alone loses the cause, because anyhow
+        // keeps only the message of a context.
+        let command = anyhow::anyhow!("io failure").context("failed to wait for sh");
         let reap = Err(anyhow::anyhow!("the child was killed but did not exit"));
         let error = with_reap(command, reap);
         let rendered = format!("{error:#}");
         assert!(
-            rendered.contains("did not finish within"),
+            rendered.contains("failed to wait for sh"),
+            "unexpected error: {rendered}"
+        );
+        assert!(
+            rendered.contains("io failure"),
             "unexpected error: {rendered}"
         );
         assert!(
             rendered.contains("did not exit"),
             "unexpected error: {rendered}"
         );
+        // The join of the readers of a host command follows the same rule,
+        // so the chain of the join error keeps the cause of the command
+        // error as well.
+    }
+
+    #[test]
+    fn poll_child_reports_a_running_child_at_its_bound() -> Result<()> {
+        // This guards the bounded poll of `poll_child`: a child that is
+        // still running at the bound is reported as running, and the poll
+        // ends at its bound. A bare wait cannot pass this test, because it
+        // blocks until the child ends.
+        let (program, args): (String, Vec<String>) = if cfg!(windows) {
+            let powershell = windows_system_program(
+                &windows_system_root(std::env::var("SystemRoot").ok()),
+                WINDOWS_POWERSHELL_PROGRAM,
+            );
+            (
+                powershell,
+                vec![
+                    "-NoProfile".to_owned(),
+                    "-Command".to_owned(),
+                    "Start-Sleep -Seconds 30".to_owned(),
+                ],
+            )
+        } else {
+            ("sleep".to_owned(), vec!["30".to_owned()])
+        };
+        let mut child = Command::new(&program)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to run {program}"))?;
+        let start = Instant::now();
+        let outcome = poll_child(&mut child, Duration::from_millis(100));
+        let elapsed = start.elapsed();
+        match outcome {
+            Ok(Some(status)) => {
+                let _ = kill_and_reap(&mut child, &program);
+                anyhow::bail!("the child ended at once with {status}, so the poll did not wait");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = kill_and_reap(&mut child, &program);
+                return Err(error).with_context(|| format!("failed to poll {program}"));
+            }
+        }
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the poll of a running child took {elapsed:?}, so it waited for the child"
+        );
+        // The child is still running, so the kill and the reap end it.
+        kill_and_reap(&mut child, &program)?;
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -1599,7 +1724,9 @@ mod tests {
         // This is a regression test that the deadline path kills and reaps:
         // a bare wait after a successful kill reaps as well, so no test can
         // catch that difference, which is why `kill_and_reap` is a bounded
-        // poll by construction.
+        // poll by construction. The poll itself is guarded by
+        // `poll_child_reports_a_running_child_at_its_bound`, which a bare
+        // wait cannot pass.
         Ok(())
     }
 
@@ -1614,16 +1741,16 @@ mod tests {
         let mut guard = ProcessGuard::from_pid_file(pid_file.clone(), "sleep");
         // The helper exits at once, and its background child keeps the
         // standard output pipe open, which is the one case a joined reader
-        // cannot wait out. The helper records the pid of that child, so the
-        // guard can stop it even when the test fails early.
+        // cannot wait out. The background child writes its own pid before
+        // anything else and then becomes the sleeper, so the pid file names
+        // the sleeper itself. The sleeper ends on its own after five
+        // seconds, so a cleanup that missed it (a pid file that was never
+        // written) cannot keep the machine busy past the end of the test.
+        let script = "sh -c 'echo $$ > \"$1\"; exec sleep 5' fixture \"$1\" & exit 0";
         let deadline = Duration::from_secs(2);
         let start = Instant::now();
-        let error = run_host_command(
-            "sh",
-            &["-c", "sleep 30 & echo $! > \"$1\"; exit 0", "sh", pid_path],
-            deadline,
-        )
-        .expect_err("a command whose pipe a grandchild holds must fail");
+        let error = run_host_command("sh", &["-c", script, "sh", pid_path], deadline)
+            .expect_err("a command whose pipe a grandchild holds must fail");
         // The pid is read right after the call and before any assert, so the
         // guard knows which process to stop.
         let pid = guard.pid().map_err(|error| {
@@ -1646,27 +1773,32 @@ mod tests {
         );
         // The identity of the process is checked before the kill, so the
         // kill cannot touch a pid that the machine handed to another process
-        // in the meantime.
+        // in the meantime. The sleeper may have ended on its own already,
+        // which the guard below accepts as well.
         let executable = unix_process_executable(pid);
-        assert_eq!(
-            executable
-                .as_deref()
-                .map(Path::new)
-                .and_then(Path::file_name),
-            Some(OsStr::new("sleep")),
+        let name = executable
+            .as_deref()
+            .map(Path::new)
+            .and_then(Path::file_name);
+        assert!(
+            name.is_none() || fixture_executable_matches("sleep", name),
             "pid {pid} is {executable:?}, not the helper of the fixture"
         );
         // The guard kills the background child and waits until it is gone.
         guard.kill_and_confirm()?;
-        // This fails on the d538cb6 code: the readers were detached there,
-        // so the call returned at its deadline while a reader kept the pipe
-        // of a process the benchmark never spawned, and the error said
-        // nothing about it.
+        // This guards that a command whose pipe a grandchild holds fails
+        // with an error that names the grandchild. It fails on the d538cb6
+        // code: the readers were detached there, so the call returned at
+        // its deadline while a reader kept the pipe of a process the
+        // benchmark never spawned, and the error said nothing about it.
         Ok(())
     }
 
     #[test]
     fn kill_and_reap_succeeds_for_an_exited_and_a_running_child() -> Result<()> {
+        // This guards the kill of a child that already exited (the child is
+        // reaped before the kill, so the kill itself fails) and the kill of
+        // a child that is still running (the same call reaps it).
         let (program, args): (&str, &[&str]) = if cfg!(windows) {
             ("cmd", &["/c", "exit 0"])
         } else {
@@ -1679,10 +1811,20 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .with_context(|| format!("failed to run {program}"))?;
-        // The exit is collected by polling, so the child is reaped before the
-        // kill: killing a child that already exited must still succeed.
-        while exited.try_wait()?.is_none() {
-            thread::sleep(CHILD_POLL_INTERVAL);
+        // The exit is collected by a bounded poll, so the child is reaped
+        // before the kill: killing a child that already exited must still
+        // succeed. The poll has a bound, and every path that fails kills and
+        // reaps the child, so the test never leaves a child behind.
+        match poll_child(&mut exited, Duration::from_secs(5)) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let _ = kill_and_reap(&mut exited, program);
+                anyhow::bail!("the child did not exit within 5s");
+            }
+            Err(error) => {
+                let _ = kill_and_reap(&mut exited, program);
+                return Err(error).with_context(|| format!("failed to wait for {program}"));
+            }
         }
         kill_and_reap(&mut exited, program)?;
 
@@ -1749,6 +1891,8 @@ mod tests {
     #[cfg(unix)]
     struct ProcessGuard {
         pid: Option<i32>,
+        start_time: Option<ProcessStartTime>,
+        confirmed: bool,
         pid_file: PathBuf,
         executable: &'static str,
     }
@@ -1762,12 +1906,18 @@ mod tests {
         fn from_pid_file(pid_file: PathBuf, executable: &'static str) -> Self {
             Self {
                 pid: None,
+                start_time: None,
+                confirmed: false,
                 pid_file,
                 executable,
             }
         }
 
         /// The pid of the guarded process.
+        ///
+        /// The start time of the process is read with the pid, so that the
+        /// check of the identity can tell this process from another one that
+        /// the machine handed the same pid to.
         fn pid(&mut self) -> Result<i32> {
             if let Some(pid) = self.pid {
                 return Ok(pid);
@@ -1778,6 +1928,7 @@ mod tests {
             let pid = recorded.trim().parse::<i32>().with_context(|| {
                 format!("the helper recorded no usable pid in {}", path.display())
             })?;
+            self.start_time = process_start_time(pid);
             self.pid = Some(pid);
             Ok(pid)
         }
@@ -1789,6 +1940,12 @@ mod tests {
         /// neither blocks without an end nor waits for a process that it may
         /// not kill. The poll is free of `waitpid`, because the process is
         /// not a child of the test.
+        ///
+        /// The identity of a process is the name of its executable and the
+        /// time it started: both must still match, so a pid that the machine
+        /// handed to another process in the meantime is never killed. A
+        /// successful call confirms the end of the process, so the drop of
+        /// the guard does not kill it a second time.
         fn kill_and_confirm(&mut self) -> Result<()> {
             if self.pid.is_none() {
                 // The test may have failed before it read the pid, so the
@@ -1800,17 +1957,37 @@ mod tests {
                 return Ok(());
             };
             if process_is_gone(pid) {
+                self.confirmed = true;
                 return Ok(());
             }
             let executable = unix_process_executable(pid);
-            let name = executable
+            let Some(name) = executable
                 .as_deref()
                 .map(Path::new)
-                .and_then(Path::file_name);
-            if name != Some(OsStr::new(self.executable)) {
+                .and_then(Path::file_name)
+            else {
+                // The process ended between the check above and this one,
+                // so there is nothing left to kill.
+                self.confirmed = true;
+                return Ok(());
+            };
+            if !fixture_executable_matches(self.executable, Some(name)) {
                 anyhow::bail!(
                     "pid {pid} is {executable:?}, not the {} of the fixture",
                     self.executable
+                );
+            }
+            if let Some(started) = self.start_time {
+                // The start time of the process must still be the one that
+                // was read with the pid: a pid that the machine handed to
+                // another process names a process that started later. A
+                // start time that the machine hid when the pid was read
+                // cannot be compared, so the name of the executable is then
+                // the only identity.
+                let current = process_start_time(pid);
+                ensure!(
+                    current == Some(started),
+                    "pid {pid} started at {current:?}, not at {started:?}"
                 );
             }
             if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
@@ -1831,6 +2008,7 @@ mod tests {
                 "the {} {pid} survived the kill",
                 self.executable
             );
+            self.confirmed = true;
             Ok(())
         }
     }
@@ -1838,6 +2016,11 @@ mod tests {
     #[cfg(unix)]
     impl Drop for ProcessGuard {
         fn drop(&mut self) {
+            // A confirmed kill needs no second one: the process is gone and
+            // its pid names nothing.
+            if self.confirmed {
+                return;
+            }
             // A cleanup that failed must not hide the failure of the test,
             // but the process must not survive the test either.
             if let Err(error) = self.kill_and_confirm() {
@@ -1846,11 +2029,89 @@ mod tests {
         }
     }
 
+    /// The start time of one process, so that a pid can be checked against
+    /// it.
+    ///
+    /// The start time of a process never changes, so a pid that the machine
+    /// handed to another process names a process with another start time.
+    /// The coarse part is the number of seconds on macOS and the number of
+    /// clock ticks on Linux; the fine part is the number of microseconds on
+    /// macOS and always zero on Linux.
+    #[cfg(unix)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ProcessStartTime {
+        coarse: u64,
+        fine: u64,
+    }
+
+    /// The start time of one process, or nothing when the machine hides it.
+    #[cfg(target_os = "macos")]
+    fn process_start_time(pid: i32) -> Option<ProcessStartTime> {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+            .unwrap_or(libc::c_int::MAX);
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if written <= 0 {
+            // The machine refused the request, so the start time is unknown.
+            return None;
+        }
+        let info = unsafe { info.assume_init() };
+        Some(ProcessStartTime {
+            coarse: info.pbi_start_tvsec,
+            fine: info.pbi_start_tvusec,
+        })
+    }
+
+    /// The start time of one process, or nothing when the machine hides it.
+    #[cfg(target_os = "linux")]
+    fn process_start_time(pid: i32) -> Option<ProcessStartTime> {
+        // The start time is the field 22 of the stat file, which follows the
+        // name of the process and its closing parenthesis.
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = stat.rsplit_once(") ")?.1;
+        let start = rest.split_whitespace().nth(19)?;
+        Some(ProcessStartTime {
+            coarse: start.parse().ok()?,
+            fine: 0,
+        })
+    }
+
+    /// The start time of one process, or nothing when the machine hides it.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+    fn process_start_time(_pid: i32) -> Option<ProcessStartTime> {
+        None
+    }
+
+    /// Whether the name of an executable is the one that the fixture started.
+    ///
+    /// A `sleep` that is a symlink to a busybox resolves to the name of the
+    /// busybox, so that name is accepted for a `sleep` as well.
+    #[cfg(unix)]
+    fn fixture_executable_matches(expected: &str, name: Option<&OsStr>) -> bool {
+        let Some(name) = name else {
+            return false;
+        };
+        if name == OsStr::new(expected) {
+            return true;
+        }
+        expected == "sleep" && name == OsStr::new("busybox")
+    }
+
     /// Whether one process is gone, so that its pid names nothing.
     ///
     /// A zombie counts as gone: the process was stopped already, and only
     /// the reap of the environment is missing, which this test cannot do
-    /// because the process is not a child of it.
+    /// because the process is not a child of it. A process whose state the
+    /// machine hides is not gone either: only a signal of zero that the
+    /// machine refuses with `ESRCH` proves that the pid names nothing.
     #[cfg(unix)]
     fn process_is_gone(pid: i32) -> bool {
         if unsafe { libc::kill(pid, 0) } == 0 {
@@ -1868,8 +2129,8 @@ mod tests {
     fn process_is_zombie(pid: i32) -> bool {
         #[cfg(target_os = "macos")]
         {
-            // The kernel reports no information about a process that is dead
-            // and waits for its reap.
+            // The state of a process is the status of its BSD info: a
+            // zombie waits for its reap, so its status is `SZOMB`.
             let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
             let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
                 .unwrap_or(libc::c_int::MAX);
@@ -1882,7 +2143,14 @@ mod tests {
                     size,
                 )
             };
-            written == 0
+            if written <= 0 {
+                // The machine refused the request, so the state of the
+                // process is unknown: a process that is not known to be a
+                // zombie is not gone.
+                return false;
+            }
+            let info = unsafe { info.assume_init() };
+            info.pbi_status == libc::SZOMB
         }
         #[cfg(not(target_os = "macos"))]
         {
