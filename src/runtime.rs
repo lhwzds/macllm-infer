@@ -37,16 +37,50 @@ pub struct ModelLoadConfig {
 impl ModelLoadConfig {
     pub const DEFAULT_KV_CACHE_BLOCK_TOKENS: usize = 16;
     pub const DEFAULT_KV_CACHE_SLAB_BLOCKS: usize = 8;
+    /// CUDA has no paged-attention kernel, so every decode step takes the
+    /// dense fallback and copies each K/V block once per layer per step.
+    /// Larger blocks keep that copy count down; see
+    /// `bench/2026-11-10-cuda-kv-blocks.md` in the work folder.
+    ///
+    /// The prefix cache reuses whole blocks, so on CUDA a prompt shorter
+    /// than one block gets no prefix reuse, and every live sequence holds at
+    /// least one block.
+    pub const CUDA_KV_CACHE_BLOCK_TOKENS: usize = 256;
+    /// CUDA has no paged-attention kernel, so every decode step takes the
+    /// dense fallback and copies each K/V block once per layer per step.
+    /// A slab of four 256-token blocks pools the allocation without raising
+    /// the per-step copy count; see `bench/2026-11-10-cuda-kv-blocks.md` in
+    /// the work folder.
+    pub const CUDA_KV_CACHE_SLAB_BLOCKS: usize = 4;
     pub const DEFAULT_SERVER_PREFIX_CACHE_CAPACITY_TOKENS: usize = 32 * 1024;
+
+    /// The K/V block and slab geometry that suits `device`.
+    ///
+    /// CPU and Metal keep the small blocks of the paged Metal kernel, while
+    /// CUDA uses the larger blocks of its dense fallback.
+    #[must_use]
+    pub fn default_kv_cache_geometry(device: DeviceKind) -> (usize, usize) {
+        match device {
+            DeviceKind::Cuda => (
+                Self::CUDA_KV_CACHE_BLOCK_TOKENS,
+                Self::CUDA_KV_CACHE_SLAB_BLOCKS,
+            ),
+            DeviceKind::Cpu | DeviceKind::Metal => (
+                Self::DEFAULT_KV_CACHE_BLOCK_TOKENS,
+                Self::DEFAULT_KV_CACHE_SLAB_BLOCKS,
+            ),
+        }
+    }
 
     #[must_use]
     pub fn new(model: impl Into<PathBuf>, device: DeviceKind, dtype: Option<DTypeKind>) -> Self {
+        let (kv_cache_block_tokens, kv_cache_slab_blocks) = Self::default_kv_cache_geometry(device);
         Self {
             model: model.into(),
             device,
             dtype,
-            kv_cache_block_tokens: Self::DEFAULT_KV_CACHE_BLOCK_TOKENS,
-            kv_cache_slab_blocks: Self::DEFAULT_KV_CACHE_SLAB_BLOCKS,
+            kv_cache_block_tokens,
+            kv_cache_slab_blocks,
             kv_cache_capacity_tokens: None,
             prefix_cache_capacity_tokens: 0,
             prefill_attention: PrefillAttentionMode::default(),
@@ -203,6 +237,41 @@ mod tests {
         assert_eq!(pool.block_tokens(), 16);
         assert_eq!(pool.slab_blocks(), 8);
         assert_eq!(pool.max_blocks(), 256);
+    }
+
+    #[test]
+    fn kv_cache_geometry_follows_the_device() {
+        assert_eq!(
+            ModelLoadConfig::default_kv_cache_geometry(DeviceKind::Cpu),
+            (
+                ModelLoadConfig::DEFAULT_KV_CACHE_BLOCK_TOKENS,
+                ModelLoadConfig::DEFAULT_KV_CACHE_SLAB_BLOCKS
+            )
+        );
+        assert_eq!(
+            ModelLoadConfig::default_kv_cache_geometry(DeviceKind::Metal),
+            (
+                ModelLoadConfig::DEFAULT_KV_CACHE_BLOCK_TOKENS,
+                ModelLoadConfig::DEFAULT_KV_CACHE_SLAB_BLOCKS
+            )
+        );
+        assert_eq!(
+            ModelLoadConfig::default_kv_cache_geometry(DeviceKind::Cuda),
+            (
+                ModelLoadConfig::CUDA_KV_CACHE_BLOCK_TOKENS,
+                ModelLoadConfig::CUDA_KV_CACHE_SLAB_BLOCKS
+            )
+        );
+
+        let cuda = ModelLoadConfig::new("model", DeviceKind::Cuda, None);
+        assert_eq!(
+            cuda.kv_cache_block_tokens,
+            ModelLoadConfig::CUDA_KV_CACHE_BLOCK_TOKENS
+        );
+        assert_eq!(
+            cuda.kv_cache_slab_blocks,
+            ModelLoadConfig::CUDA_KV_CACHE_SLAB_BLOCKS
+        );
     }
 
     #[test]

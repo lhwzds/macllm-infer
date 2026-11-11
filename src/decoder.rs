@@ -1005,7 +1005,15 @@ impl SelfAttention {
                     let (key, value) = reservation
                         .materialize_layer(lane, layer)
                         .map_err(paged_kv_error)?;
-                    sdpa_causal_attention(&lane_query, &key, &value, self.scale)?
+                    // The cache hands over strided views, but the fused kernel
+                    // reads contiguous K/V, so the history is made contiguous
+                    // here.
+                    sdpa_causal_attention(
+                        &lane_query,
+                        &key.contiguous()?,
+                        &value.contiguous()?,
+                        self.scale,
+                    )?
                 } else if fused && batch_uses_native {
                     // The batch as a whole could have used the native paged
                     // kernel, so this lane keeps it: single-row decode and the
@@ -7641,6 +7649,58 @@ mod tests {
             assert!(
                 difference <= 1e-5,
                 "groups={groups} differed by {difference} on a strided K/V view"
+            );
+        }
+        Ok(())
+    }
+
+    /// The dense attention must read the one-block history of the paged cache
+    /// as it is: the strided view and its contiguous copy agree exactly.
+    #[test]
+    fn dense_attention_matches_the_contiguous_reference_for_one_block_kv() -> Result<()> {
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 4;
+        const BLOCK_TOKENS: usize = 8;
+        const HISTORY: usize = 5;
+        let device = Device::Cpu;
+        for groups in [1_usize, 2, 4] {
+            let query_heads = KV_HEADS * groups;
+            let query = Tensor::from_vec(
+                pseudo_random_values(query_heads * HEAD_DIM, 101),
+                (1, query_heads, 1, HEAD_DIM),
+                &device,
+            )?;
+            // The cache view of one block: the head blocks of a buffer that
+            // holds more tokens than the history uses.
+            let key = Tensor::from_vec(
+                pseudo_random_values(KV_HEADS * BLOCK_TOKENS * HEAD_DIM, 103),
+                (1, KV_HEADS, BLOCK_TOKENS, HEAD_DIM),
+                &device,
+            )?
+            .narrow(2, 0, HISTORY)?;
+            let value = Tensor::from_vec(
+                pseudo_random_values(KV_HEADS * BLOCK_TOKENS * HEAD_DIM, 107),
+                (1, KV_HEADS, BLOCK_TOKENS, HEAD_DIM),
+                &device,
+            )?
+            .narrow(2, 0, HISTORY)?;
+            assert!(!key.is_contiguous(), "the test needs a strided K/V view");
+            assert!(!value.is_contiguous(), "the test needs a strided V view");
+            let scale = 1.0 / (HEAD_DIM as f64).sqrt();
+            let strided = dense_causal_attention(&query, &key, &value, groups, scale, None, None)?;
+            let contiguous = dense_causal_attention(
+                &query,
+                &key.contiguous()?,
+                &value.contiguous()?,
+                groups,
+                scale,
+                None,
+                None,
+            )?;
+            let difference = max_difference(&strided, &contiguous)?;
+            assert!(
+                difference == 0.0,
+                "groups={groups} differed by {difference} on a one-block history"
             );
         }
         Ok(())

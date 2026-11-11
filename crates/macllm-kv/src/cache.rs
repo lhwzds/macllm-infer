@@ -2038,6 +2038,15 @@ impl PagedKvAppend<'_> {
     }
 
     /// Materialize one layer's provisional history in block-table order.
+    ///
+    /// The returned K/V tensors may be strided views into the pool's slabs: a
+    /// history that fits in one block is handed over as the narrowed views of
+    /// that block, without a copy. A longer history is joined by
+    /// `Tensor::cat`, and that join may be strided as well: a partly filled
+    /// last block in a pool with more than one layer has no outer stride for
+    /// the token axis, so candle concatenates it through its transpose path.
+    /// Callers that need a contiguous K/V history make it contiguous
+    /// themselves.
     pub fn materialize_layer(&self, layer: usize) -> PagedKvResult<(Tensor, Tensor)> {
         if layer >= self.written_layers.len() || !self.written_layers[layer] {
             return Err(PagedKvPoolError::InvalidTransaction(format!(
@@ -2089,12 +2098,23 @@ impl PagedKvAppend<'_> {
             values.push(value.narrow(2, 0, len)?);
             remaining -= len;
         }
+        if keys.len() == 1 {
+            // The whole history fits in one block, so the narrowed block
+            // views already are the history: they are handed over as they
+            // are, without a copy.
+            return match (keys.pop(), values.pop()) {
+                (Some(key), Some(value)) => Ok((key, value)),
+                _ => Err(PagedKvPoolError::InvalidTransaction(
+                    "the one-block history is missing its K/V views".into(),
+                )),
+            };
+        }
         let key_refs = keys.iter().collect::<Vec<_>>();
         let value_refs = values.iter().collect::<Vec<_>>();
-        Ok((
-            Tensor::cat(&key_refs, 2)?.contiguous()?,
-            Tensor::cat(&value_refs, 2)?.contiguous()?,
-        ))
+        // `Tensor::cat` joins the blocks. The joined history is strided
+        // whenever a block view has no outer stride for the token axis, so
+        // callers that need a contiguous K/V history copy it themselves.
+        Ok((Tensor::cat(&key_refs, 2)?, Tensor::cat(&value_refs, 2)?))
     }
 
     /// Atomically publish the new logical length and every newly reserved block.
@@ -2826,6 +2846,15 @@ impl PagedKvBatchReservation {
     }
 
     /// Materialize one lane/layer's provisional history in page order.
+    ///
+    /// The returned K/V tensors may be strided views into the pool's slabs: a
+    /// history that fits in one block is handed over as the narrowed views of
+    /// that block, without a copy. A longer history is joined by
+    /// `Tensor::cat`, and that join may be strided as well: a partly filled
+    /// last block in a pool with more than one layer has no outer stride for
+    /// the token axis, so candle concatenates it through its transpose path.
+    /// Callers that need a contiguous K/V history make it contiguous
+    /// themselves.
     pub fn materialize_layer(&self, lane: usize, layer: usize) -> PagedKvResult<(Tensor, Tensor)> {
         #[cfg(any(test, feature = "test-exports"))]
         PAGED_BATCH_MATERIALIZATIONS.set(PAGED_BATCH_MATERIALIZATIONS.get().saturating_add(1));
@@ -2884,12 +2913,23 @@ impl PagedKvBatchReservation {
             values.push(value.narrow(2, 0, len)?);
             remaining -= len;
         }
+        if keys.len() == 1 {
+            // The whole history fits in one block, so the narrowed block
+            // views already are the history: they are handed over as they
+            // are, without a copy.
+            return match (keys.pop(), values.pop()) {
+                (Some(key), Some(value)) => Ok((key, value)),
+                _ => Err(PagedKvPoolError::InvalidTransaction(
+                    "the one-block history is missing its K/V views".into(),
+                )),
+            };
+        }
         let key_refs = keys.iter().collect::<Vec<_>>();
         let value_refs = values.iter().collect::<Vec<_>>();
-        Ok((
-            Tensor::cat(&key_refs, 2)?.contiguous()?,
-            Tensor::cat(&value_refs, 2)?.contiguous()?,
-        ))
+        // `Tensor::cat` joins the blocks. The joined history is strided
+        // whenever a block view has no outer stride for the token axis, so
+        // callers that need a contiguous K/V history copy it themselves.
+        Ok((Tensor::cat(&key_refs, 2)?, Tensor::cat(&value_refs, 2)?))
     }
 
     /// Atomically publish all lanes after exact identity, snapshot, and order
@@ -3612,7 +3652,7 @@ fn tensor_bytes(tensor: Option<&Tensor>) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use candle_core::{Device, Tensor};
+    use candle_core::{Device, Storage, Tensor};
 
     use super::*;
 
@@ -3703,6 +3743,66 @@ mod tests {
             (1, kv_heads, len, head_dim),
             &Device::Cpu,
         )?)
+    }
+
+    /// The address of a CPU tensor's storage, used to prove that a
+    /// materialized view shares the slab allocation instead of copying it.
+    fn cpu_storage_address(tensor: &Tensor) -> Option<usize> {
+        let (storage, _) = tensor.storage_and_layout();
+        match &*storage {
+            Storage::Cpu(storage) => storage
+                .as_slice::<f32>()
+                .ok()
+                .map(|slice| slice.as_ptr() as usize),
+            _ => None,
+        }
+    }
+
+    /// The largest absolute difference between two F32 tensors of one shape.
+    fn paged_max_difference(left: &Tensor, right: &Tensor) -> Result<f32> {
+        left.sub(right)?.abs()?.max_all()?.to_scalar::<f32>()
+    }
+
+    /// The paged test values of one base over a range of positions.
+    fn paged_range(
+        base: usize,
+        positions: std::ops::Range<usize>,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        let mut values = Vec::new();
+        for head in 0..kv_heads {
+            for position in positions.clone() {
+                for dimension in 0..head_dim {
+                    values.push((base + head * 1_000 + position * 10 + dimension) as f32);
+                }
+            }
+        }
+        values
+    }
+
+    /// The paged test values of a six-token history that spans two blocks:
+    /// the first three tokens carry `first_base`, the last three `second_base`.
+    fn paged_two_block_expected(
+        first_base: usize,
+        second_base: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        let mut values = Vec::new();
+        for head in 0..kv_heads {
+            for position in 0..6 {
+                let base = if position < 3 {
+                    first_base
+                } else {
+                    second_base
+                };
+                for dimension in 0..head_dim {
+                    values.push((base + head * 1_000 + position * 10 + dimension) as f32);
+                }
+            }
+        }
+        values
     }
 
     fn paged_expected(base: usize, len: usize, kv_heads: usize, head_dim: usize) -> Vec<f32> {
@@ -3895,6 +3995,222 @@ mod tests {
         assert_eq!(stats.free_blocks, 4);
         assert_eq!(stats.live_blocks, 0);
         assert_eq!(stats.retired_blocks, 0);
+        Ok(())
+    }
+
+    /// A history that fits in one block is handed over as the narrowed views
+    /// of that block, so the materialization copies nothing.
+    #[test]
+    fn paged_one_block_history_materializes_as_a_slab_view() -> PagedKvResult<()> {
+        const LAYERS: usize = 2;
+        const HEADS: usize = 2;
+        const DIM: usize = 2;
+        const BLOCK_TOKENS: usize = 4;
+        let pool = paged_pool(LAYERS, HEADS, DIM, BLOCK_TOKENS, 2, 4)?;
+        let mut table = PagedKvBlockTable::new(pool.clone(), 8)?;
+
+        let mut append = table.begin_append(3)?;
+        for layer in 0..LAYERS {
+            let key = paged_values(layer * 10_000, 0, 3, HEADS, DIM)?;
+            let value = paged_values(50_000 + layer * 10_000, 0, 3, HEADS, DIM)?;
+            append.write_layer(layer, &key, &value)?;
+        }
+        let (key, value) = append.materialize_layer(1)?;
+        assert_eq!(key.dim(2)?, 3);
+        assert_eq!(value.dim(2)?, 3);
+        // The history is a window into the slab, not a fresh copy.
+        assert!(!key.is_contiguous());
+        assert!(!value.is_contiguous());
+        // The layer-1 window starts after the layer-0 window of the block.
+        let layer_offset = HEADS * BLOCK_TOKENS * DIM;
+        assert_eq!(key.layout().start_offset(), layer_offset);
+        assert_eq!(value.layout().start_offset(), layer_offset);
+        // The token axis keeps the per-head stride of the slab.
+        assert_eq!(key.stride()[2], DIM);
+        assert_eq!(key.stride()[1], BLOCK_TOKENS * DIM);
+        // The view shares the slab allocation.
+        let slab_key = pool
+            .inner
+            .try_borrow()
+            .map_err(|_| PagedKvPoolError::PoolBusy)?
+            .slabs[0]
+            .key
+            .clone();
+        assert_eq!(
+            cpu_storage_address(&key),
+            cpu_storage_address(&slab_key),
+            "the one-block history does not share the slab storage"
+        );
+        // The values are the ones that were written.
+        let expected_key = Tensor::from_vec(
+            paged_range(10_000, 0..3, HEADS, DIM),
+            (1, HEADS, 3, DIM),
+            &Device::Cpu,
+        )?;
+        let expected_value = Tensor::from_vec(
+            paged_range(60_000, 0..3, HEADS, DIM),
+            (1, HEADS, 3, DIM),
+            &Device::Cpu,
+        )?;
+        let difference = paged_max_difference(&key, &expected_key)?;
+        assert!(
+            difference == 0.0,
+            "the one-block key history differs by {difference} (shape {:?})",
+            key.dims()
+        );
+        let difference = paged_max_difference(&value, &expected_value)?;
+        assert!(
+            difference == 0.0,
+            "the one-block value history differs by {difference} (shape {:?})",
+            value.dims()
+        );
+        append.commit()?;
+
+        // A history that spans two blocks keeps the values it had before.
+        let mut append = table.begin_append(3)?;
+        for layer in 0..LAYERS {
+            let key = paged_values(70_000 + layer * 10_000, 3, 3, HEADS, DIM)?;
+            let value = paged_values(90_000 + layer * 10_000, 3, 3, HEADS, DIM)?;
+            append.write_layer(layer, &key, &value)?;
+        }
+        let (key, value) = append.materialize_layer(0)?;
+        assert_eq!(key.dim(2)?, 6);
+        assert_eq!(value.dim(2)?, 6);
+        let expected_key = Tensor::from_vec(
+            paged_two_block_expected(0, 70_000, HEADS, DIM),
+            (1, HEADS, 6, DIM),
+            &Device::Cpu,
+        )?;
+        let difference = paged_max_difference(&key, &expected_key)?;
+        assert!(
+            difference == 0.0,
+            "the two-block key history differs by {difference} (shape {:?})",
+            key.dims()
+        );
+        let expected_value = Tensor::from_vec(
+            paged_two_block_expected(50_000, 90_000, HEADS, DIM),
+            (1, HEADS, 6, DIM),
+            &Device::Cpu,
+        )?;
+        let difference = paged_max_difference(&value, &expected_value)?;
+        assert!(
+            difference == 0.0,
+            "the two-block value history differs by {difference} (shape {:?})",
+            value.dims()
+        );
+        append.commit()?;
+        Ok(())
+    }
+
+    /// A history that spans several blocks is joined by `Tensor::cat`, and
+    /// the joined history is strided: the partly filled last block of a pool
+    /// with more than one layer has no outer stride for the token axis, so
+    /// candle concatenates the blocks through its transpose path. The test
+    /// pins that layout, so the comment on `materialize_layer` cannot drift
+    /// away from what candle returns.
+    #[test]
+    fn paged_multi_block_history_materializes_as_a_strided_join() -> PagedKvResult<()> {
+        const LAYERS: usize = 2;
+        const HEADS: usize = 2;
+        const DIM: usize = 2;
+        const BLOCK_TOKENS: usize = 4;
+        let pool = paged_pool(LAYERS, HEADS, DIM, BLOCK_TOKENS, 2, 4)?;
+        let mut table = PagedKvBlockTable::new(pool.clone(), 8)?;
+
+        // Six tokens fill one block and leave the second one partly filled.
+        let mut append = table.begin_append(6)?;
+        for layer in 0..LAYERS {
+            let key = paged_values(layer * 10_000, 0, 6, HEADS, DIM)?;
+            let value = paged_values(50_000 + layer * 10_000, 0, 6, HEADS, DIM)?;
+            append.write_layer(layer, &key, &value)?;
+        }
+        let (key, value) = append.materialize_layer(0)?;
+        assert_eq!(key.dim(2)?, 6);
+        assert_eq!(value.dim(2)?, 6);
+        // The join is strided, exactly as the doc comment of
+        // `materialize_layer` says it is.
+        assert!(
+            !key.is_contiguous(),
+            "the joined key history is contiguous (shape {:?})",
+            key.dims()
+        );
+        assert!(
+            !value.is_contiguous(),
+            "the joined value history is contiguous (shape {:?})",
+            value.dims()
+        );
+        // The joined history holds the values that were written.
+        let expected_key = Tensor::from_vec(
+            paged_expected(0, 6, HEADS, DIM),
+            (1, HEADS, 6, DIM),
+            &Device::Cpu,
+        )?;
+        let difference = paged_max_difference(&key, &expected_key)?;
+        assert!(
+            difference == 0.0,
+            "the joined key history differs by {difference} (shape {:?})",
+            key.dims()
+        );
+        let expected_value = Tensor::from_vec(
+            paged_expected(50_000, 6, HEADS, DIM),
+            (1, HEADS, 6, DIM),
+            &Device::Cpu,
+        )?;
+        let difference = paged_max_difference(&value, &expected_value)?;
+        assert!(
+            difference == 0.0,
+            "the joined value history differs by {difference} (shape {:?})",
+            value.dims()
+        );
+        append.commit()?;
+        Ok(())
+    }
+
+    /// The batch materialization hands over the same one-block views.
+    #[test]
+    fn paged_batch_one_block_history_materializes_as_a_slab_view() -> PagedKvResult<()> {
+        const HEADS: usize = 2;
+        const DIM: usize = 2;
+        const BLOCK_TOKENS: usize = 4;
+        let pool = paged_pool(1, HEADS, DIM, BLOCK_TOKENS, 2, 4)?;
+        let mut table = PagedKvBlockTable::new(pool.clone(), 8)?;
+
+        let mut reservation = pool.reserve_batch(&[PagedKvGrowthRequest::new(&table, 3)])?;
+        let key = paged_values(10_000, 0, 3, HEADS, DIM)?;
+        let value = paged_values(20_000, 0, 3, HEADS, DIM)?;
+        reservation.write_layer(0, 0, &key, &value)?;
+        let (materialized_key, materialized_value) = reservation.materialize_layer(0, 0)?;
+        assert_eq!(materialized_key.dim(2)?, 3);
+        assert_eq!(materialized_value.dim(2)?, 3);
+        // The history is a window into the slab, not a fresh copy.
+        assert!(!materialized_key.is_contiguous());
+        assert!(!materialized_value.is_contiguous());
+        assert_eq!(materialized_key.stride()[2], DIM);
+        assert_eq!(materialized_key.stride()[1], BLOCK_TOKENS * DIM);
+        let slab_key = pool
+            .inner
+            .try_borrow()
+            .map_err(|_| PagedKvPoolError::PoolBusy)?
+            .slabs[0]
+            .key
+            .clone();
+        assert_eq!(
+            cpu_storage_address(&materialized_key),
+            cpu_storage_address(&slab_key),
+            "the one-block history does not share the slab storage"
+        );
+        let expected_key = Tensor::from_vec(
+            paged_range(10_000, 0..3, HEADS, DIM),
+            (1, HEADS, 3, DIM),
+            &Device::Cpu,
+        )?;
+        let difference = paged_max_difference(&materialized_key, &expected_key)?;
+        assert!(
+            difference == 0.0,
+            "the one-block key history differs by {difference} (shape {:?})",
+            materialized_key.dims()
+        );
+        reservation.commit(&mut [&mut table])?;
         Ok(())
     }
 

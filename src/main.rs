@@ -124,18 +124,14 @@ struct RuntimeArgs {
     /// Activation dtype. Defaults to F32 for CPU or quantized GGUF, F16 otherwise.
     #[arg(long, value_parser = dtype_kind_parser())]
     dtype: Option<DTypeKind>,
-    /// Tokens per logical full-attention K/V block.
-    #[arg(
-        long,
-        default_value_t = ModelLoadConfig::DEFAULT_KV_CACHE_BLOCK_TOKENS
-    )]
-    kv_cache_block_tokens: usize,
-    /// Logical K/V blocks stored in each physical slab allocation.
-    #[arg(
-        long,
-        default_value_t = ModelLoadConfig::DEFAULT_KV_CACHE_SLAB_BLOCKS
-    )]
-    kv_cache_slab_blocks: usize,
+    /// Tokens per logical full-attention K/V block. Defaults to 16 on CPU and
+    /// Metal and to 256 on CUDA.
+    #[arg(long)]
+    kv_cache_block_tokens: Option<usize>,
+    /// Logical K/V blocks stored in each physical slab allocation. Defaults to
+    /// 8 on CPU and Metal and to 4 on CUDA.
+    #[arg(long)]
+    kv_cache_slab_blocks: Option<usize>,
     /// Total full-attention K/V token capacity shared across all sequences.
     /// Defaults to one model context, independent of active request count;
     /// explicit values are rounded up to a whole logical block.
@@ -1335,8 +1331,14 @@ fn load_prompt_runtime_from_config(
 
 fn model_load_config(args: &RuntimeArgs) -> ModelLoadConfig {
     let mut config = ModelLoadConfig::new(args.model.clone(), args.device, args.dtype);
-    config.kv_cache_block_tokens = args.kv_cache_block_tokens;
-    config.kv_cache_slab_blocks = args.kv_cache_slab_blocks;
+    // An explicit value wins on every device; without one the config keeps
+    // the geometry that suits the selected device.
+    if let Some(block_tokens) = args.kv_cache_block_tokens {
+        config.kv_cache_block_tokens = block_tokens;
+    }
+    if let Some(slab_blocks) = args.kv_cache_slab_blocks {
+        config.kv_cache_slab_blocks = slab_blocks;
+    }
     config.kv_cache_capacity_tokens = args.kv_cache_capacity_tokens;
     config.prefill_attention = args.prefill_attention;
     config
@@ -1490,20 +1492,104 @@ mod tests {
 
     #[test]
     fn cli_uses_shared_kv_pool_defaults() {
+        // The default device follows the build features, so the defaults of
+        // a run without `--device` are the geometry of that device.
         let runtime = serve_runtime(
             Cli::try_parse_from(["macllm", "serve", "--model", "model-dir"]).unwrap(),
+        );
+        let config = model_load_config(&runtime);
+        let (block_tokens, slab_blocks) =
+            ModelLoadConfig::default_kv_cache_geometry(runtime.device);
+
+        assert_eq!(config.kv_cache_block_tokens, block_tokens);
+        assert_eq!(config.kv_cache_slab_blocks, slab_blocks);
+        assert_eq!(config.kv_cache_capacity_tokens, None);
+
+        // An explicit CPU run keeps the small blocks of the paged kernel.
+        let cpu = serve_runtime(
+            Cli::try_parse_from(["macllm", "serve", "--model", "model-dir", "--device", "cpu"])
+                .unwrap(),
+        );
+        let cpu_config = model_load_config(&cpu);
+
+        assert_eq!(
+            cpu_config.kv_cache_block_tokens,
+            ModelLoadConfig::DEFAULT_KV_CACHE_BLOCK_TOKENS
+        );
+        assert_eq!(
+            cpu_config.kv_cache_slab_blocks,
+            ModelLoadConfig::DEFAULT_KV_CACHE_SLAB_BLOCKS
+        );
+
+        let metal = serve_runtime(
+            Cli::try_parse_from([
+                "macllm",
+                "serve",
+                "--model",
+                "model-dir",
+                "--device",
+                "metal",
+            ])
+            .unwrap(),
+        );
+        let metal_config = model_load_config(&metal);
+
+        assert_eq!(
+            metal_config.kv_cache_block_tokens,
+            ModelLoadConfig::DEFAULT_KV_CACHE_BLOCK_TOKENS
+        );
+        assert_eq!(
+            metal_config.kv_cache_slab_blocks,
+            ModelLoadConfig::DEFAULT_KV_CACHE_SLAB_BLOCKS
+        );
+    }
+
+    #[test]
+    fn cli_uses_device_cuda_kv_pool_defaults() {
+        // A device cuda run without the K/V flags keeps the CUDA geometry.
+        let runtime = serve_runtime(
+            Cli::try_parse_from([
+                "macllm",
+                "serve",
+                "--model",
+                "model-dir",
+                "--device",
+                "cuda",
+            ])
+            .unwrap(),
         );
         let config = model_load_config(&runtime);
 
         assert_eq!(
             config.kv_cache_block_tokens,
-            ModelLoadConfig::DEFAULT_KV_CACHE_BLOCK_TOKENS
+            ModelLoadConfig::CUDA_KV_CACHE_BLOCK_TOKENS
         );
         assert_eq!(
             config.kv_cache_slab_blocks,
-            ModelLoadConfig::DEFAULT_KV_CACHE_SLAB_BLOCKS
+            ModelLoadConfig::CUDA_KV_CACHE_SLAB_BLOCKS
         );
-        assert_eq!(config.kv_cache_capacity_tokens, None);
+
+        // An explicit value still wins on every device.
+        let explicit = serve_runtime(
+            Cli::try_parse_from([
+                "macllm",
+                "serve",
+                "--model",
+                "model-dir",
+                "--device",
+                "cuda",
+                "--kv-cache-block-tokens",
+                "32",
+            ])
+            .unwrap(),
+        );
+        let explicit_config = model_load_config(&explicit);
+
+        assert_eq!(explicit_config.kv_cache_block_tokens, 32);
+        assert_eq!(
+            explicit_config.kv_cache_slab_blocks,
+            ModelLoadConfig::CUDA_KV_CACHE_SLAB_BLOCKS
+        );
     }
 
     #[test]
