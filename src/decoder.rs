@@ -4527,6 +4527,31 @@ pub(crate) fn attention_mask_for_range(
     Ok(Some(mask.to_dtype(dtype)?.unsqueeze(0)?.unsqueeze(0)?))
 }
 
+/// The shapes the grouped attention reads.
+///
+/// The grouped query gathers the query heads of one KV head into a single
+/// block, so both of its dimensions are products of the tensor shapes: the
+/// query head count is `kv_heads * kv_groups` and the query row count is
+/// `kv_groups * query_len` rows per KV head. They are checked here: a head
+/// count or a row count that overflows the addressable range is a
+/// configuration error, not a value that may wrap.
+fn grouped_shapes(kv_heads: usize, kv_groups: usize, query_len: usize) -> Result<(usize, usize)> {
+    if kv_heads == 0 {
+        candle_core::bail!("grouped attention expects at least one KV head, got {kv_heads}");
+    }
+    let query_heads = kv_heads.checked_mul(kv_groups).ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "grouped attention head count overflows: {kv_heads} KV heads times {kv_groups} groups"
+        ))
+    })?;
+    let query_rows = kv_groups.checked_mul(query_len).ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "grouped attention query rows overflow: {kv_groups} groups times {query_len} queries"
+        ))
+    })?;
+    Ok((query_heads, query_rows))
+}
+
 /// Dense full-causal attention over a materialized K/V history.
 ///
 /// This is the reference attention path: the query heads are grouped by the
@@ -4551,7 +4576,20 @@ pub(crate) fn dense_causal_attention(
     let (batch, query_heads, query_len, head_dim) = query.dims4()?;
     let (key_batch, kv_heads, key_len, key_head_dim) = key.dims4()?;
     let (value_batch, value_heads, value_len, value_head_dim) = value.dims4()?;
-    if kv_groups == 0 || query_heads != kv_heads * kv_groups {
+    // The grouped shapes are products of the tensor shapes, so they are
+    // checked before they are used: a head count or a row count that
+    // overflows the addressable range is a configuration error, not a
+    // value that may wrap.
+    let (grouped_query_heads, grouped_query_len) = grouped_shapes(kv_heads, kv_groups, query_len)?;
+    // A group count of zero has its own error. The head count of a zero
+    // group history is zero as well, so the head count check below would
+    // report the same mismatch for a different reason.
+    if kv_groups == 0 {
+        candle_core::bail!(
+            "grouped attention expects at least one query group per KV head, got 0 query groups"
+        );
+    }
+    if query_heads != grouped_query_heads {
         candle_core::bail!(
             "grouped attention expects {kv_groups} query heads per KV head, got \
              {query_heads} query heads and {kv_heads} KV heads"
@@ -4586,7 +4624,7 @@ pub(crate) fn dense_causal_attention(
     // Group the query heads by their KV head. The head order is the one the
     // expanded K/V used to produce, so query head `h` still reads KV head
     // `h / kv_groups`.
-    let grouped_query = query.reshape((batch, kv_heads, kv_groups * query_len, head_dim))?;
+    let grouped_query = query.reshape((batch, kv_heads, grouped_query_len, head_dim))?;
     let scores = grouped_query
         .matmul(&key.transpose(2, 3)?)?
         .affine(scale, 0.0)?;
@@ -4599,13 +4637,10 @@ pub(crate) fn dense_causal_attention(
             // The mask is per query row, so it broadcasts over the group axis
             // the grouped query introduced.
             let scores = scores.reshape((batch, kv_heads, kv_groups, query_len, key_len))?;
-            let mask = grouped_mask(mask)?;
-            scores.broadcast_add(&mask)?.reshape((
-                batch,
-                kv_heads,
-                kv_groups * query_len,
-                key_len,
-            ))?
+            let mask = grouped_mask(mask, batch, query_len, key_len)?;
+            scores
+                .broadcast_add(&mask)?
+                .reshape((batch, kv_heads, grouped_query_len, key_len))?
         }
         None => scores,
     };
@@ -4619,10 +4654,17 @@ pub(crate) fn dense_causal_attention(
 
 /// Whether the attention matmul can read a K/V history as it is.
 ///
-/// The matmul reads one head block at a time, so the last two axes of a
-/// block must be contiguous and the heads must be evenly spaced. The
-/// compact cache views satisfy both; a view that interleaves the heads
-/// does not and is copied once.
+/// The accepted layout is a row-major or a column-major `(sequence,
+/// head_dim)` block per head: the two trailing axes of a block are either
+/// `sequence_stride == head_dim` with `dim_stride == 1`, or
+/// `sequence_stride == 1` with `dim_stride == sequence`. The head blocks
+/// are evenly spaced, so the head stride covers a whole block, and the
+/// batch spacing is checked as `batch_stride == head_stride * heads`: one
+/// batch element starts `heads` head blocks after the previous one.
+///
+/// The compact cache views satisfy all of this; a view that interleaves the
+/// heads does not and is copied once. The two products are checked, so an
+/// overflowing history is not ready instead of a wrapped size.
 fn matmul_ready_kv(
     tensor: &Tensor,
     batch: usize,
@@ -4633,32 +4675,95 @@ fn matmul_ready_kv(
     let strides = tensor.stride();
     let (batch_stride, head_stride, sequence_stride, dim_stride) =
         (strides[0], strides[1], strides[2], strides[3]);
-    let block = sequence * head_dim;
-    // The block of one head is either head-major or sequence-major. Those are
-    // the two layouts the matmul reads without a copy.
+    // The block of one head is `sequence * head_dim` elements and the
+    // batch spacing is `head_stride * heads` elements. An overflowing
+    // product is not ready: the caller copies the history instead of
+    // reading a wrapped size.
+    let Some(block) = sequence.checked_mul(head_dim) else {
+        return false;
+    };
+    let Some(batch_spacing) = head_stride.checked_mul(heads) else {
+        return false;
+    };
+    // The block of one head is either row-major or column-major in the
+    // (seq, d) axes. Those are the two layouts the matmul reads without a
+    // copy.
     let contiguous_block = (dim_stride == 1 && sequence_stride == head_dim)
         || (sequence_stride == 1 && dim_stride == sequence);
     // The head blocks are evenly spaced, so one batch element starts
     // `heads` blocks after the previous one.
-    let spaced = head_stride >= block && (batch == 1 || batch_stride == head_stride * heads);
+    let spaced = head_stride >= block && (batch == 1 || batch_stride == batch_spacing);
     contiguous_block && spaced
 }
 
 /// Reshape an additive mask so it broadcasts over the group axis of the
 /// grouped scores `(batch, kv_heads, groups, query_len, key_len)`.
 ///
-/// The mask keeps its own leading dimensions and gains a group axis of one
-/// right before the query and key axes.
-fn grouped_mask(mask: &Tensor) -> Result<Tensor> {
+/// The mask carries one value per query row and key column. The axes in
+/// front of them are the batch axis and the head axis of the scores: the
+/// head axis must be one, because after the reshape to `(batch, 1, 1, q, k)`
+/// it lands on the KV head axis of the scores, and the group axis is a new
+/// axis of size one that broadcasts the mask over every group. The batch
+/// axis must be one or the batch size of the scores.
+///
+/// The mask must cover the scores as well: its query axis is the query
+/// length and its key axis is the key length. A mask with fewer query rows
+/// would be broadcast over every query row, so it is rejected.
+///
+/// The accepted shapes are therefore `(query_len, key_len)`,
+/// `(1, 1, query_len, key_len)` and `(batch, 1, query_len, key_len)`; every
+/// other shape is rejected.
+fn grouped_mask(mask: &Tensor, batch: usize, query_len: usize, key_len: usize) -> Result<Tensor> {
     let dims = mask.dims();
     match dims {
-        [query_len, key_len] => mask.reshape((1_usize, 1, 1, *query_len, *key_len)),
-        [leading, query_len, key_len] => mask.reshape((*leading, 1_usize, 1, *query_len, *key_len)),
-        [batch, leading, query_len, key_len] => {
-            mask.reshape((*batch, *leading, 1_usize, *query_len, *key_len))
+        [mask_query_len, mask_key_len] => {
+            check_mask_extents(*mask_query_len, *mask_key_len, query_len, key_len)?;
+            mask.reshape((1_usize, 1, 1, *mask_query_len, *mask_key_len))
+        }
+        [mask_batch, heads, mask_query_len, mask_key_len] => {
+            if *heads != 1 {
+                candle_core::bail!(
+                    "attention mask with a head axis of {heads} is not supported, the head axis \
+                     must be one"
+                );
+            }
+            if *mask_batch != 1 && *mask_batch != batch {
+                candle_core::bail!(
+                    "attention mask with a batch axis of {mask_batch} does not match the batch of \
+                     {batch}"
+                );
+            }
+            check_mask_extents(*mask_query_len, *mask_key_len, query_len, key_len)?;
+            mask.reshape((*mask_batch, 1_usize, 1, *mask_query_len, *mask_key_len))
         }
         _ => candle_core::bail!("attention mask with {} axes is not supported", dims.len()),
     }
+}
+
+/// Check that a mask covers the query rows and the key columns of the
+/// scores it is added to.
+///
+/// A mask with a shorter query axis would be broadcast over every query row
+/// of the scores, so the mismatch is an error instead of a silent mask.
+fn check_mask_extents(
+    mask_query_len: usize,
+    mask_key_len: usize,
+    query_len: usize,
+    key_len: usize,
+) -> Result<()> {
+    if mask_query_len != query_len {
+        candle_core::bail!(
+            "attention mask with a query axis of {mask_query_len} does not match the query length \
+             of {query_len}"
+        );
+    }
+    if mask_key_len != key_len {
+        candle_core::bail!(
+            "attention mask with a key axis of {mask_key_len} does not match the key length of \
+             {key_len}"
+        );
+    }
+    Ok(())
 }
 
 fn tanh_softcap(input: &Tensor, softcap: f64) -> Result<Tensor> {
@@ -7520,6 +7625,30 @@ mod tests {
         Ok(())
     }
 
+    /// The devices the strided K/V case runs on.
+    ///
+    /// The CPU always runs the case. A Metal host runs it as well, because
+    /// the cache views are handed to the Metal backend in production. A
+    /// Metal build without a Metal device prints one line and runs the CPU
+    /// leg only.
+    fn strided_case_devices() -> Vec<Device> {
+        #[cfg(feature = "metal")]
+        {
+            let mut devices = vec![Device::Cpu];
+            match Device::new_metal(0) {
+                Ok(device) => devices.push(device),
+                Err(error) => eprintln!(
+                    "skipping the Metal leg of the strided K/V case: no Metal device: {error}"
+                ),
+            }
+            devices
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            vec![Device::Cpu]
+        }
+    }
+
     /// The device the comparison runs on for one dtype.
     ///
     /// The CPU backend only supports F16 matmuls without the accelerate
@@ -7537,74 +7666,182 @@ mod tests {
         probe.matmul(&probe).ok().map(|_| Device::Cpu)
     }
 
+    /// The message of an attention call that must be rejected.
+    ///
+    /// A call that is accepted is reported with its shape, so a failure
+    /// prints shapes and lengths instead of a tensor.
+    fn rejection_message(result: Result<Tensor>) -> String {
+        match result {
+            Ok(tensor) => format!("the call was accepted with the shape {:?}", tensor.dims()),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    /// The mask the differential comparison applies.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ComparisonMask {
+        None,
+        Causal,
+        Sliding,
+        /// A different mask per batch element, stacked on the batch axis.
+        PerBatch,
+    }
+
+    /// The mask of the differential comparison for one configuration.
+    ///
+    /// The causal mask carries the batch axis, so the batched shape of the
+    /// mask contract is covered as well. The per-batch mask gives every
+    /// batch element a different mask, so a path that mixes the batch
+    /// elements up differs from the reference.
+    fn comparison_mask(
+        kind: ComparisonMask,
+        query_len: usize,
+        key_len: usize,
+        window: usize,
+        batch: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Option<Tensor>> {
+        match kind {
+            ComparisonMask::None => Ok(None),
+            ComparisonMask::Causal => {
+                let mask = causal_mask(query_len, key_len, dtype, device)?;
+                Ok(Some(mask.expand((batch, 1, query_len, key_len))?))
+            }
+            ComparisonMask::Sliding => attention_mask_for_range(
+                AttentionKind::SlidingCausal { window },
+                key_len - query_len,
+                query_len,
+                0,
+                key_len,
+                dtype,
+                device,
+            ),
+            ComparisonMask::PerBatch => {
+                // The even batch elements carry the causal mask and the odd
+                // ones the sliding mask, so the batch elements differ.
+                let mut masks = Vec::with_capacity(batch);
+                for element in 0..batch {
+                    let mask = if element % 2 == 0 {
+                        causal_mask(query_len, key_len, dtype, device)?
+                    } else {
+                        attention_mask_for_range(
+                            AttentionKind::SlidingCausal { window },
+                            key_len - query_len,
+                            query_len,
+                            0,
+                            key_len,
+                            dtype,
+                            device,
+                        )?
+                        .ok_or_else(|| {
+                            candle_core::Error::Msg(
+                                "the sliding comparison mask has no masked position".into(),
+                            )
+                        })?
+                    };
+                    masks.push(mask);
+                }
+                Ok(Some(Tensor::cat(&masks, 0)?))
+            }
+        }
+    }
+
     /// The grouped attention must agree with the expand-based formula it
     /// replaced, for every group count, query length, softcap and dtype.
+    ///
+    /// The comparison covers one and two KV heads, one and two batch
+    /// elements and the sliding window mask the decoder builds, so the
+    /// grouped query is checked against the expanded K/V on every shape
+    /// the runtime hands it. The batched case carries a different mask per
+    /// batch element, so a path that mixes the batch elements up fails the
+    /// comparison.
     #[test]
     fn grouped_attention_matches_the_expanded_reference() -> Result<()> {
-        const KV_HEADS: usize = 2;
         const HEAD_DIM: usize = 8;
         const KEY_LEN: usize = 6;
+        const WINDOW: usize = 3;
         for dtype in [DType::F32, DType::F16] {
             let Some(device) = comparison_device(dtype) else {
                 eprintln!("skipping the {dtype:?} comparison: no F16 matmul backend");
                 continue;
             };
-            for groups in [1_usize, 2, 4] {
-                for (query_len, masked) in [(1_usize, false), (5, true)] {
-                    for softcap in [None, Some(30.0_f64)] {
-                        let query_heads = KV_HEADS * groups;
-                        let query = Tensor::from_vec(
-                            pseudo_random_values(query_heads * query_len * HEAD_DIM, 13),
-                            (1, query_heads, query_len, HEAD_DIM),
-                            &device,
-                        )?
-                        .to_dtype(dtype)?;
-                        let key = Tensor::from_vec(
-                            pseudo_random_values(KV_HEADS * KEY_LEN * HEAD_DIM, 29),
-                            (1, KV_HEADS, KEY_LEN, HEAD_DIM),
-                            &device,
-                        )?
-                        .to_dtype(dtype)?;
-                        let value = Tensor::from_vec(
-                            pseudo_random_values(KV_HEADS * KEY_LEN * HEAD_DIM, 47),
-                            (1, KV_HEADS, KEY_LEN, HEAD_DIM),
-                            &device,
-                        )?
-                        .to_dtype(dtype)?;
-                        let mask = if masked {
-                            Some(causal_mask(query_len, KEY_LEN, dtype, &device)?)
-                        } else {
-                            None
-                        };
-                        let scale = 1.0 / (HEAD_DIM as f64).sqrt();
-                        let grouped = dense_causal_attention(
-                            &query,
-                            &key,
-                            &value,
-                            groups,
-                            scale,
-                            softcap,
-                            mask.as_ref(),
-                        )?;
-                        let expanded = expanded_causal_attention(
-                            &query,
-                            &key,
-                            &value,
-                            groups,
-                            scale,
-                            softcap,
-                            mask.as_ref(),
-                        )?;
-                        let tolerance = if dtype == DType::F32 { 1e-5 } else { 2e-3 };
-                        let difference = max_difference(
-                            &grouped.to_dtype(DType::F32)?,
-                            &expanded.to_dtype(DType::F32)?,
-                        )?;
-                        assert!(
-                            difference <= tolerance,
-                            "groups={groups} query_len={query_len} softcap={softcap:?} \
-                             {dtype:?} differed by {difference} (tolerance {tolerance})"
-                        );
+            for (kv_heads, batch) in [(1_usize, 1_usize), (1, 2), (2, 1), (2, 2)] {
+                for groups in [1_usize, 2, 4] {
+                    for (query_len, mask_kind) in [
+                        (1_usize, ComparisonMask::None),
+                        (5, ComparisonMask::Causal),
+                        (5, ComparisonMask::Sliding),
+                        (5, ComparisonMask::PerBatch),
+                    ] {
+                        for softcap in [None, Some(30.0_f64)] {
+                            let query_heads = kv_heads * groups;
+                            let seed = 13_u64
+                                + kv_heads as u64 * 7
+                                + batch as u64 * 31
+                                + groups as u64 * 101
+                                + query_len as u64 * 13;
+                            let query = Tensor::from_vec(
+                                pseudo_random_values(
+                                    batch * query_heads * query_len * HEAD_DIM,
+                                    seed,
+                                ),
+                                (batch, query_heads, query_len, HEAD_DIM),
+                                &device,
+                            )?
+                            .to_dtype(dtype)?;
+                            let key = Tensor::from_vec(
+                                pseudo_random_values(
+                                    batch * kv_heads * KEY_LEN * HEAD_DIM,
+                                    seed + 29,
+                                ),
+                                (batch, kv_heads, KEY_LEN, HEAD_DIM),
+                                &device,
+                            )?
+                            .to_dtype(dtype)?;
+                            let value = Tensor::from_vec(
+                                pseudo_random_values(
+                                    batch * kv_heads * KEY_LEN * HEAD_DIM,
+                                    seed + 47,
+                                ),
+                                (batch, kv_heads, KEY_LEN, HEAD_DIM),
+                                &device,
+                            )?
+                            .to_dtype(dtype)?;
+                            let mask = comparison_mask(
+                                mask_kind, query_len, KEY_LEN, WINDOW, batch, dtype, &device,
+                            )?;
+                            let scale = 1.0 / (HEAD_DIM as f64).sqrt();
+                            let grouped = dense_causal_attention(
+                                &query,
+                                &key,
+                                &value,
+                                groups,
+                                scale,
+                                softcap,
+                                mask.as_ref(),
+                            )?;
+                            let expanded = expanded_causal_attention(
+                                &query,
+                                &key,
+                                &value,
+                                groups,
+                                scale,
+                                softcap,
+                                mask.as_ref(),
+                            )?;
+                            let tolerance = if dtype == DType::F32 { 1e-5 } else { 2e-3 };
+                            let difference = max_difference(
+                                &grouped.to_dtype(DType::F32)?,
+                                &expanded.to_dtype(DType::F32)?,
+                            )?;
+                            assert!(
+                                difference <= tolerance,
+                                "kv_heads={kv_heads} batch={batch} groups={groups} \
+                                 query_len={query_len} mask={mask_kind:?} softcap={softcap:?} \
+                                 {dtype:?} differed by {difference} (tolerance {tolerance})"
+                            );
+                        }
                     }
                 }
             }
@@ -7614,42 +7851,60 @@ mod tests {
 
     /// The KV cache hands over strided K/V views, so the grouped attention
     /// must read them without a contiguous copy of the history.
+    ///
+    /// A Metal host reads the same views, because the cache hands them to
+    /// the Metal backend in production.
     #[test]
     fn grouped_attention_reads_strided_kv_views() -> Result<()> {
         const KV_HEADS: usize = 2;
         const HEAD_DIM: usize = 4;
         const KEY_LEN: usize = 5;
         const CAPACITY: usize = 9;
-        let device = Device::Cpu;
-        for groups in [1_usize, 2, 4] {
-            let query_heads = KV_HEADS * groups;
-            let query = Tensor::from_vec(
-                pseudo_random_values(query_heads * HEAD_DIM, 71),
-                (1, query_heads, 1, HEAD_DIM),
-                &device,
-            )?;
-            let key = Tensor::from_vec(
-                pseudo_random_values(KV_HEADS * CAPACITY * HEAD_DIM, 83),
-                (1, KV_HEADS, CAPACITY, HEAD_DIM),
-                &device,
-            )?
-            .narrow(2, 2, KEY_LEN)?;
-            let value = Tensor::from_vec(
-                pseudo_random_values(KV_HEADS * CAPACITY * HEAD_DIM, 97),
-                (1, KV_HEADS, CAPACITY, HEAD_DIM),
-                &device,
-            )?
-            .narrow(2, 2, KEY_LEN)?;
-            assert!(!key.is_contiguous(), "the test needs a strided K/V view");
-            let scale = 1.0 / (HEAD_DIM as f64).sqrt();
-            let grouped = dense_causal_attention(&query, &key, &value, groups, scale, None, None)?;
-            let expanded =
-                expanded_causal_attention(&query, &key, &value, groups, scale, None, None)?;
-            let difference = max_difference(&grouped, &expanded)?;
-            assert!(
-                difference <= 1e-5,
-                "groups={groups} differed by {difference} on a strided K/V view"
-            );
+        for device in strided_case_devices() {
+            for groups in [1_usize, 2, 4] {
+                let query_heads = KV_HEADS * groups;
+                let query = Tensor::from_vec(
+                    pseudo_random_values(query_heads * HEAD_DIM, 71),
+                    (1, query_heads, 1, HEAD_DIM),
+                    &device,
+                )?;
+                let key = Tensor::from_vec(
+                    pseudo_random_values(KV_HEADS * CAPACITY * HEAD_DIM, 83),
+                    (1, KV_HEADS, CAPACITY, HEAD_DIM),
+                    &device,
+                )?
+                .narrow(2, 2, KEY_LEN)?;
+                let value = Tensor::from_vec(
+                    pseudo_random_values(KV_HEADS * CAPACITY * HEAD_DIM, 97),
+                    (1, KV_HEADS, CAPACITY, HEAD_DIM),
+                    &device,
+                )?
+                .narrow(2, 2, KEY_LEN)?;
+                assert!(!key.is_contiguous(), "the test needs a strided K/V view");
+                assert!(!value.is_contiguous(), "the test needs a strided V view");
+                // The narrowed views are the ones the cache hands over, so
+                // the layout predicate must accept them: a predicate that
+                // always rejects would let the test pass with a copied
+                // history.
+                assert!(
+                    matmul_ready_kv(&key, 1, KV_HEADS, KEY_LEN, HEAD_DIM),
+                    "the narrowed K/V view must be ready for the matmul"
+                );
+                assert!(
+                    matmul_ready_kv(&value, 1, KV_HEADS, KEY_LEN, HEAD_DIM),
+                    "the narrowed V/V view must be ready for the matmul"
+                );
+                let scale = 1.0 / (HEAD_DIM as f64).sqrt();
+                let grouped =
+                    dense_causal_attention(&query, &key, &value, groups, scale, None, None)?;
+                let expanded =
+                    expanded_causal_attention(&query, &key, &value, groups, scale, None, None)?;
+                let difference = max_difference(&grouped, &expanded)?;
+                assert!(
+                    difference <= 1e-5,
+                    "groups={groups} differed by {difference} on a strided K/V view on {device:?}"
+                );
+            }
         }
         Ok(())
     }
@@ -7706,10 +7961,10 @@ mod tests {
         Ok(())
     }
 
-    /// The compact K/V history must reach the matmul as it is, so the
-    /// grouped attention never copies the history it reads.
+    /// The compact K/V history must satisfy the layout predicate, so the
+    /// grouped attention can read it without a contiguous copy.
     #[test]
-    fn compact_kv_history_reaches_the_matmul_without_a_copy() -> Result<()> {
+    fn compact_kv_history_satisfies_the_layout_predicate() -> Result<()> {
         const KV_HEADS: usize = 4;
         const HEAD_DIM: usize = 8;
         const CAPACITY: usize = 16;
@@ -7732,6 +7987,201 @@ mod tests {
             LENGTH,
             HEAD_DIM
         ));
+        Ok(())
+    }
+
+    /// The layout predicate must not wrap: an overflowing block size or
+    /// head spacing is not ready, so the caller copies the history instead
+    /// of reading a wrapped size.
+    #[test]
+    fn matmul_ready_kv_rejects_overflowing_products() -> Result<()> {
+        let device = Device::Cpu;
+        // A contiguous history of two elements per head.
+        let tensor = Tensor::zeros((2, 1, 2, 2), DType::F32, &device)?;
+        // The block size of the history overflows the addressable range.
+        assert!(
+            !matmul_ready_kv(&tensor, 1, 1, 1_usize << 63, 2),
+            "an overflowing block size must not be ready"
+        );
+        // The head spacing of the history overflows the addressable range.
+        assert!(
+            !matmul_ready_kv(&tensor, 2, 1 + (1_usize << 62), 2, 2),
+            "an overflowing head spacing must not be ready"
+        );
+        Ok(())
+    }
+
+    /// The grouped attention must reject the shapes it cannot group.
+    ///
+    /// Every case names the guard it exercises: a history without a KV head,
+    /// a group count of zero, a query head count that does not match the
+    /// groups and a mask with three axes. The zero-group case uses a query
+    /// without a head and a history with KV heads, so the head count matches
+    /// the zero groups and only the zero-group guard can reject it.
+    #[test]
+    fn grouped_attention_rejects_ungroupable_shapes() -> Result<()> {
+        let device = Device::Cpu;
+        // A history without a KV head has nothing to group.
+        let query = Tensor::zeros((1, 0, 3, 4), DType::F32, &device)?;
+        let key = Tensor::zeros((1, 0, 3, 4), DType::F32, &device)?;
+        let value = Tensor::zeros((1, 0, 3, 4), DType::F32, &device)?;
+        let error = rejection_message(dense_causal_attention(
+            &query, &key, &value, 1, 1.0, None, None,
+        ));
+        assert!(
+            error.contains("at least one KV head"),
+            "unexpected error for a history without a KV head: {error}"
+        );
+        // A group count of zero leaves the query heads without a KV head.
+        // The query has no head, so the head count matches the zero groups
+        // and only the zero-group guard can reject this case.
+        let query = Tensor::zeros((1, 0, 3, 4), DType::F32, &device)?;
+        let key = Tensor::zeros((1, 2, 3, 4), DType::F32, &device)?;
+        let value = Tensor::zeros((1, 2, 3, 4), DType::F32, &device)?;
+        let error = rejection_message(dense_causal_attention(
+            &query, &key, &value, 0, 1.0, None, None,
+        ));
+        assert!(
+            error.contains("at least one query group"),
+            "unexpected error for a group count of zero: {error}"
+        );
+        // A query head count that does not match the groups cannot be
+        // grouped onto the KV heads.
+        let query = Tensor::zeros((1, 3, 3, 4), DType::F32, &device)?;
+        let key = Tensor::zeros((1, 2, 3, 4), DType::F32, &device)?;
+        let value = Tensor::zeros((1, 2, 3, 4), DType::F32, &device)?;
+        let error = rejection_message(dense_causal_attention(
+            &query, &key, &value, 1, 1.0, None, None,
+        ));
+        assert!(
+            error.contains("query heads per KV head"),
+            "unexpected error for a query head count that does not match: {error}"
+        );
+        // A mask with three axes has no head axis to broadcast over.
+        let query = Tensor::zeros((1, 2, 3, 4), DType::F32, &device)?;
+        let key = Tensor::zeros((1, 2, 3, 4), DType::F32, &device)?;
+        let value = Tensor::zeros((1, 2, 3, 4), DType::F32, &device)?;
+        let mask = Tensor::zeros((1, 3, 4), DType::F32, &device)?;
+        let error = rejection_message(dense_causal_attention(
+            &query,
+            &key,
+            &value,
+            1,
+            1.0,
+            None,
+            Some(&mask),
+        ));
+        assert!(
+            error.contains("axes"),
+            "unexpected error for a mask with three axes: {error}"
+        );
+        Ok(())
+    }
+
+    /// The grouped shapes are products of the tensor shapes, so an
+    /// overflowing product is an error instead of a wrapped value.
+    #[test]
+    fn grouped_shapes_reject_overflowing_products() {
+        assert!(
+            grouped_shapes(usize::MAX, 2, 1).is_err(),
+            "an overflowing head count must be rejected"
+        );
+        assert!(
+            grouped_shapes(1, usize::MAX, 2).is_err(),
+            "an overflowing query row count must be rejected"
+        );
+        assert!(
+            grouped_shapes(0, 1, 1).is_err(),
+            "a history without a KV head must be rejected"
+        );
+        assert_eq!(grouped_shapes(2, 3, 4).expect("the shapes fit"), (6, 12));
+    }
+
+    /// The mask of the grouped attention must broadcast over the group
+    /// axis, so only the documented shapes are accepted.
+    ///
+    /// The mask covers three query rows and four key columns here, so the
+    /// extents of every case match the scores it is added to.
+    #[test]
+    fn grouped_mask_accepts_only_the_documented_shapes() -> Result<()> {
+        let device = Device::Cpu;
+        // The accepted shapes gain the batch, head and group axes.
+        let mask = Tensor::zeros((3, 4), DType::F32, &device)?;
+        assert_eq!(grouped_mask(&mask, 2, 3, 4)?.dims(), &[1, 1, 1, 3, 4]);
+        let mask = Tensor::zeros((1, 1, 3, 4), DType::F32, &device)?;
+        assert_eq!(grouped_mask(&mask, 2, 3, 4)?.dims(), &[1, 1, 1, 3, 4]);
+        let mask = Tensor::zeros((2, 1, 3, 4), DType::F32, &device)?;
+        assert_eq!(grouped_mask(&mask, 2, 3, 4)?.dims(), &[2, 1, 1, 3, 4]);
+        // A mask with three axes has no head axis to check.
+        let mask = Tensor::zeros((1, 3, 4), DType::F32, &device)?;
+        assert!(
+            grouped_mask(&mask, 2, 3, 4).is_err(),
+            "a mask with three axes must be rejected"
+        );
+        // A head axis of more than one does not broadcast over the groups.
+        let mask = Tensor::zeros((1, 2, 3, 4), DType::F32, &device)?;
+        assert!(
+            grouped_mask(&mask, 2, 3, 4).is_err(),
+            "a head axis other than one must be rejected"
+        );
+        // A batch axis that is neither one nor the batch does not
+        // broadcast over the scores.
+        let mask = Tensor::zeros((3, 1, 3, 4), DType::F32, &device)?;
+        assert!(
+            grouped_mask(&mask, 2, 3, 4).is_err(),
+            "a batch axis that does not match must be rejected"
+        );
+        Ok(())
+    }
+
+    /// The mask of the grouped attention must cover the query rows and the
+    /// key columns of the scores.
+    ///
+    /// A mask with fewer query rows would be broadcast over every query
+    /// row, so a query of five rows with a mask of one row is rejected and
+    /// a mask of the right size is accepted.
+    #[test]
+    fn grouped_mask_rejects_masks_with_the_wrong_extent() -> Result<()> {
+        let device = Device::Cpu;
+        // A mask with one row does not cover the five query rows.
+        let mask = Tensor::zeros((1, 4), DType::F32, &device)?;
+        let error = rejection_message(grouped_mask(&mask, 1, 5, 4));
+        assert!(
+            error.contains("query axis"),
+            "unexpected error for a mask with one query row: {error}"
+        );
+        // A mask with the right extents is accepted.
+        let mask = Tensor::zeros((5, 4), DType::F32, &device)?;
+        assert_eq!(grouped_mask(&mask, 1, 5, 4)?.dims(), &[1, 1, 1, 5, 4]);
+        // A mask with the wrong number of key columns is rejected as well.
+        let mask = Tensor::zeros((5, 3), DType::F32, &device)?;
+        let error = rejection_message(grouped_mask(&mask, 1, 5, 4));
+        assert!(
+            error.contains("key axis"),
+            "unexpected error for a mask with three key columns: {error}"
+        );
+        // The attention path rejects the same mask.
+        let query = Tensor::zeros((1, 2, 5, 4), DType::F32, &device)?;
+        let key = Tensor::zeros((1, 2, 3, 4), DType::F32, &device)?;
+        let value = Tensor::zeros((1, 2, 3, 4), DType::F32, &device)?;
+        let mask = Tensor::zeros((1, 1, 1, 3), DType::F32, &device)?;
+        let error = rejection_message(dense_causal_attention(
+            &query,
+            &key,
+            &value,
+            1,
+            1.0,
+            None,
+            Some(&mask),
+        ));
+        assert!(
+            error.contains("query axis"),
+            "unexpected error for a mask with one query row: {error}"
+        );
+        // A mask that covers the query rows and the key columns is accepted.
+        let mask = Tensor::zeros((1, 1, 5, 3), DType::F32, &device)?;
+        dense_causal_attention(&query, &key, &value, 1, 1.0, None, Some(&mask))
+            .expect("a mask with the right extents must be accepted");
         Ok(())
     }
 
