@@ -1505,6 +1505,60 @@ mod tests {
         assert_eq!(config.kv_cache_slab_blocks, slab_blocks);
         assert_eq!(config.kv_cache_capacity_tokens, None);
 
+        // The comparison above reads the geometry of the device the parser
+        // picked, so it holds for every default device. These asserts pin
+        // the device itself and its shipped geometry: `DEFAULT_DEVICE`
+        // selects Metal first, then CUDA, then the CPU, and a default that
+        // fell back to another backend would change the numbers below.
+        #[cfg(all(feature = "cuda", not(feature = "metal")))]
+        {
+            assert_eq!(
+                runtime.device,
+                DeviceKind::Cuda,
+                "a CUDA build without Metal defaults to the CUDA device"
+            );
+            assert_eq!(
+                config.kv_cache_block_tokens, 256,
+                "a CUDA build without Metal defaults to 256-token KV blocks"
+            );
+            assert_eq!(
+                config.kv_cache_slab_blocks, 4,
+                "a CUDA build without Metal defaults to 4-block KV slabs"
+            );
+        }
+        #[cfg(feature = "metal")]
+        {
+            assert_eq!(
+                runtime.device,
+                DeviceKind::Metal,
+                "a Metal build defaults to the Metal device"
+            );
+            assert_eq!(
+                config.kv_cache_block_tokens, 16,
+                "a Metal build defaults to 16-token KV blocks"
+            );
+            assert_eq!(
+                config.kv_cache_slab_blocks, 8,
+                "a Metal build defaults to 8-block KV slabs"
+            );
+        }
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        {
+            assert_eq!(
+                runtime.device,
+                DeviceKind::Cpu,
+                "a build without Metal and without CUDA defaults to the CPU device"
+            );
+            assert_eq!(
+                config.kv_cache_block_tokens, 16,
+                "a CPU build defaults to 16-token KV blocks"
+            );
+            assert_eq!(
+                config.kv_cache_slab_blocks, 8,
+                "a CPU build defaults to 8-block KV slabs"
+            );
+        }
+
         // An explicit CPU run keeps the small blocks of the paged kernel.
         let cpu = serve_runtime(
             Cli::try_parse_from(["macllm", "serve", "--model", "model-dir", "--device", "cpu"])

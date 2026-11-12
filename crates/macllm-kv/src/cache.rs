@@ -2039,14 +2039,17 @@ impl PagedKvAppend<'_> {
 
     /// Materialize one layer's provisional history in block-table order.
     ///
-    /// The returned K/V tensors may be strided views into the pool's slabs: a
-    /// history that fits in one block is handed over as the narrowed views of
-    /// that block, without a copy. A longer history is joined by
-    /// `Tensor::cat`, and that join may be strided as well: a partly filled
-    /// last block in a pool with more than one layer has no outer stride for
-    /// the token axis, so candle concatenates it through its transpose path.
-    /// Callers that need a contiguous K/V history make it contiguous
-    /// themselves.
+    /// A history that fits in one block is handed over as the narrowed views
+    /// of that block, without a copy; those views are views into the pool's
+    /// slabs. A longer history is a new tensor joined by `Tensor::cat`, and
+    /// that join may be strided: a partly filled last block in a pool with
+    /// more than one layer has no outer stride for the token axis, so candle
+    /// concatenates it through its transpose path. Callers that need a
+    /// contiguous K/V history make it contiguous themselves.
+    ///
+    /// A one-block view aliases the slab, so a later write to the same block
+    /// changes what the view reads; callers use it within the step that
+    /// materialized it.
     pub fn materialize_layer(&self, layer: usize) -> PagedKvResult<(Tensor, Tensor)> {
         if layer >= self.written_layers.len() || !self.written_layers[layer] {
             return Err(PagedKvPoolError::InvalidTransaction(format!(
@@ -2111,9 +2114,10 @@ impl PagedKvAppend<'_> {
         }
         let key_refs = keys.iter().collect::<Vec<_>>();
         let value_refs = values.iter().collect::<Vec<_>>();
-        // `Tensor::cat` joins the blocks. The joined history is strided
-        // whenever a block view has no outer stride for the token axis, so
-        // callers that need a contiguous K/V history copy it themselves.
+        // `Tensor::cat` joins the blocks. The joined history is strided for
+        // that pool with candle 0.11 whenever a block view has no outer
+        // stride for the token axis, so callers that need a contiguous K/V
+        // history copy it themselves.
         Ok((Tensor::cat(&key_refs, 2)?, Tensor::cat(&value_refs, 2)?))
     }
 
@@ -2847,14 +2851,17 @@ impl PagedKvBatchReservation {
 
     /// Materialize one lane/layer's provisional history in page order.
     ///
-    /// The returned K/V tensors may be strided views into the pool's slabs: a
-    /// history that fits in one block is handed over as the narrowed views of
-    /// that block, without a copy. A longer history is joined by
-    /// `Tensor::cat`, and that join may be strided as well: a partly filled
-    /// last block in a pool with more than one layer has no outer stride for
-    /// the token axis, so candle concatenates it through its transpose path.
-    /// Callers that need a contiguous K/V history make it contiguous
-    /// themselves.
+    /// A history that fits in one block is handed over as the narrowed views
+    /// of that block, without a copy; those views are views into the pool's
+    /// slabs. A longer history is a new tensor joined by `Tensor::cat`, and
+    /// that join may be strided: a partly filled last block in a pool with
+    /// more than one layer has no outer stride for the token axis, so candle
+    /// concatenates it through its transpose path. Callers that need a
+    /// contiguous K/V history make it contiguous themselves.
+    ///
+    /// A one-block view aliases the slab, so a later write to the same block
+    /// changes what the view reads; callers use it within the step that
+    /// materialized it.
     pub fn materialize_layer(&self, lane: usize, layer: usize) -> PagedKvResult<(Tensor, Tensor)> {
         #[cfg(any(test, feature = "test-exports"))]
         PAGED_BATCH_MATERIALIZATIONS.set(PAGED_BATCH_MATERIALIZATIONS.get().saturating_add(1));
@@ -2926,9 +2933,10 @@ impl PagedKvBatchReservation {
         }
         let key_refs = keys.iter().collect::<Vec<_>>();
         let value_refs = values.iter().collect::<Vec<_>>();
-        // `Tensor::cat` joins the blocks. The joined history is strided
-        // whenever a block view has no outer stride for the token axis, so
-        // callers that need a contiguous K/V history copy it themselves.
+        // `Tensor::cat` joins the blocks. The joined history is strided for
+        // that pool with candle 0.11 whenever a block view has no outer
+        // stride for the token axis, so callers that need a contiguous K/V
+        // history copy it themselves.
         Ok((Tensor::cat(&key_refs, 2)?, Tensor::cat(&value_refs, 2)?))
     }
 
@@ -3664,12 +3672,122 @@ mod tests {
         )
     }
 
-    fn sliding_values(cache: &SlidingKvCache) -> Result<Vec<f32>> {
+    /// Flattens the key history of a sliding cache and reports its shape.
+    ///
+    /// The history is the concatenation of the cache's segments along the
+    /// token axis, so its shape is the shape of one segment with the token
+    /// count of every segment.
+    fn sliding_key_history(cache: &SlidingKvCache) -> Result<(Vec<f32>, Vec<usize>)> {
+        let segments = cache.history_segments()?;
         let mut values = Vec::new();
-        for segment in cache.history_segments()? {
+        let mut tokens = 0_usize;
+        for segment in &segments {
             values.extend(segment.key.flatten_all()?.to_vec1::<f32>()?);
+            tokens += segment.key.dim(2)?;
         }
-        Ok(values)
+        let mut dims = segments
+            .first()
+            .map_or_else(Vec::new, |segment| segment.key.dims().to_vec());
+        if let Some(token_axis) = dims.get_mut(2) {
+            *token_axis = tokens;
+        }
+        Ok((values, dims))
+    }
+
+    /// Compares two flat buffers read from tensors without printing them.
+    ///
+    /// The buffers are flat slices, and the shapes of the read and of the
+    /// expected data are compared first, so a read of another shape with the
+    /// same values fails. The report of a failure names the buffer, both
+    /// shapes, both lengths, the number of differing elements and the first
+    /// differing index with its two values. A failing assert never dumps a
+    /// whole buffer.
+    fn assert_values<T>(
+        name: &str,
+        actual_shape: &[usize],
+        expected_shape: &[usize],
+        actual: &[T],
+        expected: &[T],
+    ) where
+        T: PartialEq + std::fmt::Display + Copy,
+    {
+        assert!(
+            actual_shape == expected_shape,
+            "{name}: shape mismatch (actual shape {actual_shape:?}, expected shape {expected_shape:?})"
+        );
+        let mut differing = 0_usize;
+        let mut first = None;
+        for index in 0..actual.len().max(expected.len()) {
+            let actual_value = actual.get(index).copied();
+            let expected_value = expected.get(index).copied();
+            if actual_value != expected_value {
+                differing += 1;
+                if first.is_none() {
+                    first = Some((index, actual_value, expected_value));
+                }
+            }
+        }
+        let Some((index, actual_value, expected_value)) = first else {
+            return;
+        };
+        panic!(
+            "{name} (actual shape {actual_shape:?}, expected shape {expected_shape:?}): \
+             {differing} of {} elements differ (actual length {}, expected length {}); \
+             first difference at index {index}: actual {}, expected {}",
+            actual.len().max(expected.len()),
+            actual.len(),
+            expected.len(),
+            actual_value.map_or_else(|| "missing".to_string(), |value| value.to_string()),
+            expected_value.map_or_else(|| "missing".to_string(), |value| value.to_string()),
+        );
+    }
+
+    /// Flattens a nested page table in row-major order.
+    fn flatten_page_table(rows: &[Vec<u32>]) -> Vec<u32> {
+        rows.iter().flat_map(|row| row.iter().copied()).collect()
+    }
+
+    #[test]
+    fn assert_values_accepts_equal_buffers() {
+        assert_values(
+            "the helper buffer",
+            &[2],
+            &[2],
+            &[1.0_f32, 2.0],
+            &[1.0, 2.0],
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "the helper buffer (actual shape [2], expected shape [2]): 1 of 2 elements differ"
+    )]
+    fn assert_values_reports_the_first_difference_without_the_buffers() {
+        assert_values(
+            "the helper buffer",
+            &[2],
+            &[2],
+            &[1.0_f32, 2.0],
+            &[1.0, 3.0],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "the helper buffer: shape mismatch")]
+    fn assert_values_rejects_equal_values_with_another_shape() {
+        assert_values(
+            "the helper buffer",
+            &[1, 2],
+            &[2, 1],
+            &[1.0_f32, 2.0],
+            &[1.0, 2.0],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "actual length 2, expected length 1")]
+    fn assert_values_reports_different_lengths() {
+        assert_values("the helper buffer", &[2], &[2], &[1.0_f32, 2.0], &[1.0]);
     }
 
     fn paged_pool(
@@ -3947,13 +4065,19 @@ mod tests {
                 let value = paged_values(50_000 + layer * 10_000, 0, 3, HEADS, DIM)?;
                 append.write_layer(layer, &key, &value)?;
                 let (actual_key, actual_value) = append.materialize_layer(layer)?;
-                assert_eq!(
-                    actual_key.flatten_all()?.to_vec1::<f32>()?,
-                    paged_expected(layer * 10_000, 3, HEADS, DIM)
+                assert_values(
+                    &format!("the materialized key history of layer {layer}"),
+                    actual_key.dims(),
+                    &[1, HEADS, 3, DIM],
+                    &actual_key.flatten_all()?.to_vec1::<f32>()?,
+                    &paged_expected(layer * 10_000, 3, HEADS, DIM),
                 );
-                assert_eq!(
-                    actual_value.flatten_all()?.to_vec1::<f32>()?,
-                    paged_expected(50_000 + layer * 10_000, 3, HEADS, DIM)
+                assert_values(
+                    &format!("the materialized value history of layer {layer}"),
+                    actual_value.dims(),
+                    &[1, HEADS, 3, DIM],
+                    &actual_value.flatten_all()?.to_vec1::<f32>()?,
+                    &paged_expected(50_000 + layer * 10_000, 3, HEADS, DIM),
                 );
             }
             append.commit()?
@@ -3969,13 +4093,19 @@ mod tests {
                 let value = paged_values(50_000 + layer * 10_000, 3, 2, HEADS, DIM)?;
                 append.write_layer(layer, &key, &value)?;
                 let (actual_key, actual_value) = append.materialize_layer(layer)?;
-                assert_eq!(
-                    actual_key.flatten_all()?.to_vec1::<f32>()?,
-                    paged_expected(layer * 10_000, 5, HEADS, DIM)
+                assert_values(
+                    &format!("the materialized key history of layer {layer}"),
+                    actual_key.dims(),
+                    &[1, HEADS, 5, DIM],
+                    &actual_key.flatten_all()?.to_vec1::<f32>()?,
+                    &paged_expected(layer * 10_000, 5, HEADS, DIM),
                 );
-                assert_eq!(
-                    actual_value.flatten_all()?.to_vec1::<f32>()?,
-                    paged_expected(50_000 + layer * 10_000, 5, HEADS, DIM)
+                assert_values(
+                    &format!("the materialized value history of layer {layer}"),
+                    actual_value.dims(),
+                    &[1, HEADS, 5, DIM],
+                    &actual_value.flatten_all()?.to_vec1::<f32>()?,
+                    &paged_expected(50_000 + layer * 10_000, 5, HEADS, DIM),
                 );
             }
             append.commit()?
@@ -3999,8 +4129,10 @@ mod tests {
     }
 
     /// A history that fits in one block is handed over as the narrowed views
-    /// of that block, so the materialization copies nothing.
+    /// of that block, so the materialization copies nothing; the two-block
+    /// half of the same table keeps the values it had before.
     #[test]
+    #[allow(clippy::too_many_lines)] // The one-block and two-block halves of one table stay in one test.
     fn paged_one_block_history_materializes_as_a_slab_view() -> PagedKvResult<()> {
         const LAYERS: usize = 2;
         const HEADS: usize = 2;
@@ -4028,18 +4160,44 @@ mod tests {
         // The token axis keeps the per-head stride of the slab.
         assert_eq!(key.stride()[2], DIM);
         assert_eq!(key.stride()[1], BLOCK_TOKENS * DIM);
-        // The view shares the slab allocation.
-        let slab_key = pool
-            .inner
-            .try_borrow()
-            .map_err(|_| PagedKvPoolError::PoolBusy)?
-            .slabs[0]
-            .key
-            .clone();
+        // The view shares the slab allocation. Both addresses must be
+        // known first: a pool whose storage is not CPU F32 has no
+        // address, and `None == None` would let the comparison pass
+        // without proving that the view aliases the slab.
+        let (slab_key, slab_value) = {
+            let pool = pool
+                .inner
+                .try_borrow()
+                .map_err(|_| PagedKvPoolError::PoolBusy)?;
+            (pool.slabs[0].key.clone(), pool.slabs[0].value.clone())
+        };
+        let key_address = cpu_storage_address(&key);
+        let slab_key_address = cpu_storage_address(&slab_key);
+        assert!(
+            key_address.is_some(),
+            "the one-block key view has no CPU storage address"
+        );
+        assert!(
+            slab_key_address.is_some(),
+            "the slab key has no CPU storage address"
+        );
         assert_eq!(
-            cpu_storage_address(&key),
-            cpu_storage_address(&slab_key),
-            "the one-block history does not share the slab storage"
+            key_address, slab_key_address,
+            "the one-block key history does not share the slab storage"
+        );
+        let value_address = cpu_storage_address(&value);
+        let slab_value_address = cpu_storage_address(&slab_value);
+        assert!(
+            value_address.is_some(),
+            "the one-block value view has no CPU storage address"
+        );
+        assert!(
+            slab_value_address.is_some(),
+            "the slab value has no CPU storage address"
+        );
+        assert_eq!(
+            value_address, slab_value_address,
+            "the one-block value history does not share the slab storage"
         );
         // The values are the ones that were written.
         let expected_key = Tensor::from_vec(
@@ -4098,16 +4256,34 @@ mod tests {
             "the two-block value history differs by {difference} (shape {:?})",
             value.dims()
         );
+        // These asserts pin that the joined history is strided for this
+        // two-layer pool with candle 0.11: a layer view of a multi-layer
+        // pool has no outer stride for the token axis, so candle concatenates
+        // the blocks through its transpose path. A candle release that
+        // returns a contiguous join fails only these asserts, and the doc
+        // comments of `materialize_layer` then need updating.
+        assert!(
+            !key.is_contiguous(),
+            "the joined key history is contiguous (shape {:?})",
+            key.dims()
+        );
+        assert!(
+            !value.is_contiguous(),
+            "the joined value history is contiguous (shape {:?})",
+            value.dims()
+        );
         append.commit()?;
         Ok(())
     }
 
     /// A history that spans several blocks is joined by `Tensor::cat`, and
-    /// the joined history is strided: the partly filled last block of a pool
-    /// with more than one layer has no outer stride for the token axis, so
-    /// candle concatenates the blocks through its transpose path. The test
-    /// pins that layout, so the comment on `materialize_layer` cannot drift
-    /// away from what candle returns.
+    /// the joined history is strided for this pool with candle 0.11: the
+    /// partly filled last block of a pool with more than one layer has no
+    /// outer stride for the token axis, so candle concatenates the blocks
+    /// through its transpose path. The contiguity asserts pin candle's
+    /// current behavior: a candle release that returns a contiguous join
+    /// fails only these asserts, and the doc comments of `materialize_layer`
+    /// then need updating.
     #[test]
     fn paged_multi_block_history_materializes_as_a_strided_join() -> PagedKvResult<()> {
         const LAYERS: usize = 2;
@@ -4127,19 +4303,9 @@ mod tests {
         let (key, value) = append.materialize_layer(0)?;
         assert_eq!(key.dim(2)?, 6);
         assert_eq!(value.dim(2)?, 6);
-        // The join is strided, exactly as the doc comment of
-        // `materialize_layer` says it is.
-        assert!(
-            !key.is_contiguous(),
-            "the joined key history is contiguous (shape {:?})",
-            key.dims()
-        );
-        assert!(
-            !value.is_contiguous(),
-            "the joined value history is contiguous (shape {:?})",
-            value.dims()
-        );
-        // The joined history holds the values that were written.
+        // The joined history holds the values that were written. The values
+        // are checked before the layout, so a wrong history is reported as
+        // a wrong value and not as a wrong layout.
         let expected_key = Tensor::from_vec(
             paged_expected(0, 6, HEADS, DIM),
             (1, HEADS, 6, DIM),
@@ -4160,6 +4326,21 @@ mod tests {
         assert!(
             difference == 0.0,
             "the joined value history differs by {difference} (shape {:?})",
+            value.dims()
+        );
+        // The join is strided for this pool with candle 0.11, exactly as the
+        // doc comment of `materialize_layer` says it may be. These asserts
+        // pin candle's current behavior: a candle release that returns a
+        // contiguous join fails only these asserts, and the doc comments of
+        // `materialize_layer` then need updating.
+        assert!(
+            !key.is_contiguous(),
+            "the joined key history is contiguous (shape {:?})",
+            key.dims()
+        );
+        assert!(
+            !value.is_contiguous(),
+            "the joined value history is contiguous (shape {:?})",
             value.dims()
         );
         append.commit()?;
@@ -4185,20 +4366,51 @@ mod tests {
         // The history is a window into the slab, not a fresh copy.
         assert!(!materialized_key.is_contiguous());
         assert!(!materialized_value.is_contiguous());
+        // The token axis keeps the per-head stride of the slab.
         assert_eq!(materialized_key.stride()[2], DIM);
         assert_eq!(materialized_key.stride()[1], BLOCK_TOKENS * DIM);
-        let slab_key = pool
-            .inner
-            .try_borrow()
-            .map_err(|_| PagedKvPoolError::PoolBusy)?
-            .slabs[0]
-            .key
-            .clone();
-        assert_eq!(
-            cpu_storage_address(&materialized_key),
-            cpu_storage_address(&slab_key),
-            "the one-block history does not share the slab storage"
+        assert_eq!(materialized_value.stride()[2], DIM);
+        assert_eq!(materialized_value.stride()[1], BLOCK_TOKENS * DIM);
+        // The views share the slab allocation. Both addresses must be
+        // known first: a pool whose storage is not CPU F32 has no
+        // address, and `None == None` would let the comparison pass
+        // without proving that the view aliases the slab.
+        let (slab_key, slab_value) = {
+            let pool = pool
+                .inner
+                .try_borrow()
+                .map_err(|_| PagedKvPoolError::PoolBusy)?;
+            (pool.slabs[0].key.clone(), pool.slabs[0].value.clone())
+        };
+        let key_address = cpu_storage_address(&materialized_key);
+        let slab_key_address = cpu_storage_address(&slab_key);
+        assert!(
+            key_address.is_some(),
+            "the one-block key view has no CPU storage address"
         );
+        assert!(
+            slab_key_address.is_some(),
+            "the slab key has no CPU storage address"
+        );
+        assert_eq!(
+            key_address, slab_key_address,
+            "the one-block key history does not share the slab storage"
+        );
+        let value_address = cpu_storage_address(&materialized_value);
+        let slab_value_address = cpu_storage_address(&slab_value);
+        assert!(
+            value_address.is_some(),
+            "the one-block value view has no CPU storage address"
+        );
+        assert!(
+            slab_value_address.is_some(),
+            "the slab value has no CPU storage address"
+        );
+        assert_eq!(
+            value_address, slab_value_address,
+            "the one-block value history does not share the slab storage"
+        );
+        // The values are the ones that were written.
         let expected_key = Tensor::from_vec(
             paged_range(10_000, 0..3, HEADS, DIM),
             (1, HEADS, 3, DIM),
@@ -4209,6 +4421,17 @@ mod tests {
             difference == 0.0,
             "the one-block key history differs by {difference} (shape {:?})",
             materialized_key.dims()
+        );
+        let expected_value = Tensor::from_vec(
+            paged_range(20_000, 0..3, HEADS, DIM),
+            (1, HEADS, 3, DIM),
+            &Device::Cpu,
+        )?;
+        let difference = paged_max_difference(&materialized_value, &expected_value)?;
+        assert!(
+            difference == 0.0,
+            "the one-block value history differs by {difference} (shape {:?})",
+            materialized_value.dims()
         );
         reservation.commit(&mut [&mut table])?;
         Ok(())
@@ -4376,13 +4599,19 @@ mod tests {
             let mut append = fork.begin_append(1)?;
             append.write_layer(0, &suffix, &suffix)?;
             let (key, value) = append.materialize_layer(0)?;
-            assert_eq!(
-                key.flatten_all()?.to_vec1::<f32>()?,
-                paged_expected(100, 5, 1, 1)
+            assert_values(
+                "the forked key history",
+                key.dims(),
+                &[1, 1, 5, 1],
+                &key.flatten_all()?.to_vec1::<f32>()?,
+                &paged_expected(100, 5, 1, 1),
             );
-            assert_eq!(
-                value.flatten_all()?.to_vec1::<f32>()?,
-                paged_expected(100, 5, 1, 1)
+            assert_values(
+                "the forked value history",
+                value.dims(),
+                &[1, 1, 5, 1],
+                &value.flatten_all()?.to_vec1::<f32>()?,
+                &paged_expected(100, 5, 1, 1),
             );
             append.commit()?
         };
@@ -4418,13 +4647,19 @@ mod tests {
             assert_ne!(append.block_id(0)?, source_id);
             append.write_layer(0, &suffix, &suffix)?;
             let (key, value) = append.materialize_layer(0)?;
-            assert_eq!(
-                key.flatten_all()?.to_vec1::<f32>()?,
-                vec![100.0, 110.0, 920.0]
+            assert_values(
+                "the copied key history",
+                key.dims(),
+                &[1, 1, 3, 1],
+                &key.flatten_all()?.to_vec1::<f32>()?,
+                &[100.0, 110.0, 920.0],
             );
-            assert_eq!(
-                value.flatten_all()?.to_vec1::<f32>()?,
-                vec![100.0, 110.0, 920.0]
+            assert_values(
+                "the copied value history",
+                value.dims(),
+                &[1, 1, 3, 1],
+                &value.flatten_all()?.to_vec1::<f32>()?,
+                &[100.0, 110.0, 920.0],
             );
             append.commit()?
         };
@@ -4432,13 +4667,19 @@ mod tests {
         assert_eq!(source.block_ids(), &[source_id]);
         assert_ne!(fork.block_ids()[0], source_id);
         let (source_key, source_value) = pool.inner.borrow().layer_views(source_id, 0, None)?;
-        assert_eq!(
-            source_key.flatten_all()?.to_vec1::<f32>()?,
-            paged_expected(100, 4, 1, 1)
+        assert_values(
+            "the source key history",
+            source_key.dims(),
+            &[1, 1, 4, 1],
+            &source_key.flatten_all()?.to_vec1::<f32>()?,
+            &paged_expected(100, 4, 1, 1),
         );
-        assert_eq!(
-            source_value.flatten_all()?.to_vec1::<f32>()?,
-            paged_expected(100, 4, 1, 1)
+        assert_values(
+            "the source value history",
+            source_value.dims(),
+            &[1, 1, 4, 1],
+            &source_value.flatten_all()?.to_vec1::<f32>()?,
+            &paged_expected(100, 4, 1, 1),
         );
         let stats = pool.stats()?;
         assert_eq!(stats.live_blocks, 2);
@@ -4474,13 +4715,19 @@ mod tests {
         batch.write_layer(1, 0, &second_suffix, &second_suffix)?;
         let (first_key, _) = batch.materialize_layer(0, 0)?;
         let (second_key, _) = batch.materialize_layer(1, 0)?;
-        assert_eq!(
-            first_key.flatten_all()?.to_vec1::<f32>()?,
-            vec![100.0, 110.0, 120.0]
+        assert_values(
+            "the first lane key history",
+            first_key.dims(),
+            &[1, 1, 3, 1],
+            &first_key.flatten_all()?.to_vec1::<f32>()?,
+            &[100.0, 110.0, 120.0],
         );
-        assert_eq!(
-            second_key.flatten_all()?.to_vec1::<f32>()?,
-            vec![100.0, 110.0, 920.0]
+        assert_values(
+            "the second lane key history",
+            second_key.dims(),
+            &[1, 1, 3, 1],
+            &second_key.flatten_all()?.to_vec1::<f32>()?,
+            &[100.0, 110.0, 920.0],
         );
         let epoch = batch.commit(&mut [&mut first, &mut second])?;
 
@@ -4525,9 +4772,12 @@ mod tests {
         assert_eq!(source.logical_len(), 4);
         assert_eq!(fork.logical_len(), 2);
         let (source_key, _) = pool.inner.borrow().layer_views(source_id, 0, None)?;
-        assert_eq!(
-            source_key.flatten_all()?.to_vec1::<f32>()?,
-            paged_expected(100, 4, 1, 1)
+        assert_values(
+            "the source key history",
+            source_key.dims(),
+            &[1, 1, 4, 1],
+            &source_key.flatten_all()?.to_vec1::<f32>()?,
+            &paged_expected(100, 4, 1, 1),
         );
         let stats = pool.stats()?;
         assert_eq!(stats.live_blocks, 1);
@@ -4599,13 +4849,19 @@ mod tests {
                 let value = paged_values(50_000 + base, 0, len, 1, 1)?;
                 batch.write_layer(lane, layer, &key, &value)?;
                 let (actual_key, actual_value) = batch.materialize_layer(lane, layer)?;
-                assert_eq!(
-                    actual_key.flatten_all()?.to_vec1::<f32>()?,
-                    paged_expected(base, len, 1, 1)
+                assert_values(
+                    &format!("the key history of lane {lane}"),
+                    actual_key.dims(),
+                    &[1, 1, len, 1],
+                    &actual_key.flatten_all()?.to_vec1::<f32>()?,
+                    &paged_expected(base, len, 1, 1),
                 );
-                assert_eq!(
-                    actual_value.flatten_all()?.to_vec1::<f32>()?,
-                    paged_expected(50_000 + base, len, 1, 1)
+                assert_values(
+                    &format!("the value history of lane {lane}"),
+                    actual_value.dims(),
+                    &[1, 1, len, 1],
+                    &actual_value.flatten_all()?.to_vec1::<f32>()?,
+                    &paged_expected(50_000 + base, len, 1, 1),
                 );
             }
         }
@@ -4663,9 +4919,19 @@ mod tests {
                 assert_eq!(read.dtype(), DType::F32);
                 assert_eq!(read.layer(), layer);
                 assert_eq!(read.slabs().len(), 2);
+                let expected_page_table = vec![vec![0_u32, 0], vec![0, 1], vec![1, 0]];
+                let page_table = read.page_table().to_vec2::<u32>()?;
                 assert_eq!(
-                    read.page_table().to_vec2::<u32>()?,
-                    vec![vec![0, 0], vec![0, 1], vec![1, 0]]
+                    page_table.len(),
+                    expected_page_table.len(),
+                    "the page table has one row per page"
+                );
+                assert_values(
+                    "the page table",
+                    read.page_table().dims(),
+                    &[3, 2],
+                    &flatten_page_table(&page_table),
+                    &flatten_page_table(&expected_page_table),
                 );
             }
 
@@ -4681,9 +4947,19 @@ mod tests {
             assert_eq!(read.head_dim(), 2);
             assert_eq!(read.dtype(), DType::F32);
             assert_eq!(read.slabs().len(), 2);
+            let expected_page_table = vec![vec![0_u32, 0], vec![0, 1], vec![1, 0]];
+            let page_table = read.page_table().to_vec2::<u32>()?;
             assert_eq!(
-                read.page_table().to_vec2::<u32>()?,
-                vec![vec![0, 0], vec![0, 1], vec![1, 0]]
+                page_table.len(),
+                expected_page_table.len(),
+                "the page table has one row per page"
+            );
+            assert_values(
+                "the page table",
+                read.page_table().dims(),
+                &[3, 2],
+                &flatten_page_table(&page_table),
+                &flatten_page_table(&expected_page_table),
             );
             let current_page_table_id = read.page_table().id();
             if let Some(first_page_table_id) = compact_page_table_id {
@@ -4749,9 +5025,12 @@ mod tests {
         let value = paged_values(10, 1, 1, 1, 1)?;
         second.write_layer(0, 0, &value, &value)?;
         let (key, _) = second.materialize_layer(0, 0)?;
-        assert_eq!(
-            key.flatten_all()?.to_vec1::<f32>()?,
-            paged_expected(10, 2, 1, 1)
+        assert_values(
+            "the key history of the reused page",
+            key.dims(),
+            &[1, 1, 2, 1],
+            &key.flatten_all()?.to_vec1::<f32>()?,
+            &paged_expected(10, 2, 1, 1),
         );
         let second_epoch = second.commit(&mut [&mut table])?;
         pool.mark_completed_through(second_epoch)?;
@@ -4976,13 +5255,19 @@ mod tests {
                 let values = paged_values(layer * 100, 2, 1, 1, 1)?;
                 append.write_layer(layer, &values, &values)?;
                 let (key, value) = append.materialize_layer(layer)?;
-                assert_eq!(
-                    key.flatten_all()?.to_vec1::<f32>()?,
-                    paged_expected(layer * 100, 3, 1, 1)
+                assert_values(
+                    &format!("the retried key history of layer {layer}"),
+                    key.dims(),
+                    &[1, 1, 3, 1],
+                    &key.flatten_all()?.to_vec1::<f32>()?,
+                    &paged_expected(layer * 100, 3, 1, 1),
                 );
-                assert_eq!(
-                    value.flatten_all()?.to_vec1::<f32>()?,
-                    paged_expected(layer * 100, 3, 1, 1)
+                assert_values(
+                    &format!("the retried value history of layer {layer}"),
+                    value.dims(),
+                    &[1, 1, 3, 1],
+                    &value.flatten_all()?.to_vec1::<f32>()?,
+                    &paged_expected(layer * 100, 3, 1, 1),
                 );
             }
             append.commit()?
@@ -5143,7 +5428,13 @@ mod tests {
             new_id = append.block_id(0)?;
             append.write_layer(0, &values, &values)?;
             let (key, _) = append.materialize_layer(0)?;
-            assert_eq!(key.flatten_all()?.to_vec1::<f32>()?, vec![900.0]);
+            assert_values(
+                "the key history of the reused block",
+                key.dims(),
+                &[1, 1, 1, 1],
+                &key.flatten_all()?.to_vec1::<f32>()?,
+                &[900.0],
+            );
             next_epoch = append.commit()?;
         }
         assert_eq!(new_id.slot(), old_id.slot());
@@ -5174,8 +5465,20 @@ mod tests {
             append.write_layer(0, &fresh, &fresh)?;
             let (key, value) = append.materialize_layer(0)?;
             assert_eq!(key.dims4()?, (1, 1, 1, 1));
-            assert_eq!(key.flatten_all()?.to_vec1::<f32>()?, vec![7.0]);
-            assert_eq!(value.flatten_all()?.to_vec1::<f32>()?, vec![7.0]);
+            assert_values(
+                "the key history of the reused block",
+                key.dims(),
+                &[1, 1, 1, 1],
+                &key.flatten_all()?.to_vec1::<f32>()?,
+                &[7.0],
+            );
+            assert_values(
+                "the value history of the reused block",
+                value.dims(),
+                &[1, 1, 1, 1],
+                &value.flatten_all()?.to_vec1::<f32>()?,
+                &[7.0],
+            );
             append.commit()?
         };
         pool.mark_completed_through(completion)?;
@@ -5238,7 +5541,13 @@ mod tests {
         assert_eq!(cache.allocated_capacity(), 16);
         let (key, _) = cache.append(&next, &next)?;
         assert_eq!(key.dims4()?, (1, 2, 1, 4));
-        assert_eq!(key.flatten_all()?.to_vec1::<f32>()?, vec![1.0; 8]);
+        assert_values(
+            "the key history of the dense cache",
+            key.dims(),
+            &[1, 2, 1, 4],
+            &key.flatten_all()?.to_vec1::<f32>()?,
+            &[1.0; 8],
+        );
         Ok(())
     }
 
@@ -5257,8 +5566,20 @@ mod tests {
         let expected = std::iter::repeat_n(0.0, 2)
             .chain(std::iter::repeat_n(1.0, 32))
             .collect::<Vec<_>>();
-        assert_eq!(key.flatten_all()?.to_vec1::<f32>()?, expected);
-        assert_eq!(value.flatten_all()?.to_vec1::<f32>()?, expected);
+        assert_values(
+            "the key history of the grown cache",
+            key.dims(),
+            &[1, 1, 17, 2],
+            &key.flatten_all()?.to_vec1::<f32>()?,
+            &expected,
+        );
+        assert_values(
+            "the value history of the grown cache",
+            value.dims(),
+            &[1, 1, 17, 2],
+            &value.flatten_all()?.to_vec1::<f32>()?,
+            &expected,
+        );
         Ok(())
     }
 
@@ -5281,7 +5602,14 @@ mod tests {
         let mut cache = SlidingKvCache::new(4, 32)?;
         let first = token_values(0, 3, &device)?;
         cache.append(&first, &first)?;
-        assert_eq!(sliding_values(&cache)?, vec![0.0, 1.0, 2.0]);
+        let (values, dims) = sliding_key_history(&cache)?;
+        assert_values(
+            "the sliding key history",
+            &dims,
+            &[1, 1, 3, 1],
+            &values,
+            &[0.0, 1.0, 2.0],
+        );
         assert_eq!(
             cache.stats(),
             KvCacheStats {
@@ -5304,7 +5632,14 @@ mod tests {
         assert_eq!(cache.stats().resident_start, 4);
         assert_eq!(cache.stats().resident_len, 3);
         assert_eq!(cache.stats().allocated_capacity, 6);
-        assert_eq!(sliding_values(&cache)?, vec![4.0, 5.0, 6.0]);
+        let (values, dims) = sliding_key_history(&cache)?;
+        assert_values(
+            "the sliding key history",
+            &dims,
+            &[1, 1, 3, 1],
+            &values,
+            &[4.0, 5.0, 6.0],
+        );
         let segments = cache.history_segments()?;
         assert_eq!(
             segments.len(),
@@ -5330,8 +5665,22 @@ mod tests {
         }
         assert_eq!(one_shot.logical_len(), 11);
         assert_eq!(chunked.logical_len(), 11);
-        assert_eq!(sliding_values(&one_shot)?, vec![8.0, 9.0, 10.0]);
-        assert_eq!(sliding_values(&chunked)?, sliding_values(&one_shot)?);
+        let (one_shot_values, one_shot_dims) = sliding_key_history(&one_shot)?;
+        let (chunked_values, chunked_dims) = sliding_key_history(&chunked)?;
+        assert_values(
+            "the one-shot sliding key history",
+            &one_shot_dims,
+            &[1, 1, 3, 1],
+            &one_shot_values,
+            &[8.0, 9.0, 10.0],
+        );
+        assert_values(
+            "the chunked sliding key history",
+            &chunked_dims,
+            &one_shot_dims,
+            &chunked_values,
+            &one_shot_values,
+        );
         assert_eq!(chunked.stats().allocated_capacity, 6);
         Ok(())
     }
@@ -5347,7 +5696,14 @@ mod tests {
         sliding.append(&first, &first)?;
         let second = token_values(3, 2, &device)?;
         sliding.append(&second, &second)?;
-        assert_eq!(sliding_values(sliding)?, vec![2.0, 3.0, 4.0]);
+        let (values, dims) = sliding_key_history(sliding)?;
+        assert_values(
+            "the sliding key history",
+            &dims,
+            &[1, 1, 3, 1],
+            &values,
+            &[2.0, 3.0, 4.0],
+        );
 
         let checkpoint = sliding.checkpoint();
         // Cursor is at physical slot 5. Q=H writes slots 5,0,1 and therefore
@@ -5357,20 +5713,41 @@ mod tests {
             unreachable!()
         };
         sliding.append(&failed_step, &failed_step)?;
-        assert_eq!(sliding_values(sliding)?, vec![5.0, 6.0, 7.0]);
+        let (values, dims) = sliding_key_history(sliding)?;
+        assert_values(
+            "the sliding key history",
+            &dims,
+            &[1, 1, 3, 1],
+            &values,
+            &[5.0, 6.0, 7.0],
+        );
         let LayerKvCache::Sliding(sliding) = &mut cache else {
             unreachable!()
         };
         sliding.restore(checkpoint);
         assert_eq!(sliding.logical_len(), 5);
-        assert_eq!(sliding_values(sliding)?, vec![2.0, 3.0, 4.0]);
+        let (values, dims) = sliding_key_history(sliding)?;
+        assert_values(
+            "the restored sliding key history",
+            &dims,
+            &[1, 1, 3, 1],
+            &values,
+            &[2.0, 3.0, 4.0],
+        );
 
         let LayerKvCache::Sliding(sliding) = &mut cache else {
             unreachable!()
         };
         sliding.append(&failed_step, &failed_step)?;
         assert_eq!(sliding.logical_len(), 8);
-        assert_eq!(sliding_values(sliding)?, vec![5.0, 6.0, 7.0]);
+        let (values, dims) = sliding_key_history(sliding)?;
+        assert_values(
+            "the sliding key history",
+            &dims,
+            &[1, 1, 3, 1],
+            &values,
+            &[5.0, 6.0, 7.0],
+        );
         Ok(())
     }
 
@@ -5382,7 +5759,14 @@ mod tests {
             let old = token_values(start, len, &device)?;
             reused.append(&old, &old)?;
         }
-        assert_eq!(sliding_values(&reused)?, vec![4.0, 5.0, 6.0]);
+        let (values, dims) = sliding_key_history(&reused)?;
+        assert_values(
+            "the reused sliding key history",
+            &dims,
+            &[1, 1, 3, 1],
+            &values,
+            &[4.0, 5.0, 6.0],
+        );
         assert_eq!(reused.history_segments()?.len(), 2);
         reused.clear();
         assert!(reused.is_empty());
@@ -5392,7 +5776,15 @@ mod tests {
         reused.append(&next, &next)?;
         let mut fresh = SlidingKvCache::new(4, 32)?;
         fresh.append(&next, &next)?;
-        assert_eq!(sliding_values(&reused)?, sliding_values(&fresh)?);
+        let (reused_values, reused_dims) = sliding_key_history(&reused)?;
+        let (fresh_values, fresh_dims) = sliding_key_history(&fresh)?;
+        assert_values(
+            "the reused sliding key history",
+            &reused_dims,
+            &fresh_dims,
+            &reused_values,
+            &fresh_values,
+        );
         assert_eq!(reused.logical_len(), fresh.logical_len());
         Ok(())
     }
@@ -5425,7 +5817,14 @@ mod tests {
             assert_eq!(cache.stats().resident_start, position);
             assert_eq!(cache.stats().resident_len, 1);
             assert_eq!(cache.stats().allocated_capacity, 2);
-            assert_eq!(sliding_values(&cache)?, vec![position as f32]);
+            let (values, dims) = sliding_key_history(&cache)?;
+            assert_values(
+                "the sliding key history",
+                &dims,
+                &[1, 1, 1, 1],
+                &values,
+                &[position as f32],
+            );
         }
         Ok(())
     }

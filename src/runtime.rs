@@ -39,18 +39,20 @@ impl ModelLoadConfig {
     pub const DEFAULT_KV_CACHE_SLAB_BLOCKS: usize = 8;
     /// CUDA has no paged-attention kernel, so every decode step takes the
     /// dense fallback and copies each K/V block once per layer per step.
-    /// Larger blocks keep that copy count down; see
-    /// `bench/2026-11-10-cuda-kv-blocks.md` in the work folder.
+    /// Larger blocks cut that copy count.
     ///
-    /// The prefix cache reuses whole blocks, so on CUDA a prompt shorter
-    /// than one block gets no prefix reuse, and every live sequence holds at
-    /// least one block.
+    /// After every completed prefill chunk the engine publishes the prefix
+    /// that is in the cache: a pure-attention model publishes it rounded down
+    /// to whole blocks, while a hybrid model with exact snapshots publishes
+    /// it only when the session length equals it exactly. On CUDA a
+    /// pure-attention prompt shorter than one block (256 tokens) therefore
+    /// gets no prefix reuse, and every live sequence holds at least one
+    /// block.
     pub const CUDA_KV_CACHE_BLOCK_TOKENS: usize = 256;
     /// CUDA has no paged-attention kernel, so every decode step takes the
     /// dense fallback and copies each K/V block once per layer per step.
     /// A slab of four 256-token blocks pools the allocation without raising
-    /// the per-step copy count; see `bench/2026-11-10-cuda-kv-blocks.md` in
-    /// the work folder.
+    /// the per-step copy count.
     pub const CUDA_KV_CACHE_SLAB_BLOCKS: usize = 4;
     pub const DEFAULT_SERVER_PREFIX_CACHE_CAPACITY_TOKENS: usize = 32 * 1024;
 

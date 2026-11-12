@@ -4791,6 +4791,123 @@ mod tests {
 
     use super::*;
 
+    /// Compares two flat float buffers read from tensors without printing
+    /// them.
+    ///
+    /// The buffers are flat slices: a caller that reads a nested tensor
+    /// flattens the read in row-major order with `flatten_rows` or
+    /// `flatten_planes` before the comparison. The shapes are compared
+    /// first, so a read of another shape with the same values fails; the
+    /// report of a failure names the buffer, both shapes, both lengths, the
+    /// number of differing elements and the first differing index with its
+    /// two values. A failing assert never dumps a whole buffer.
+    fn assert_values(
+        name: &str,
+        actual_shape: &[usize],
+        expected_shape: &[usize],
+        actual: &[f32],
+        expected: &[f32],
+    ) {
+        assert!(
+            actual_shape == expected_shape,
+            "{name}: shape mismatch (actual shape {actual_shape:?}, expected shape {expected_shape:?})"
+        );
+        let mut differing = 0_usize;
+        let mut first = None;
+        for index in 0..actual.len().max(expected.len()) {
+            let actual_value = actual.get(index).copied();
+            let expected_value = expected.get(index).copied();
+            if actual_value != expected_value {
+                differing += 1;
+                if first.is_none() {
+                    first = Some((index, actual_value, expected_value));
+                }
+            }
+        }
+        let Some((index, actual_value, expected_value)) = first else {
+            return;
+        };
+        panic!(
+            "{name} (actual shape {actual_shape:?}, expected shape {expected_shape:?}): \
+             {differing} of {} elements differ (actual length {}, expected length {}); \
+             first difference at index {index}: actual {}, expected {}",
+            actual.len().max(expected.len()),
+            actual.len(),
+            expected.len(),
+            actual_value.map_or_else(|| "missing".to_string(), |value| value.to_string()),
+            expected_value.map_or_else(|| "missing".to_string(), |value| value.to_string()),
+        );
+    }
+
+    /// Names the kind of a device without printing its identity.
+    fn device_kind(device: &Device) -> &'static str {
+        if device.is_cpu() {
+            "cpu"
+        } else if device.is_cuda() {
+            "cuda"
+        } else if device.is_metal() {
+            "metal"
+        } else {
+            "unknown"
+        }
+    }
+
+    /// Flattens a nested float buffer in row-major order.
+    fn flatten_rows(rows: &[Vec<f32>]) -> Vec<f32> {
+        rows.iter().flat_map(|row| row.iter().copied()).collect()
+    }
+
+    /// Flattens a nested float buffer in row-major order.
+    fn flatten_planes(planes: &[Vec<Vec<f32>>]) -> Vec<f32> {
+        planes
+            .iter()
+            .flat_map(|plane| flatten_rows(plane))
+            .collect()
+    }
+
+    #[test]
+    fn assert_values_accepts_equal_buffers() {
+        assert_values(
+            "the helper buffer",
+            &[2],
+            &[2],
+            &[1.0_f32, 2.0],
+            &[1.0, 2.0],
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "the helper buffer (actual shape [2], expected shape [2]): 1 of 2 elements differ"
+    )]
+    fn assert_values_reports_the_first_difference_without_the_buffers() {
+        assert_values(
+            "the helper buffer",
+            &[2],
+            &[2],
+            &[1.0_f32, 2.0],
+            &[1.0, 3.0],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "the helper buffer: shape mismatch")]
+    fn assert_values_rejects_equal_values_with_another_shape() {
+        assert_values(
+            "the helper buffer",
+            &[1, 2],
+            &[2, 1],
+            &[1.0_f32, 2.0],
+            &[1.0, 2.0],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "actual length 2, expected length 1")]
+    fn assert_values_reports_different_lengths() {
+        assert_values("the helper buffer", &[2], &[2], &[1.0_f32, 2.0], &[1.0]);
+    }
+
     fn tiny_spec() -> DecoderSpec {
         let head_dim = 4;
         let num_layers = 2;
@@ -6557,13 +6674,16 @@ mod tests {
 
         let mut one_shot_state = ShortConvolutionState::new(3);
         let one_shot = mixer.forward_lane(&mut one_shot_state, &input)?;
-        assert_eq!(
-            one_shot.to_vec3::<f32>()?,
-            vec![vec![
+        assert_values(
+            "the one-shot short convolution",
+            one_shot.dims(),
+            &[1, 3, 2],
+            &flatten_planes(&one_shot.to_vec3::<f32>()?),
+            &flatten_planes(&[vec![
                 vec![100.0, 16.0],
                 vec![2730.0, 136.0],
-                vec![12_955.0, 456.0]
-            ]]
+                vec![12_955.0, 456.0],
+            ]]),
         );
         assert_eq!(one_shot_state.logical_len, 3);
         let tail = one_shot_state.tail.as_ref().expect("shortconv tail");
@@ -6576,15 +6696,23 @@ mod tests {
                     "tail must not retain the full prefill window"
                 );
             }
-            storage => panic!("unexpected shortconv tail storage {storage:?}"),
+            // The report names the dtype and the device kind of the storage
+            // and the shape of the tail, never the storage itself: the debug
+            // output of a CPU storage of another dtype prints its whole
+            // buffer.
+            _ => panic!(
+                "unexpected shortconv tail storage (dtype {:?}, device {}, shape {:?})",
+                tail.dtype(),
+                device_kind(tail.device()),
+                tail.dims()
+            ),
         }
-        assert_eq!(
-            one_shot_state
-                .tail
-                .as_ref()
-                .expect("K=3 keeps two history tokens")
-                .to_vec3::<f32>()?,
-            vec![vec![vec![9.0, 16.0], vec![25.0, 36.0]]]
+        assert_values(
+            "the retained short convolution tail",
+            tail.dims(),
+            &[1, 2, 2],
+            &flatten_planes(&tail.to_vec3::<f32>()?),
+            &flatten_planes(&[vec![vec![9.0, 16.0], vec![25.0, 36.0]]]),
         );
 
         let mut chunked_state = ShortConvolutionState::new(3);
@@ -7909,8 +8037,12 @@ mod tests {
         Ok(())
     }
 
-    /// The dense attention must read the one-block history of the paged cache
-    /// as it is: the strided view and its contiguous copy agree exactly.
+    /// The dense attention computes the same result from the strided
+    /// one-block view as from its contiguous copy.
+    ///
+    /// The view comes from a one-block reservation of the test's own small
+    /// pool, so the test shows that the view is eligible for the copy-free
+    /// path and that the result equals the contiguous reference.
     #[test]
     fn dense_attention_matches_the_contiguous_reference_for_one_block_kv() -> Result<()> {
         const KV_HEADS: usize = 2;
@@ -7918,6 +8050,66 @@ mod tests {
         const BLOCK_TOKENS: usize = 8;
         const HISTORY: usize = 5;
         let device = Device::Cpu;
+        // The test builds its own small pool, not the decoder's default
+        // pool, so the history is the one a one-block reservation hands
+        // to the attention.
+        let mut spec = tiny_spec();
+        spec.num_kv_heads = KV_HEADS;
+        spec.head_dim = HEAD_DIM;
+        let pool = DecoderModel::new_paged_pool(
+            &spec,
+            1,
+            PagedKvPoolConfig::new(BLOCK_TOKENS, 1, 4).map_err(paged_kv_error)?,
+            DType::F32,
+            &device,
+        )?;
+        let mut table = PagedKvBlockTable::new(pool.clone(), 8).map_err(paged_kv_error)?;
+        let mut append = table.begin_append(HISTORY).map_err(paged_kv_error)?;
+        let written_key = Tensor::from_vec(
+            pseudo_random_values(KV_HEADS * HISTORY * HEAD_DIM, 103),
+            (1, KV_HEADS, HISTORY, HEAD_DIM),
+            &device,
+        )?;
+        let written_value = Tensor::from_vec(
+            pseudo_random_values(KV_HEADS * HISTORY * HEAD_DIM, 107),
+            (1, KV_HEADS, HISTORY, HEAD_DIM),
+            &device,
+        )?;
+        append
+            .write_layer(0, &written_key, &written_value)
+            .map_err(paged_kv_error)?;
+        let (key, value) = append.materialize_layer(0).map_err(paged_kv_error)?;
+        // The one-block history is a window into the slab, not a copy. The
+        // view aliases the slab and is valid within the step that
+        // materialized it, so every read of it happens before the append
+        // is committed.
+        assert!(!key.is_contiguous(), "the test needs a strided K view");
+        assert!(!value.is_contiguous(), "the test needs a strided V view");
+        // The layout predicate accepts the view, so the view is eligible
+        // for the copy-free path; the assert does not claim that the
+        // attention takes that path.
+        assert!(
+            matmul_ready_kv(&key, 1, KV_HEADS, HISTORY, HEAD_DIM),
+            "the one-block key view must be ready for the matmul"
+        );
+        assert!(
+            matmul_ready_kv(&value, 1, KV_HEADS, HISTORY, HEAD_DIM),
+            "the one-block value view must be ready for the matmul"
+        );
+        // The history carries the values that were written, so the
+        // comparison below is not a comparison of two empty buffers.
+        let difference = max_difference(&key, &written_key)?;
+        assert!(
+            difference == 0.0,
+            "the one-block key history differs by {difference} (shape {:?})",
+            key.dims()
+        );
+        let difference = max_difference(&value, &written_value)?;
+        assert!(
+            difference == 0.0,
+            "the one-block value history differs by {difference} (shape {:?})",
+            value.dims()
+        );
         for groups in [1_usize, 2, 4] {
             let query_heads = KV_HEADS * groups;
             let query = Tensor::from_vec(
@@ -7925,22 +8117,6 @@ mod tests {
                 (1, query_heads, 1, HEAD_DIM),
                 &device,
             )?;
-            // The cache view of one block: the head blocks of a buffer that
-            // holds more tokens than the history uses.
-            let key = Tensor::from_vec(
-                pseudo_random_values(KV_HEADS * BLOCK_TOKENS * HEAD_DIM, 103),
-                (1, KV_HEADS, BLOCK_TOKENS, HEAD_DIM),
-                &device,
-            )?
-            .narrow(2, 0, HISTORY)?;
-            let value = Tensor::from_vec(
-                pseudo_random_values(KV_HEADS * BLOCK_TOKENS * HEAD_DIM, 107),
-                (1, KV_HEADS, BLOCK_TOKENS, HEAD_DIM),
-                &device,
-            )?
-            .narrow(2, 0, HISTORY)?;
-            assert!(!key.is_contiguous(), "the test needs a strided K/V view");
-            assert!(!value.is_contiguous(), "the test needs a strided V view");
             let scale = 1.0 / (HEAD_DIM as f64).sqrt();
             let strided = dense_causal_attention(&query, &key, &value, groups, scale, None, None)?;
             let contiguous = dense_causal_attention(
@@ -7958,6 +8134,7 @@ mod tests {
                 "groups={groups} differed by {difference} on a one-block history"
             );
         }
+        append.commit().map_err(paged_kv_error)?;
         Ok(())
     }
 
@@ -8274,15 +8451,20 @@ mod tests {
         };
         let input = Tensor::new(&[[[1.0_f32]]], &device)?;
         let (query, _, _, gate) = attention.project_packed_qkv(&input, 1)?;
-        assert_eq!(
-            query.flatten_all()?.to_vec1::<f32>()?,
-            vec![1.0, 2.0, 5.0, 6.0]
+        assert_values(
+            "the projected query",
+            query.dims(),
+            &[1, 2, 1, 2],
+            &query.flatten_all()?.to_vec1::<f32>()?,
+            &[1.0, 2.0, 5.0, 6.0],
         );
-        assert_eq!(
-            gate.expect("gated attention returns its projected gate")
-                .flatten_all()?
-                .to_vec1::<f32>()?,
-            vec![0.0, -1.0, 1.0, 0.5]
+        let gate = gate.expect("gated attention returns its projected gate");
+        assert_values(
+            "the projected gate",
+            gate.dims(),
+            &[1, 1, 4],
+            &gate.flatten_all()?.to_vec1::<f32>()?,
+            &[0.0, -1.0, 1.0, 0.5],
         );
 
         let mut cache = LayerKvCache::Full(KvCache::new(4));
@@ -8304,10 +8486,14 @@ mod tests {
     #[test]
     fn gated_delta_repeats_key_heads_for_gguf_tiled_value_order() -> Result<()> {
         let input = Tensor::new(&[[1_f32, 2.0], [3.0, 4.0]], &Device::Cpu)?;
-        let expanded = repeat_heads_tiled_dim(&input, 2, 0)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        assert_eq!(expanded, vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]);
+        let expanded = repeat_heads_tiled_dim(&input, 2, 0)?;
+        assert_values(
+            "the repeated key heads",
+            expanded.dims(),
+            &[4, 2],
+            &expanded.flatten_all()?.to_vec1::<f32>()?,
+            &[1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0],
+        );
         Ok(())
     }
 
@@ -9252,7 +9438,13 @@ mod tests {
             .flatten_all()?
             .to_vec1::<f32>()?;
         assert!(decode[0].is_infinite() && decode[0].is_sign_negative());
-        assert_eq!(&decode[1..], &[0.0, 0.0]);
+        assert_values(
+            "the unmasked decode cells",
+            &[2],
+            &[2],
+            &decode[1..],
+            &[0.0, 0.0],
+        );
 
         let prefill = model
             .attention_mask(kind, 3, 0)?
@@ -9261,10 +9453,22 @@ mod tests {
             .to_vec2::<f32>()?;
         assert!(prefill[0][0].abs() < f32::EPSILON);
         assert!(prefill[0][1].is_sign_negative());
-        assert_eq!(&prefill[1][..2], &[0.0, 0.0]);
+        assert_values(
+            "the unmasked prefill cells of row 1",
+            &[2],
+            &[2],
+            &prefill[1][..2],
+            &[0.0, 0.0],
+        );
         assert!(prefill[1][2].is_sign_negative());
         assert!(prefill[2][0].is_sign_negative());
-        assert_eq!(&prefill[2][1..], &[0.0, 0.0]);
+        assert_values(
+            "the unmasked prefill cells of row 2",
+            &[2],
+            &[2],
+            &prefill[2][1..],
+            &[0.0, 0.0],
+        );
 
         let gemma_window = AttentionKind::SlidingCausal { window: 512 };
         assert!(model.attention_mask(gemma_window, 1, 511)?.is_none());
@@ -9301,10 +9505,22 @@ mod tests {
         .expect("the tile contains both a future key and one expired key")
         .reshape((2, 5))?
         .to_vec2::<f32>()?;
-        assert_eq!(&absolute_range[0][..4], &[0.0, 0.0, 0.0, 0.0]);
+        assert_values(
+            "the unmasked absolute-range cells of row 0",
+            &[4],
+            &[4],
+            &absolute_range[0][..4],
+            &[0.0, 0.0, 0.0, 0.0],
+        );
         assert!(absolute_range[0][4].is_sign_negative());
         assert!(absolute_range[1][0].is_sign_negative());
-        assert_eq!(&absolute_range[1][1..], &[0.0, 0.0, 0.0, 0.0]);
+        assert_values(
+            "the unmasked absolute-range cells of row 1",
+            &[4],
+            &[4],
+            &absolute_range[1][1..],
+            &[0.0, 0.0, 0.0, 0.0],
+        );
         Ok(())
     }
 
