@@ -2114,9 +2114,10 @@ impl PagedKvAppend<'_> {
         }
         let key_refs = keys.iter().collect::<Vec<_>>();
         let value_refs = values.iter().collect::<Vec<_>>();
-        // `Tensor::cat` joins the blocks. The joined history is strided for
-        // that pool with candle 0.11 whenever a block view has no outer
-        // stride for the token axis, so callers that need a contiguous K/V
+        // `Tensor::cat` joins the blocks. The join may be strided: with
+        // candle 0.11 it is for a pool with more than one layer whose last
+        // block is partly filled, because such a block view has no outer
+        // stride for the token axis. Callers that need a contiguous K/V
         // history copy it themselves.
         Ok((Tensor::cat(&key_refs, 2)?, Tensor::cat(&value_refs, 2)?))
     }
@@ -2933,9 +2934,10 @@ impl PagedKvBatchReservation {
         }
         let key_refs = keys.iter().collect::<Vec<_>>();
         let value_refs = values.iter().collect::<Vec<_>>();
-        // `Tensor::cat` joins the blocks. The joined history is strided for
-        // that pool with candle 0.11 whenever a block view has no outer
-        // stride for the token axis, so callers that need a contiguous K/V
+        // `Tensor::cat` joins the blocks. The join may be strided: with
+        // candle 0.11 it is for a pool with more than one layer whose last
+        // block is partly filled, because such a block view has no outer
+        // stride for the token axis. Callers that need a contiguous K/V
         // history copy it themselves.
         Ok((Tensor::cat(&key_refs, 2)?, Tensor::cat(&value_refs, 2)?))
     }

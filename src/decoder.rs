@@ -54,6 +54,7 @@ const MAX_HOST_ROUTER_LOGIT_ELEMENTS: usize = 16 << 20;
 #[cfg(test)]
 thread_local! {
     static FULL_CAUSAL_MASK_CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
+    static KV_CONTIGUOUS_COPIES: Cell<usize> = const { Cell::new(0) };
     static FORCE_CPU_DIRECT_PAGED_ATTENTION: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -65,6 +66,18 @@ fn reset_full_causal_mask_construction_count() {
 #[cfg(test)]
 fn full_causal_mask_construction_count() -> usize {
     FULL_CAUSAL_MASK_CONSTRUCTIONS.get()
+}
+
+/// Resets the counter of the K/V copies the attention made.
+#[cfg(test)]
+fn reset_kv_contiguous_copy_count() {
+    KV_CONTIGUOUS_COPIES.set(0);
+}
+
+/// The number of K/V copies the attention made since the last reset.
+#[cfg(test)]
+fn kv_contiguous_copy_count() -> usize {
+    KV_CONTIGUOUS_COPIES.get()
 }
 
 #[cfg(test)]
@@ -4614,11 +4627,15 @@ pub(crate) fn dense_causal_attention(
     let key = if matmul_ready_kv(key, batch, kv_heads, key_len, head_dim) {
         key.clone()
     } else {
+        #[cfg(test)]
+        KV_CONTIGUOUS_COPIES.set(KV_CONTIGUOUS_COPIES.get().saturating_add(1));
         key.contiguous()?
     };
     let value = if matmul_ready_kv(value, batch, kv_heads, key_len, head_dim) {
         value.clone()
     } else {
+        #[cfg(test)]
+        KV_CONTIGUOUS_COPIES.set(KV_CONTIGUOUS_COPIES.get().saturating_add(1));
         value.contiguous()?
     };
     // Group the query heads by their KV head. The head order is the one the
@@ -4658,9 +4675,12 @@ pub(crate) fn dense_causal_attention(
 /// head_dim)` block per head: the two trailing axes of a block are either
 /// `sequence_stride == head_dim` with `dim_stride == 1`, or
 /// `sequence_stride == 1` with `dim_stride == sequence`. The head blocks
-/// are evenly spaced, so the head stride covers a whole block, and the
-/// batch spacing is checked as `batch_stride == head_stride * heads`: one
-/// batch element starts `heads` head blocks after the previous one.
+/// are evenly spaced, so the head stride covers a whole block. The batch
+/// spacing is checked as `batch_stride == head_stride * heads`: one batch
+/// element starts `heads` head blocks after the previous one. That check
+/// applies to more than one batch element only: a history of a single batch
+/// element has no next element to compare with, so its batch stride is read
+/// but not compared.
 ///
 /// The compact cache views satisfy all of this; a view that interleaves the
 /// heads does not and is copied once. The two products are checked, so an
@@ -4691,7 +4711,9 @@ fn matmul_ready_kv(
     let contiguous_block = (dim_stride == 1 && sequence_stride == head_dim)
         || (sequence_stride == 1 && dim_stride == sequence);
     // The head blocks are evenly spaced, so one batch element starts
-    // `heads` blocks after the previous one.
+    // `heads` blocks after the previous one. The batch stride is read for
+    // every history, but it is only compared when there is more than one
+    // batch element.
     let spaced = head_stride >= block && (batch == 1 || batch_stride == batch_spacing);
     contiguous_block && spaced
 }
@@ -7981,7 +8003,11 @@ mod tests {
     /// must read them without a contiguous copy of the history.
     ///
     /// A Metal host reads the same views, because the cache hands them to
-    /// the Metal backend in production.
+    /// the Metal backend in production. The copy counter guards the copy
+    /// free path: an attention that copied every history would count one
+    /// copy per view and fail the assertion. The counter also observes the
+    /// copies of a view the matmul cannot read, so a history that is not
+    /// ready is copied instead of read wrongly.
     #[test]
     fn grouped_attention_reads_strided_kv_views() -> Result<()> {
         const KV_HEADS: usize = 2;
@@ -8016,23 +8042,80 @@ mod tests {
                 // history.
                 assert!(
                     matmul_ready_kv(&key, 1, KV_HEADS, KEY_LEN, HEAD_DIM),
-                    "the narrowed K/V view must be ready for the matmul"
+                    "the narrowed K view must be ready for the matmul"
                 );
                 assert!(
                     matmul_ready_kv(&value, 1, KV_HEADS, KEY_LEN, HEAD_DIM),
-                    "the narrowed V/V view must be ready for the matmul"
+                    "the narrowed V view must be ready for the matmul"
                 );
                 let scale = 1.0 / (HEAD_DIM as f64).sqrt();
+                reset_kv_contiguous_copy_count();
                 let grouped =
                     dense_causal_attention(&query, &key, &value, groups, scale, None, None)?;
+                assert_eq!(
+                    kv_contiguous_copy_count(),
+                    0,
+                    "the narrowed K/V view must be read without a copy (groups={groups})"
+                );
                 let expanded =
                     expanded_causal_attention(&query, &key, &value, groups, scale, None, None)?;
                 let difference = max_difference(&grouped, &expanded)?;
                 assert!(
                     difference <= 1e-5,
-                    "groups={groups} differed by {difference} on a strided K/V view on {device:?}"
+                    "groups={groups} differed by {difference} on a strided K/V view on {}",
+                    device_kind(&device)
                 );
             }
+            // Each of these views is half of a wider last axis, so its
+            // sequence stride is twice the head dimension and
+            // `matmul_ready_kv` rejects it. The attention copies such a
+            // view. The counter observes the copies: one for the K view
+            // and one for the V view.
+            let query = Tensor::zeros((1, KV_HEADS, 1, HEAD_DIM), DType::F32, &device)?;
+            let interleaved_key =
+                Tensor::zeros((1, KV_HEADS, KEY_LEN, HEAD_DIM * 2), DType::F32, &device)?
+                    .narrow(3, 0, HEAD_DIM)?;
+            let interleaved_value =
+                Tensor::zeros((1, KV_HEADS, KEY_LEN, HEAD_DIM * 2), DType::F32, &device)?
+                    .narrow(3, 0, HEAD_DIM)?;
+            let value = Tensor::zeros((1, KV_HEADS, KEY_LEN, HEAD_DIM), DType::F32, &device)?;
+            assert!(
+                !matmul_ready_kv(&interleaved_key, 1, KV_HEADS, KEY_LEN, HEAD_DIM),
+                "the interleaved K view must not be ready for the matmul"
+            );
+            assert!(
+                !matmul_ready_kv(&interleaved_value, 1, KV_HEADS, KEY_LEN, HEAD_DIM),
+                "the interleaved V view must not be ready for the matmul"
+            );
+            assert!(
+                matmul_ready_kv(&value, 1, KV_HEADS, KEY_LEN, HEAD_DIM),
+                "the contiguous V view must be ready for the matmul"
+            );
+            // One of the two views is not ready, so the attention copies it
+            // once and reads the other view as it is.
+            reset_kv_contiguous_copy_count();
+            dense_causal_attention(&query, &interleaved_key, &value, 1, 1.0, None, None)?;
+            assert_eq!(
+                kv_contiguous_copy_count(),
+                1,
+                "the interleaved K view must be copied once"
+            );
+            // Both views are not ready, so the attention copies each of them.
+            reset_kv_contiguous_copy_count();
+            dense_causal_attention(
+                &query,
+                &interleaved_key,
+                &interleaved_value,
+                1,
+                1.0,
+                None,
+                None,
+            )?;
+            assert_eq!(
+                kv_contiguous_copy_count(),
+                2,
+                "the interleaved K and V views must be copied once each"
+            );
         }
         Ok(())
     }
@@ -8040,9 +8123,11 @@ mod tests {
     /// The dense attention computes the same result from the strided
     /// one-block view as from its contiguous copy.
     ///
-    /// The view comes from a one-block reservation of the test's own small
-    /// pool, so the test shows that the view is eligible for the copy-free
-    /// path and that the result equals the contiguous reference.
+    /// The view comes from `begin_append` on the test's own small pool, so
+    /// the test shows that the view is eligible for the copy-free path and
+    /// that the result equals the contiguous reference. The copy counter
+    /// guards the copy-free path: an attention that copied the one-block
+    /// history would count a copy and fail the assertion.
     #[test]
     fn dense_attention_matches_the_contiguous_reference_for_one_block_kv() -> Result<()> {
         const KV_HEADS: usize = 2;
@@ -8050,9 +8135,9 @@ mod tests {
         const BLOCK_TOKENS: usize = 8;
         const HISTORY: usize = 5;
         let device = Device::Cpu;
-        // The test builds its own small pool, not the decoder's default
-        // pool, so the history is the one a one-block reservation hands
-        // to the attention.
+        // The view comes from `begin_append` on the test's own small pool,
+        // not the decoder's default pool, so the history is the one the
+        // cache hands to the attention.
         let mut spec = tiny_spec();
         spec.num_kv_heads = KV_HEADS;
         spec.head_dim = HEAD_DIM;
@@ -8085,9 +8170,9 @@ mod tests {
         // is committed.
         assert!(!key.is_contiguous(), "the test needs a strided K view");
         assert!(!value.is_contiguous(), "the test needs a strided V view");
-        // The layout predicate accepts the view, so the view is eligible
-        // for the copy-free path; the assert does not claim that the
-        // attention takes that path.
+        // The layout predicate accepts the view, so the attention reads
+        // it without a copy. The copy counter below proves that: an
+        // attention that copied the history would count a copy.
         assert!(
             matmul_ready_kv(&key, 1, KV_HEADS, HISTORY, HEAD_DIM),
             "the one-block key view must be ready for the matmul"
@@ -8118,7 +8203,13 @@ mod tests {
                 &device,
             )?;
             let scale = 1.0 / (HEAD_DIM as f64).sqrt();
+            reset_kv_contiguous_copy_count();
             let strided = dense_causal_attention(&query, &key, &value, groups, scale, None, None)?;
+            assert_eq!(
+                kv_contiguous_copy_count(),
+                0,
+                "the one-block view must be read without a copy (groups={groups})"
+            );
             let contiguous = dense_causal_attention(
                 &query,
                 &key.contiguous()?,
@@ -8153,8 +8244,9 @@ mod tests {
             .narrow(2, 0, LENGTH)?;
         assert!(!cached.is_contiguous(), "the test needs a strided K/V view");
         assert!(matmul_ready_kv(&cached, 1, KV_HEADS, LENGTH, HEAD_DIM));
-        // A view whose head dimension is interleaved with another one cannot
-        // be read one head block at a time.
+        // A view that is half of a wider last axis has a sequence stride
+        // of twice the head dimension, so it cannot be read one head
+        // block at a time.
         let interleaved = Tensor::zeros((1, KV_HEADS, LENGTH, HEAD_DIM * 2), DType::F32, &device)?
             .narrow(3, 0, HEAD_DIM)?;
         assert!(!matmul_ready_kv(
@@ -8278,7 +8370,11 @@ mod tests {
     /// axis, so only the documented shapes are accepted.
     ///
     /// The mask covers three query rows and four key columns here, so the
-    /// extents of every case match the scores it is added to.
+    /// extents of every case match the scores it is added to. Every
+    /// rejected shape is rejected for its own reason: the error of the
+    /// mask with three axes names the axis count, and the error of every
+    /// other mask names the axis that does not match, so a guard that
+    /// stops rejecting one shape cannot be hidden by another guard.
     #[test]
     fn grouped_mask_accepts_only_the_documented_shapes() -> Result<()> {
         let device = Device::Cpu;
@@ -8291,22 +8387,25 @@ mod tests {
         assert_eq!(grouped_mask(&mask, 2, 3, 4)?.dims(), &[2, 1, 1, 3, 4]);
         // A mask with three axes has no head axis to check.
         let mask = Tensor::zeros((1, 3, 4), DType::F32, &device)?;
+        let error = rejection_message(grouped_mask(&mask, 2, 3, 4));
         assert!(
-            grouped_mask(&mask, 2, 3, 4).is_err(),
-            "a mask with three axes must be rejected"
+            error.contains("3 axes"),
+            "a mask with three axes must be rejected for its own reason: {error}"
         );
         // A head axis of more than one does not broadcast over the groups.
         let mask = Tensor::zeros((1, 2, 3, 4), DType::F32, &device)?;
+        let error = rejection_message(grouped_mask(&mask, 2, 3, 4));
         assert!(
-            grouped_mask(&mask, 2, 3, 4).is_err(),
-            "a head axis other than one must be rejected"
+            error.contains("head axis"),
+            "a head axis other than one must be rejected for its own reason: {error}"
         );
         // A batch axis that is neither one nor the batch does not
         // broadcast over the scores.
         let mask = Tensor::zeros((3, 1, 3, 4), DType::F32, &device)?;
+        let error = rejection_message(grouped_mask(&mask, 2, 3, 4));
         assert!(
-            grouped_mask(&mask, 2, 3, 4).is_err(),
-            "a batch axis that does not match must be rejected"
+            error.contains("batch axis"),
+            "a batch axis that does not match must be rejected for its own reason: {error}"
         );
         Ok(())
     }

@@ -44,10 +44,10 @@ impl ModelLoadConfig {
     /// After every completed prefill chunk the engine publishes the prefix
     /// that is in the cache: a pure-attention model publishes it rounded down
     /// to whole blocks, while a hybrid model with exact snapshots publishes
-    /// it only when the session length equals it exactly. On CUDA a
-    /// pure-attention prompt shorter than one block (256 tokens) therefore
-    /// gets no prefix reuse, and every live sequence holds at least one
-    /// block.
+    /// it only when the session length equals the prefix length exactly.
+    /// On CUDA a pure-attention prompt shorter than one block (256 tokens)
+    /// therefore gets no prefix reuse, and every live sequence holds at
+    /// least one block.
     pub const CUDA_KV_CACHE_BLOCK_TOKENS: usize = 256;
     /// CUDA has no paged-attention kernel, so every decode step takes the
     /// dense fallback and copies each K/V block once per layer per step.
