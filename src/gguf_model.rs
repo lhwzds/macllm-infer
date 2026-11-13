@@ -4039,6 +4039,7 @@ mod tests {
     use candle_core::{DType, Device};
 
     use crate::model_weights::GgufWeightSource;
+    use crate::server::test_helpers::{assert_same_text, assert_same_values};
 
     use super::*;
 
@@ -4113,10 +4114,10 @@ mod tests {
             let model = GgufModel::open(fixture.path())?;
             let adapter = model.adapter()?;
             let messages = [crate::chat::ChatMessage::user("Hello")];
-            assert_eq!(
-                adapter.format_chat_messages(&messages)?,
+            assert_same_text(
+                &format!("{profile} {policy:?}"),
+                &adapter.format_chat_messages(&messages)?,
                 expected,
-                "{profile} {policy:?}"
             );
         }
         Ok(())
@@ -4351,18 +4352,20 @@ mod tests {
             let model = GgufModel::open(fixture.path())?;
             let adapter = model.adapter()?;
             let messages = [crate::chat::ChatMessage::user("Hello")];
-            assert_eq!(
-                adapter.format_chat_messages(&messages)?,
-                "auser:Helloassistant:unset<|stop|>"
+            assert_same_text(
+                "the chat render",
+                &adapter.format_chat_messages(&messages)?,
+                "auser:Helloassistant:unset<|stop|>",
             );
-            assert_eq!(
-                adapter.format_chat_messages_with(
+            assert_same_text(
+                "the chat render",
+                &adapter.format_chat_messages_with(
                     &messages,
                     crate::chat::ChatTemplateOptions {
-                        enable_thinking: Some(false)
+                        enable_thinking: Some(false),
                     },
                 )?,
-                "auser:Helloassistant:off<|stop|>"
+                "auser:Helloassistant:off<|stop|>",
             );
             let prompt = crate::agent::AgentPrompt {
                 messages: vec![crate::agent::AgentMessage::User {
@@ -4604,9 +4607,16 @@ mod tests {
         let cached = runtime.forward_tokens(session.as_mut(), &[1], prefix.len())?;
         let mut full_session = runtime.new_session()?;
         let full = runtime.forward_tokens(full_session.as_mut(), &[1, 2, 1, 2, 1, 2, 1], 0)?;
-        assert_eq!(
-            cached.flatten_all()?.to_vec1::<f32>()?,
-            full.flatten_all()?.to_vec1::<f32>()?
+        let cached_values = cached.flatten_all()?.to_vec1::<f32>()?;
+        let full_values = full.flatten_all()?.to_vec1::<f32>()?;
+        assert_same_values(
+            &format!(
+                "the cached logits of shape {:?} against {:?}",
+                cached.dims(),
+                full.dims()
+            ),
+            &cached_values,
+            &full_values,
         );
         Ok(())
     }
@@ -4815,9 +4825,16 @@ mod tests {
         drop(cached_session);
         let mut full_session = runtime.new_session()?;
         let full = runtime.forward_tokens(full_session.as_mut(), &[2, 3, 2], 0)?;
-        assert_eq!(
-            cached.flatten_all()?.to_vec1::<f32>()?,
-            full.flatten_all()?.to_vec1::<f32>()?
+        let cached_values = cached.flatten_all()?.to_vec1::<f32>()?;
+        let full_values = full.flatten_all()?.to_vec1::<f32>()?;
+        assert_same_values(
+            &format!(
+                "the cached logits of shape {:?} against {:?}",
+                cached.dims(),
+                full.dims()
+            ),
+            &cached_values,
+            &full_values,
         );
         Ok(())
     }
@@ -5878,12 +5895,13 @@ mod tests {
             .tokenizer()
             .encode(rendered, false)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        assert_eq!(
+        assert_same_values(
+            "the token IDs of the SmolLM2 chat render",
             ids.get_ids(),
             &[
                 1, 9690, 198, 2683, 359, 253, 5356, 5646, 11173, 3365, 3511, 308, 34519, 28, 7018,
                 411, 407, 19712, 8182, 2, 198, 1, 4093, 198, 19556, 2, 198, 1, 520, 9531, 198,
-            ]
+            ],
         );
         Ok(())
     }
@@ -5911,9 +5929,10 @@ mod tests {
             model.chat_template.as_deref(),
             Some(crate::models::qwen2::QWEN2_5_CHAT_TEMPLATE)
         );
-        assert_eq!(
-            model.adapter()?.format_chat(None, "Hello")?,
-            "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
+        assert_same_text(
+            "the chat render",
+            &model.adapter()?.format_chat(None, "Hello")?,
+            "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n",
         );
         Ok(())
     }
@@ -5971,17 +5990,19 @@ mod tests {
         assert_eq!(model.backend_config().llama_qk, None);
 
         let rendered = model.adapter()?.format_chat(None, "Hello")?;
-        assert_eq!(
-            rendered,
-            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
+        assert_same_text(
+            "the chat render",
+            &rendered,
+            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n",
         );
         let ids = model
             .tokenizer()
             .encode(rendered, false)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        assert_eq!(
+        assert_same_values(
+            "the token IDs of the Qwen2.5 chat render",
             ids.get_ids(),
-            [151_644, 872, 198, 9_707, 151_645, 198, 151_644, 77_091, 198]
+            &[151_644, 872, 198, 9_707, 151_645, 198, 151_644, 77_091, 198],
         );
         Ok(())
     }
@@ -6312,9 +6333,10 @@ mod tests {
             assert_eq!(layer.norm_layout, NormLayout::Sandwich);
             assert_eq!(layer.activation, Activation::GeluTanh);
         }
-        assert_eq!(
-            model.adapter()?.format_chat(None, " Hello ")?,
-            "<bos><start_of_turn>user\nHello<end_of_turn>\n<start_of_turn>model\n"
+        assert_same_text(
+            "the chat render",
+            &model.adapter()?.format_chat(None, " Hello ")?,
+            "<bos><start_of_turn>user\nHello<end_of_turn>\n<start_of_turn>model\n",
         );
         assert!(
             model
@@ -6379,11 +6401,12 @@ mod tests {
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             assert_eq!(encoding.get_ids(), expected, "token IDs for {text:?}");
         }
-        assert_eq!(
-            model
+        assert_same_text(
+            "the chat render",
+            &model
                 .adapter()?
                 .format_chat(Some(" Be terse. "), " Hello ")?,
-            "<bos><start_of_turn>user\n Be terse. \n\nHello<end_of_turn>\n<start_of_turn>model\n"
+            "<bos><start_of_turn>user\n Be terse. \n\nHello<end_of_turn>\n<start_of_turn>model\n",
         );
         Ok(())
     }
@@ -6457,13 +6480,14 @@ mod tests {
         let chat = tokenizer
             .encode(rendered, false)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        assert_eq!(
+        assert_same_values(
+            "the token IDs of the Llama 3.2 chat render",
             chat.get_ids(),
-            [
+            &[
                 128_000, 128_006, 9_125, 128_007, 271, 38_766, 1_303, 33_025, 2_696, 25, 6_790,
                 220, 2_366, 18, 198, 15_724, 2_696, 25, 220, 1_627, 10_263, 220, 2_366, 19, 271,
                 128_009, 128_006, 882, 128_007, 271, 9_906, 128_009, 128_006, 78_191, 128_007, 271,
-            ]
+            ],
         );
         Ok(())
     }
@@ -6511,8 +6535,8 @@ mod tests {
             .map_err(|error| anyhow::anyhow!(error.to_string()))?
             .get_ids()
             .to_vec();
-        println!("the rendered prompt: {rendered:?}");
-        println!("the encoded ids: {ids:?}");
+        println!("the rendered prompt: {} bytes long", rendered.len());
+        println!("the encoded ids: {} ids", ids.len());
         let Some(bos) = model.bos_token.as_deref() else {
             println!("the checkpoint has no BOS token");
             return Ok(());

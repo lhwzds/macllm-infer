@@ -25,6 +25,9 @@ use macllm_infer::{
 };
 use sha2::{Digest, Sha256};
 
+mod common;
+use common::{assert_same_text, assert_same_values};
+
 const FIXTURE_SIZE: u64 = 147_811_520;
 const FIXTURE_SHA256: &str = "2f87bbe14ba4f02b4de2b7227777ed821fec013f64cb907b9d6e836aeda0cbf7";
 const RAW_PROMPT: &str = "2 + 2 =";
@@ -95,14 +98,19 @@ fn qwen3_moe_metadata_tokenizer_and_chat_contract_are_pinned() -> anyhow::Result
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     assert_eq!(raw.get_ids(), RAW_PROMPT_IDS);
     let rendered = adapter.format_chat(None, RAW_PROMPT)?;
-    assert_eq!(
-        rendered,
-        "<|im_start|>user\n2 + 2 =<|im_end|>\n<|im_start|>assistant\n"
+    assert_same_text(
+        "the chat render",
+        &rendered,
+        "<|im_start|>user\n2 + 2 =<|im_end|>\n<|im_start|>assistant\n",
     );
     let chat = tokenizer
         .encode(rendered, false)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    assert_eq!(chat.get_ids(), CHAT_PROMPT_IDS);
+    assert_same_values(
+        "the token IDs of the chat render",
+        chat.get_ids(),
+        CHAT_PROMPT_IDS,
+    );
     Ok(())
 }
 

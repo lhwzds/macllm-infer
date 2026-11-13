@@ -23,6 +23,9 @@ use macllm_infer::{
     weights::ModelFiles,
 };
 
+mod common;
+use common::{assert_same_text, assert_same_values};
+
 const MAX_F16_CROSS_FORMAT_DIFFERENCE: f32 = 0.05;
 const MAX_Q8_CROSS_FORMAT_DIFFERENCE: f32 = 0.75;
 const MAX_Q4_CROSS_FORMAT_DIFFERENCE: f32 = 6.5;
@@ -34,6 +37,19 @@ const MAX_CANDLE_FRESH_FULL_RELATIVE_RMS: f64 = 0.002;
 // Candle's process-global Metal resource registry and these multi-model gates
 // must not be initialized concurrently inside one test binary.
 static METAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn the_two_copies_of_the_test_helpers_stay_identical() {
+    // The library test modules carry their own copy of these helpers, and
+    // the two integration test directories carry one copy each. The copies
+    // of the shared file have to stay byte-identical, so a change to one of
+    // them cannot pass the tests of the other.
+    assert_same_text(
+        "the shared test helpers",
+        include_str!("common/mod.rs"),
+        include_str!("../crates/macllm-chat/tests/common/mod.rs"),
+    );
+}
 
 #[test]
 #[ignore = "requires an accessible Apple Metal device"]
@@ -189,17 +205,22 @@ fn assert_same_model_contract(safetensors: &ModelFiles, gguf: &ModelFiles) -> an
     let rendered = safetensors
         .adapter()?
         .format_chat(None, "What is the capital of France?")?;
-    assert_eq!(
-        rendered,
-        gguf.adapter()?
-            .format_chat(None, "What is the capital of France?")?
+    assert_same_text(
+        "the chat render",
+        &rendered,
+        &gguf
+            .adapter()?
+            .format_chat(None, "What is the capital of France?")?,
     );
-    for text in [
-        "Hello",
-        "The answer is 12345.",
-        "café 🦀 — Rust",
-        "<|im_start|>assistant\nParis<|im_end|>",
-        rendered.as_str(),
+    for (label, text) in [
+        ("Hello", "Hello"),
+        ("The answer is 12345.", "The answer is 12345."),
+        ("café 🦀 — Rust", "café 🦀 — Rust"),
+        (
+            "<|im_start|>assistant\nParis<|im_end|>",
+            "<|im_start|>assistant\nParis<|im_end|>",
+        ),
+        ("rendered", rendered.as_str()),
     ] {
         let expected = safetensors_tokenizer
             .encode(text, false)
@@ -207,10 +228,10 @@ fn assert_same_model_contract(safetensors: &ModelFiles, gguf: &ModelFiles) -> an
         let actual = gguf_tokenizer
             .encode(text, false)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        assert_eq!(
+        assert_same_values(
+            &format!("the token IDs of {label}"),
             actual.get_ids(),
             expected.get_ids(),
-            "token IDs for {text:?}"
         );
         let expected_decoded = safetensors_tokenizer
             .decode(expected.get_ids(), false)
@@ -218,9 +239,10 @@ fn assert_same_model_contract(safetensors: &ModelFiles, gguf: &ModelFiles) -> an
         let actual_decoded = gguf_tokenizer
             .decode(actual.get_ids(), false)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        assert_eq!(
-            actual_decoded, expected_decoded,
-            "decoded text for {text:?}"
+        assert_same_text(
+            &format!("the decoded text of {label}"),
+            &actual_decoded,
+            &expected_decoded,
         );
     }
     Ok(())

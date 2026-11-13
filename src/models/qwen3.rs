@@ -314,6 +314,7 @@ impl ModelAdapter for Qwen3Adapter {
 mod tests {
     use super::*;
     use crate::agent::{AgentDirective, AgentMessage, ToolCall, ToolDefinition};
+    use crate::server::test_helpers::assert_same_text;
     use serde_json::json;
 
     fn official_config() -> Qwen3Config {
@@ -370,16 +371,18 @@ mod tests {
             ],
             ChatTemplateOptions::default(),
         )?;
-        assert_eq!(
-            prompt,
-            "<|im_start|>system\nBe concise.<|im_end|>\n<|im_start|>user\nFirst?<|im_end|>\n<|im_start|>assistant\nFirst.<|im_end|>\n<|im_start|>user\nSecond?<|im_end|>\n<|im_start|>assistant\n"
+        assert_same_text(
+            "the chat render",
+            &prompt,
+            "<|im_start|>system\nBe concise.<|im_end|>\n<|im_start|>user\nFirst?<|im_end|>\n<|im_start|>assistant\nFirst.<|im_end|>\n<|im_start|>user\nSecond?<|im_end|>\n<|im_start|>assistant\n",
         );
-        assert_eq!(
-            format_qwen3_chat_messages(
+        assert_same_text(
+            "the chat render",
+            &format_qwen3_chat_messages(
                 &[ChatMessage::user("Hello")],
-                ChatTemplateOptions::default()
+                ChatTemplateOptions::default(),
             )?,
-            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
+            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n",
         );
         Ok(())
     }
@@ -488,9 +491,10 @@ mod tests {
             AgentTemplateProfile::Qwen3Current,
             AgentTemplateProfile::Qwen3Gguf,
         ] {
-            assert_eq!(
-                format_qwen3_agent_prompt(profile, &prompt, ChatTemplateOptions::default())?,
-                expected
+            assert_same_text(
+                "the agent render",
+                &format_qwen3_agent_prompt(profile, &prompt, ChatTemplateOptions::default())?,
+                expected,
             );
         }
         Ok(())
@@ -534,13 +538,14 @@ mod tests {
             "</tool_response><|im_end|>\n",
             "<|im_start|>assistant\n<tool_call>\n{\"name\":\"lookup\",\"arguments\":"
         )));
-        assert_eq!(
-            rendered,
-            format_qwen3_agent_prompt(
+        assert_same_text(
+            "the render",
+            &rendered,
+            &format_qwen3_agent_prompt(
                 AgentTemplateProfile::Qwen3Gguf,
                 &prompt,
-                ChatTemplateOptions::default()
-            )?
+                ChatTemplateOptions::default(),
+            )?,
         );
         Ok(())
     }
@@ -621,9 +626,10 @@ mod tests {
             AgentTemplateProfile::Qwen3Current,
             AgentTemplateProfile::Qwen3Gguf,
         ] {
-            assert_eq!(
-                format_qwen3_agent_prompt(profile, &prompt, ChatTemplateOptions::default())?,
-                expected
+            assert_same_text(
+                "the agent render",
+                &format_qwen3_agent_prompt(profile, &prompt, ChatTemplateOptions::default())?,
+                expected,
             );
         }
         Ok(())
@@ -713,17 +719,20 @@ mod tests {
             };
             // Official tail: `<|im_start|>assistant\n` plus, only for
             // `enable_thinking=false`, `<think>\n\n</think>\n\n`.
-            assert_eq!(
-                adapter.format_chat_messages_with(&messages, disabled)?,
-                format!("{history}<|im_start|>assistant\n<think>\n\n</think>\n\n")
+            assert_same_text(
+                "the chat render",
+                &adapter.format_chat_messages_with(&messages, disabled)?,
+                &format!("{history}<|im_start|>assistant\n<think>\n\n</think>\n\n"),
             );
-            assert_eq!(
-                adapter.format_chat_messages_with(&messages, enabled)?,
-                adapter.format_chat_messages(&messages)?
+            assert_same_text(
+                "the chat render",
+                &adapter.format_chat_messages_with(&messages, enabled)?,
+                &adapter.format_chat_messages(&messages)?,
             );
-            assert_eq!(
-                adapter.format_chat_messages(&messages)?,
-                format!("{history}<|im_start|>assistant\n")
+            assert_same_text(
+                "the chat render",
+                &adapter.format_chat_messages(&messages)?,
+                &format!("{history}<|im_start|>assistant\n"),
             );
 
             let default_auto = adapter.format_agent_prompt(&auto)?;
@@ -731,13 +740,15 @@ mod tests {
                 default_auto
                     .ends_with("<|im_start|>user\nList files.<|im_end|>\n<|im_start|>assistant\n")
             );
-            assert_eq!(
-                adapter.format_agent_prompt_with(&auto, disabled)?,
-                format!("{default_auto}<think>\n\n</think>\n\n")
+            assert_same_text(
+                "the agent render",
+                &adapter.format_agent_prompt_with(&auto, disabled)?,
+                &format!("{default_auto}<think>\n\n</think>\n\n"),
             );
-            assert_eq!(
-                adapter.format_agent_prompt_with(&auto, enabled)?,
-                default_auto
+            assert_same_text(
+                "the agent render",
+                &adapter.format_agent_prompt_with(&auto, enabled)?,
+                &default_auto,
             );
             assert!(adapter.format_agent_prompt_with(&forced, disabled)?.ends_with(
                 "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n{\"name\":\"shell\",\"arguments\":"
@@ -820,18 +831,20 @@ mod tests {
             ..Default::default()
         })?;
         assert!(adapter.jinja.is_some());
-        assert_eq!(
-            adapter.format_chat_messages(&[ChatMessage::user("Hello")])?,
-            "<bos><user>Hello<assistant><eos>"
+        assert_same_text(
+            "the chat render",
+            &adapter.format_chat_messages(&[ChatMessage::user("Hello")])?,
+            "<bos><user>Hello<assistant><eos>",
         );
-        assert_eq!(
-            adapter.format_chat_messages_with(
+        assert_same_text(
+            "the chat render",
+            &adapter.format_chat_messages_with(
                 &[ChatMessage::user("Hello")],
                 ChatTemplateOptions {
-                    enable_thinking: Some(false)
-                }
+                    enable_thinking: Some(false),
+                },
             )?,
-            "<bos><user>Hello<assistant><direct><eos>"
+            "<bos><user>Hello<assistant><direct><eos>",
         );
 
         let prompt = AgentPrompt {

@@ -20,6 +20,9 @@ use macllm_chat::chat_templates::{qwen3, qwen35};
 use macllm_chat::jinja::JinjaChatTemplate;
 use serde::Deserialize;
 
+mod common;
+use common::assert_same_bytes;
+
 const FIXTURES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/chat_templates"
@@ -139,27 +142,6 @@ fn agent_prompt(case: &Case) -> Result<AgentPrompt> {
     })
 }
 
-/// Where two renders first disagree, with the surrounding bytes of each.
-fn difference(rendered: &str, expected: &[u8]) -> String {
-    let rendered = rendered.as_bytes();
-    let offset = rendered
-        .iter()
-        .zip(expected)
-        .position(|(left, right)| left != right)
-        .unwrap_or(rendered.len().min(expected.len()));
-    let window = |bytes: &[u8]| {
-        let start = offset.saturating_sub(24);
-        String::from_utf8_lossy(&bytes[start..(offset + 24).min(bytes.len())])
-            .escape_debug()
-            .to_string()
-    };
-    format!(
-        "\nfirst difference at byte {offset}\n  generic: {:?}\n  fixture: {:?}",
-        window(rendered),
-        window(expected)
-    )
-}
-
 #[test]
 fn the_generic_renderer_reproduces_every_reference_render() -> Result<()> {
     let root = Path::new(FIXTURES);
@@ -208,11 +190,10 @@ fn the_generic_renderer_reproduces_every_reference_render() -> Result<()> {
                     ));
                     let expected = std::fs::read(&path)
                         .with_context(|| format!("failed to read {}", path.display()))?;
-                    assert_eq!(
+                    assert_same_bytes(
+                        &format!("{template_name} / {case_name} / thinking-{variant}"),
                         rendered.as_bytes(),
-                        expected.as_slice(),
-                        "{template_name} / {case_name} / thinking-{variant}{}",
-                        difference(&rendered, &expected)
+                        &expected,
                     );
                     compared += 1;
                 }
@@ -279,17 +260,16 @@ fn the_pinned_renderers_and_the_generic_one_agree_on_every_case() -> Result<()> 
                             }
                             other => bail!("no pinned text renderer for `{other}`"),
                         };
-                        assert_eq!(
+                        assert_same_bytes(
+                            &format!("{template_name} / {case_name} / thinking-{variant}"),
                             plain.as_bytes(),
                             generic.as_bytes(),
-                            "{template_name} / {case_name} / thinking-{variant}"
                         );
                     }
-                    assert_eq!(
+                    assert_same_bytes(
+                        &format!("{family} / {template_name} / {case_name} / thinking-{variant}"),
                         pinned.as_bytes(),
                         generic.as_bytes(),
-                        "{family} / {template_name} / {case_name} / thinking-{variant}{}",
-                        difference(&generic, pinned.as_bytes())
                     );
                     compared += 1;
                 }

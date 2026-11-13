@@ -4443,6 +4443,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::server::test_helpers::assert_same_json;
     use crate::{
         benchmark::{
             MaterializedPrefixPrompt, PREFIX_DEMO_SCHEMA_VERSION, PreparedPrefixPrompt,
@@ -5039,9 +5040,10 @@ I resolve_fused_ops: Flash Attention enabled
     fn shared_request_body_contains_only_the_strict_cross_server_contract() {
         let body = completion_body(&prompt(), 32, true, &contract()).unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            body,
-            json!({
+        assert_same_json(
+            "the request body",
+            &body,
+            &json!({
                 "prompt": "hello",
                 "n_predict": 32,
                 "temperature": 0.0,
@@ -5078,7 +5080,7 @@ I resolve_fused_ops: Flash Attention enabled
                     "timings/predicted_n",
                     "timings/predicted_ms"
                 ]
-            })
+            }),
         );
         assert_eq!(macllm_exact_seed_reuse_tokens(&contract()).unwrap(), 16_368);
     }
